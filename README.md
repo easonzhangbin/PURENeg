@@ -6,7 +6,7 @@
 
 PURE Neg 是独立维护的 macOS 应用。除尘引擎基于 Magnus Holmes 的 MIT 开源项目。 [上游项目 film-dust](https://github.com/magholmes/film-dust) · [基准提交 `fcf68d6`](https://github.com/magholmes/film-dust/commit/fcf68d6c6a77e4373db28f878c7f80f7b8934f3f)
 
-[下载 PURE Neg 正式版](https://github.com/easonzhangbin/PURENeg/releases/latest) · Apple 芯片 Mac，macOS 14 或更新版本。
+[下载 macOS 安装包（含启动助手）][macos-installer] · [版本说明](https://github.com/easonzhangbin/PURENeg/releases/latest) · Apple 芯片 Mac，macOS 14 或更新版本。
 
 [源码与构建](#源码与构建) · [技术内核与开源项目](#技术内核与开源项目) · [支持 PURE Neg](SUPPORT.md)
 
@@ -47,9 +47,13 @@ macOS 界面使用 AppKit 和 SwiftUI。本机检测、审核和导出逻辑使�
 
 软件源码采用 MIT 许可。图标、字标、启动画面、收款码和示例照片分别保留各自的权利与署名。 [项目许可](LICENSE) · [第三方许可说明](THIRD_PARTY_NOTICES.md) · [引擎上游声明](vendor/film-dust/NOTICES.txt)
 
+[macos-installer]: https://github.com/easonzhangbin/PURENeg/releases/download/v0.4.7/PURE-Neg-0.4.7-macos-arm64.zip
+
 ## 安装与使用指南
 
-从 [Releases](https://github.com/easonzhangbin/PURENeg/releases) 下载 macOS ZIP。解压后保留完整文件夹，双击「打开 PURE Neg.command」。安装包使用本地临时签名，尚未经过 Apple 公证。
+下载完整安装包，解压后在 `PURE Neg 0.4.7` 文件夹内双击「打开 PURE Neg.command」。启动助手和 `PURE Neg.app` 放在同一目录。安装包使用本地临时签名，尚未经过 Apple 公证。[下载 macOS 安装包][macos-installer]
+
+发布页的 `-update.zip` 专供应用内更新。
 
 应用会定期检查 GitHub 正式版，发现新版时可在提示中下载安装。可从「PURE Neg → 检查更新…」立即检查，或在「设置 → 通用」调整自动检查。
 

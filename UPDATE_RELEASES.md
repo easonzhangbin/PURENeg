@@ -25,6 +25,6 @@ cp dist/release-0.4.7/PURE-Neg-0.4.7-macos-arm64-update.zip "$update_stage/"
   --verify "$update_stage/appcast.xml"
 ```
 
-把用户下载包、`-update.zip` 和签名后的 `appcast.xml` 一并上传到同一个 GitHub Release 草稿。核对 appcast 的版本号和安装包地址后，再发布并设为最新正式版。签名后的文件须原样上传。未集成 Sparkle 的既有版本需要先下载并安装一次。
+把用户下载包、`-update.zip` 和签名后的 `appcast.xml` 一并上传到同一个 GitHub Release 草稿。核对 appcast 的版本号和安装包地址后，再发布并设为最新正式版。签名后的文件须原样上传。 在 README 的 `macos-installer` 链接和发布说明顶部链接本次的完整安装包。未集成 Sparkle 的既有版本需要先下载并安装一次。
 
 本地测试可用 `APP_ONLY=1 PURENEG_UPDATE_TEST=1` 配合 `http://localhost:<端口>/appcast.xml` 和独立的测试签名密钥。正式构建只接受 HTTPS。
