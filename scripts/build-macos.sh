@@ -250,15 +250,14 @@ if [[ -n "$package_mode" ]]; then
   ditto --norsrc --noextattr --noqtn "$APP_DIR" "$package_dir/PURE Neg.app"
   install -m 0755 "$LAUNCHER" "$package_dir/打开 PURE Neg.command"
   codesign --verify --deep --strict "$package_dir/PURE Neg.app"
-  ditto -c -k --norsrc --keepParent "$package_dir" "$STAGING_DIR/distribution.zip"
+  if [[ "$package_mode" == "release" ]]; then
+    # Sparkle expects the app at the root of the update archive.
+    ditto -c -k --norsrc "$package_dir" "$STAGING_DIR/distribution.zip"
+  else
+    ditto -c -k --norsrc --keepParent "$package_dir" "$STAGING_DIR/distribution.zip"
+  fi
   mv -f "$STAGING_DIR/distribution.zip" "$package_archive"
   echo "Distribution archive: $package_archive"
-  if [[ "$package_mode" == "release" && -n "$SPARKLE_DIR" ]]; then
-    update_archive="$DIST_DIR/PURE-Neg-$app_version-macos-$ARCH-update.zip"
-    ditto -c -k --norsrc --keepParent "$APP_DIR" "$STAGING_DIR/update.zip"
-    mv -f "$STAGING_DIR/update.zip" "$update_archive"
-    echo "Sparkle update archive: $update_archive"
-  fi
 fi
 
 echo "Built: $FINAL_APP_DIR"

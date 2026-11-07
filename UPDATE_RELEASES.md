@@ -11,11 +11,11 @@ export PURENEG_UPDATE_PUBLIC_KEY="$("$SPARKLE_DIR/bin/generate_keys" --account e
 PACKAGE_RELEASE=1 bash scripts/build-macos.sh
 ```
 
-每次正式发版都要递增 `CFBundleVersion`。构建同时生成用户下载包与仅含应用的 `-update.zip`。在独立的目录中签发更新，下面以 Apple 芯片版 0.4.7 为例。
+每次正式发版都要递增 `CFBundleVersion`。首次安装与应用内更新共用构建生成的完整安装 ZIP。 应用与启动助手都在 ZIP 顶层，便于 Sparkle 读取应用版本。在独立的目录中签发更新，下面以 Apple 芯片版 0.4.7 为例。
 
 ```sh
 update_stage="$(mktemp -d)"
-cp dist/release-0.4.7/PURE-Neg-0.4.7-macos-arm64-update.zip "$update_stage/"
+cp dist/release-0.4.7/PURE-Neg-0.4.7-macos-arm64.zip "$update_stage/"
 "$SPARKLE_DIR/bin/generate_appcast" \
   --account easonzhangbin.PURENeg.production \
   --download-url-prefix "https://github.com/easonzhangbin/PURENeg/releases/download/v0.4.7/" \
@@ -25,6 +25,6 @@ cp dist/release-0.4.7/PURE-Neg-0.4.7-macos-arm64-update.zip "$update_stage/"
   --verify "$update_stage/appcast.xml"
 ```
 
-把用户下载包、`-update.zip` 和签名后的 `appcast.xml` 一并上传到同一个 GitHub Release 草稿。核对 appcast 的版本号和安装包地址后，再发布并设为最新正式版。签名后的文件须原样上传。 在 README 的 `macos-installer` 链接和发布说明顶部链接本次的完整安装包。未集成 Sparkle 的既有版本需要先下载并安装一次。
+把完整安装 ZIP 和签名后的 `appcast.xml` 一并上传到同一个 GitHub Release 草稿。核对 appcast 的版本号和安装包地址后，再发布并设为最新正式版。签名后的文件须原样上传。在 README 的 `macos-installer` 链接和发布说明顶部链接本次的完整安装包。未集成 Sparkle 的既有版本需要先下载并安装一次。
 
 本地测试可用 `APP_ONLY=1 PURENEG_UPDATE_TEST=1` 配合 `http://localhost:<端口>/appcast.xml` 和独立的测试签名密钥。正式构建只接受 HTTPS。
