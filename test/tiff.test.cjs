@@ -1,0 +1,147 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const zlib = require('node:zlib');
+const { decodeTiff, encodeTiff } = require('../src/tiff.cjs');
+
+function samples(n, depth) {
+  let seed = 77;
+  return Uint16Array.from({ length: n }, () => {
+    seed = (Math.imul(1664525, seed) + 1013904223) >>> 0;
+    return depth === 8 ? (seed >>> 24) * 257 : seed >>> 16;
+  });
+}
+function image(channels = 3, depth = 16, width = 17, height = 11) {
+  return { width, height, channels, depth, data: samples(width * height * channels, depth) };
+}
+function entry(buf, tag) {
+  const ifd = buf.readUInt32LE(4), count = buf.readUInt16LE(ifd);
+  for (let i = 0; i < count; i++) {
+    const at = ifd + 2 + 12 * i;
+    if (buf.readUInt16LE(at) === tag) return at;
+  }
+  throw new Error(`test fixture lacks tag ${tag}`);
+}
+function setScalar(buf, tag, value) {
+  const at = entry(buf, tag), type = buf.readUInt16LE(at + 2);
+  assert.equal(buf.readUInt32LE(at + 4), 1);
+  if (type === 3) buf.writeUInt16LE(value, at + 8); else buf.writeUInt32LE(value, at + 8);
+  return buf;
+}
+function replaceStrip(buf, compression, strip) {
+  const offset = buf.readUInt32LE(entry(buf, 273) + 8);
+  const out = Buffer.concat([buf.subarray(0, offset), strip]);
+  setScalar(out, 259, compression); setScalar(out, 279, strip.length);
+  return out;
+}
+
+for (const depth of [8, 16]) for (const channels of [1, 2, 3, 4]) for (const compression of ['none', 'deflate']) {
+  test(`${depth}-bit ${channels}-channel ${compression} round trip keeps samples and ICC`, () => {
+    const source = image(channels, depth), before = source.data.slice();
+    source.icc = Buffer.from([0, 0, 0, 12, 0xff, 2, 7, 0, 0x80, 5, 9, 0]);
+    source.resolution = { x: 2400, y: 2399.5, unit: 2 };
+    const decoded = decodeTiff(encodeTiff(source, { compression, rowsPerStrip: 3 }));
+    assert.equal(decoded.width, source.width); assert.equal(decoded.height, source.height);
+    assert.equal(decoded.depth, depth); assert.equal(decoded.channels, channels);
+    assert.equal(decoded.alpha, channels === 2 || channels === 4);
+    assert.deepEqual(decoded.data, source.data); assert.deepEqual(source.data, before);
+    assert.deepEqual(decoded.icc, source.icc); assert.deepEqual(decoded.resolution, source.resolution);
+  });
+}
+
+for (const depth of [8, 16]) for (const codec of ['lzw', 'packbits', 'deflate']) {
+  test(`independent Pillow fixture: ${depth}-bit ${codec}`, () => {
+    const fixture = fs.readFileSync(path.join(__dirname, 'fixtures', 'tiff', `pillow-${depth}-${codec}.tiff`));
+    const got = decodeTiff(fixture), width = depth === 8 ? 97 : 37, height = depth === 8 ? 83 : 31, channels = depth === 8 ? 3 : 1;
+    assert.equal(got.width, width); assert.equal(got.height, height); assert.equal(got.channels, channels);
+    assert.equal(got.depth, depth); assert.deepEqual(got.data, samples(width * height * channels, depth));
+  });
+}
+
+test('independent big-endian 16-bit uncompressed fixture', () => {
+  const fixture = fs.readFileSync(path.join(__dirname, 'fixtures', 'tiff', 'pillow-16-be-raw.tiff'));
+  assert.equal(fixture.toString('ascii', 0, 2), 'MM');
+  assert.deepEqual(decodeTiff(fixture).data, samples(37 * 31, 16));
+});
+
+test('WhiteIsZero is normalized, without inverting straight alpha', () => {
+  const src = image(2, 16, 2, 1), encoded = setScalar(encodeTiff(src), 262, 0), got = decodeTiff(encoded);
+  assert.deepEqual(got.data, Uint16Array.from([65535 - src.data[0], src.data[1], 65535 - src.data[2], src.data[3]]));
+});
+
+test('8-bit writer rounds full-range samples without changing its source', () => {
+  const src = { width: 3, height: 1, channels: 1, depth: 8, data: new Uint16Array([0, 32768, 65535]) };
+  assert.deepEqual(decodeTiff(encodeTiff(src)).data, new Uint16Array([0, 32896, 65535]));
+  assert.deepEqual(src.data, new Uint16Array([0, 32768, 65535]));
+});
+
+test('LZW handles the code == next dictionary case', () => {
+  const codes = [256, 65, 258, 257], encoded = Buffer.alloc(Math.ceil(codes.length * 9 / 8));
+  let bit = 0;
+  for (const code of codes) for (let k = 8; k >= 0; k--, bit++) encoded[bit >> 3] |= ((code >> k) & 1) << (7 - (bit & 7));
+  const base = encodeTiff(image(1, 8, 3, 1));
+  assert.deepEqual(decodeTiff(replaceStrip(base, 5, encoded)).data, new Uint16Array([65 * 257, 65 * 257, 65 * 257]));
+});
+
+test('PackBits accepts a no-op and a repeated-byte run', () => {
+  const base = encodeTiff(image(1, 8, 4, 1));
+  assert.deepEqual(decodeTiff(replaceStrip(base, 32773, Buffer.from([128, 253, 17]))).data, new Uint16Array(4).fill(17 * 257));
+});
+
+test('legacy raw Deflate strips are bounded and supported', () => {
+  const src = image(1, 8, 7, 1), base = encodeTiff(src), raw = Buffer.from(Uint8Array.from(src.data, v => v / 257));
+  const packed = zlib.deflateRawSync(raw);
+  assert.deepEqual(decodeTiff(replaceStrip(base, 32946, packed)).data, src.data);
+});
+
+test('rejects a decompression bomb before allocating oversized output', () => {
+  const base = encodeTiff(image(1, 8, 1, 1)), packed = zlib.deflateSync(Buffer.alloc(1024 * 1024));
+  assert.throws(() => decodeTiff(replaceStrip(base, 8, packed)), /Deflate strip/);
+});
+
+test('rejects truncation, invalid offsets and a wrong uncompressed strip length', () => {
+  const good = encodeTiff(image());
+  assert.throws(() => decodeTiff(good.subarray(0, 7)), /truncated/);
+  assert.throws(() => decodeTiff(good.subarray(0, good.length - 1)), /outside the file/);
+  const offset = Buffer.from(good); setScalar(offset, 273, 0xffffffff);
+  assert.throws(() => decodeTiff(offset), /outside the file/);
+  const count = Buffer.from(good); setScalar(count, 279, 2);
+  assert.throws(() => decodeTiff(count), /strip length/);
+});
+
+test('rejects unsupported TIFF interpretations before processing pixels', () => {
+  for (const [tag, value, error] of [[274, 6, /orientation/], [284, 2, /planar/], [262, 5, /photometric/], [259, 7, /compression/], [278, 0, /rows per strip/]]) {
+    const buf = setScalar(encodeTiff(image()), tag, value);
+    assert.throws(() => decodeTiff(buf), error);
+  }
+  const gray = encodeTiff(image(1)); setScalar(gray, 258, 32);
+  assert.throws(() => decodeTiff(gray), /8-bit or 16-bit/);
+  const signed = encodeTiff(image(1)); setScalar(signed, 339, 2);
+  assert.throws(() => decodeTiff(signed), /signed/);
+  const associated = encodeTiff(image(4)); setScalar(associated, 338, 1);
+  assert.throws(() => decodeTiff(associated), /straight.*alpha/);
+});
+
+test('rejects multi-page, duplicate-tag and oversized images', () => {
+  const good = encodeTiff(image(1));
+  const multi = Buffer.from(good), ifd = multi.readUInt32LE(4), count = multi.readUInt16LE(ifd);
+  multi.writeUInt32LE(ifd, ifd + 2 + count * 12);
+  assert.throws(() => decodeTiff(multi), /multi-page/);
+  const duplicate = Buffer.from(good); duplicate.writeUInt16LE(256, entry(duplicate, 257));
+  assert.throws(() => decodeTiff(duplicate), /duplicate/);
+  const huge = Buffer.from(good); setScalar(huge, 256, 0xffffffff);
+  assert.throws(() => decodeTiff(huge), /pixel\/sample limit/);
+  assert.throws(() => decodeTiff(good, { maxPixels: 1 }), /pixel\/sample limit/);
+});
+
+test('writer rejects missing samples, unsupported depth and inconsistent channels', () => {
+  assert.throws(() => encodeTiff({ ...image(), data: new Uint16Array(1) }), /exactly sized/);
+  assert.throws(() => encodeTiff({ ...image(), depth: 32 }), /8-bit or 16-bit/);
+  assert.throws(() => encodeTiff({ ...image(4), alpha: false }), /alpha flag/);
+  assert.throws(() => encodeTiff({ ...image(1), colorChannels: 3 }), /channel count/);
+  assert.throws(() => encodeTiff(image(), { compression: 'jpeg' }), /compression/);
+  assert.throws(() => encodeTiff({ ...image(), resolution: { x: Infinity, y: 72 } }), /resolution/);
+});

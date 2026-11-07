@@ -1,0 +1,15 @@
+{
+  "name": "pure-neg",
+  "version": "0.4.6",
+  "private": true,
+  "description": "Local film cleanup with 16-bit scans and editable repair masks",
+  "license": "MIT",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "doctor": "node src/cli.cjs doctor",
+    "build:native": "bash vendor/film-dust/native/build.sh",
+    "build:macos": "bash scripts/build-macos.sh"
+  },
+  "engines": {"node": ">=22"}
+}

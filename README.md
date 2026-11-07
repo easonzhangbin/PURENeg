@@ -4,7 +4,7 @@
 
 面向胶片扫描件的 macOS 除尘与修整工具。从一整卷里选出要处理的底片，检查自动标出的灰尘、划痕和纤维，再逐张修整和导出。
 
-[下载 PURE Neg 0.4.6 Beta 1](https://github.com/easonzhangbin/PURENeg/releases/tag/v0.4.6-beta.1) · Apple 芯片 Mac，macOS 14 或更新版本。
+[下载 PURE Neg 0.4.6 正式版](https://github.com/easonzhangbin/PURENeg/releases/tag/v0.4.6) · Apple 芯片 Mac，macOS 14 或更新版本。
 
 [源码与构建](#源码与构建) · [技术内核与开源项目](#技术内核与开源项目) · [支持 PURE Neg](SUPPORT.md)
 
@@ -14,15 +14,15 @@
 
 ![PURE Neg 观片台。候选区位于上方，带原始帧号的底片袋位于下方](docs/images/light-table.png)
 
-导入多张 TIFF 或 JPEG 后，在灯板上点选底片。底片会从袋中移到上方候选区，再点一次可放回。候选区为空时，「下一步」会纳入整卷。右下角的电源按钮可点亮灯板，支持 HDR 的屏幕会提亮透光区域，接缝和印字附近用半透明遮光保留细节。
+导入多张 TIFF 或 JPEG 后，在灯板上点选底片。底片会从袋中移到上方候选区，再点一次可放回。候选区为空时，「下一步」会纳入整卷。右下角的电源按钮可点亮灯板。关闭时指示灯为红色，开启时为绿色。支持 HDR 的屏幕会提亮透光区域，接缝和印字附近用半透明遮光保留细节。
 
 ### 除尘审核
 
-![PURE Neg 0.4.6 Beta 1 的除尘审核页。中央分割对比原图和修复后照片，右半显示红色修复蒙版](docs/images/review.png)
+![PURE Neg 0.4.6 的除尘审核页。中央分割对比原图和修复后照片，右半显示红色修复蒙版](docs/images/review.png)
 
-中央画布可切换「原图」「修复后」和「分割对比」，也能缩放检查。左栏用可调颜色和不透明度的蒙版标出修复位置。用画笔补修漏点，用橡皮擦恢复误修，也可从点位列表排除整处。右栏保留原始帧号，显示检测进度和审核状态。批量处理时，默认闲置 4 秒后检测其余照片，操作时暂停。
+中央画布可切换「原图」「修复后」和「分割对比」，也能缩放检查。左栏用可调颜色和不透明度的蒙版标出修复位置。用画笔补修漏点，用橡皮擦恢复误修，也可从点位列表排除整处。右栏保留原始帧号，显示检测进度和处理状态。检测中可直接点击另一张照片切换。批量处理时，默认闲置 4 秒后检测其余照片，操作时暂停。
 
-截图展示 0.4.6 Beta 1，先点「通过审核」，再导出当前或所选照片。仓库源码中的批量流程可直接导出预览就绪的照片。支持按原始分辨率导出 TIFF、JPEG 或 PNG，并可另存修复蒙版。
+检查修复结果后，点左下角「导出当前」。也可在右侧勾选多张照片，再点「导出所选」。支持按原始分辨率导出 TIFF、JPEG 或 PNG，保存时可选择附带修复蒙版。导出后仍可继续修整，再导出一个新版本。
 
 ## 视觉设计
 
@@ -41,13 +41,13 @@ macOS 界面使用 AppKit 和 SwiftUI。本机检测、审核和导出逻辑使�
 - **film-dust**。自动检测与修补基于 Magnus Holmes 的 MIT 项目。PURE Neg 在原始像素上补充划痕检测和纤维追踪，并实现观片台、点位审核、蒙版修整与批量导出。 [基准提交 `fcf68d6`](https://github.com/magholmes/film-dust/commit/fcf68d6c6a77e4373db28f878c7f80f7b8934f3f)
 - **scikit-image**。film-dust 的骨架细化查表方法参考了该项目的实现。 [项目主页](https://scikit-image.org/)
 - **Torchvision**。按 film-dust 的上游说明，其场景判断模型基于 MobileNetV3-small ImageNet 权重。 [模型文档](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.mobilenet_v3_small.html)
-- **Node.js**。内测包随附本机运行环境，用于执行检测和修补引擎。 [项目主页](https://nodejs.org/)
+- **Node.js**。下载包随附本机运行环境，用于执行检测和修补引擎。 [项目主页](https://nodejs.org/)
 
 软件源码采用 MIT 许可。图标、字标、启动画面、收款码和示例照片分别保留各自的权利与署名。 [项目许可](LICENSE) · [第三方许可说明](THIRD_PARTY_NOTICES.md) · [引擎上游声明](vendor/film-dust/NOTICES.txt)
 
 ## 安装与使用指南
 
-从 [Releases](https://github.com/easonzhangbin/PURENeg/releases) 下载 macOS 内测 ZIP。解压后保留完整文件夹，双击「打开 PURE Neg.command」。内测包采用临时签名，首次打开时可按 macOS 的提示完成授权。
+从 [Releases](https://github.com/easonzhangbin/PURENeg/releases) 下载 macOS ZIP。解压后保留完整文件夹，双击「打开 PURE Neg.command」。安装包使用本地临时签名，尚未经过 Apple 公证。
 
 应用内的「帮助 → PURE Neg 使用指南」包含中英文操作说明。
 

@@ -1,0 +1,430 @@
+'use strict';
+
+// Review is a separate, local transaction: preparing or previewing never
+// publishes a final image and never sends commands to PhotoCraft.
+const fs = require('node:fs/promises');
+const { constants: fsConstants } = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { setImmediate: yieldNow } = require('node:timers/promises');
+const { processFile, cancelled, requireWorkSpace } = require('./processor.cjs');
+const { decodeTiff, encodeTiff } = require('./tiff.cjs');
+const { checkedStrokes, applyStrokes } = require('./brush.cjs');
+const { runImageCodec } = require('./image-codec.cjs');
+const { workRootOverride, defaultWorkRoot, legacyWorkRoot } = require('./workspace.cjs');
+const version = require('./version.cjs');
+
+const SCHEMA = 'photocraft-film-dust-review';
+const MAX_RUNS = 2_000_000;
+const MAX_REGIONS = 20_000;
+const RUN_MAGIC = Buffer.from('FDRUNS01');
+const fail = message => { throw new Error(message); };
+const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+const inside = (root, filename) => {
+  const rel = path.relative(root, filename);
+  return rel !== '' && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+};
+
+function defaultCacheRoot() {
+  return path.join(workRootOverride() || defaultWorkRoot(), 'reviews');
+}
+
+async function cacheLocation(root, create = false) {
+  const resolved = path.resolve(root || defaultCacheRoot());
+  if (create) await fs.mkdir(resolved, { recursive: true, mode: 0o700 });
+  return fs.realpath(resolved);
+}
+
+async function signingKey(root, create = false) {
+  const filename = path.join(root, '.review-signing-key');
+  if (create) {
+    try { await fs.writeFile(filename, crypto.randomBytes(32), { flag: 'wx', mode: 0o600 }); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+  }
+  const stat = await fs.lstat(filename);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== 32) fail('审核凭证无效，请重新分析照片。');
+  return fs.readFile(filename);
+}
+
+function signature(record, key) { return crypto.createHmac('sha256', key).update(JSON.stringify(record)).digest('hex'); }
+async function saveRecord(filename, record, key) {
+  const temp = filename + '.' + crypto.randomUUID();
+  try {
+    await fs.writeFile(temp, JSON.stringify({ record, signature: signature(record, key) }) + '\n', { flag: 'wx', mode: 0o600 });
+    await fs.rename(temp, filename);
+  } finally { await fs.rm(temp, { force: true }).catch(() => {}); }
+}
+
+class RunStore {
+  constructor() { this.length = 0; this.capacity = 1024; this.x0 = new Uint32Array(this.capacity); this.x1 = new Uint32Array(this.capacity); this.y = new Uint32Array(this.capacity); this.parent = new Uint32Array(this.capacity); }
+  push(y, x0, x1) {
+    if (this.length >= MAX_RUNS) fail('检测区域过于复杂，请降低灵敏度后重新分析。');
+    if (this.length === this.capacity) {
+      this.capacity = Math.min(MAX_RUNS, this.capacity * 2);
+      for (const field of ['x0', 'x1', 'y', 'parent']) { const next = new Uint32Array(this.capacity); next.set(this[field]); this[field] = next; }
+    }
+    const id = this.length++;
+    this.y[id] = y; this.x0[id] = x0; this.x1[id] = x1; this.parent[id] = id;
+    return id;
+  }
+  find(id) { let root = id; while (this.parent[root] !== root) root = this.parent[root]; while (this.parent[id] !== id) { const next = this.parent[id]; this.parent[id] = root; id = next; } return root; }
+  union(a, b) { const x = this.find(a), y = this.find(b); if (x !== y) this.parent[Math.max(x, y)] = Math.min(x, y); }
+}
+
+function connectedRegions(mask) {
+  const { width: W, height: H, data } = mask;
+  if (mask.channels !== 1 || !Number.isSafeInteger(W) || !Number.isSafeInteger(H) || W < 1 || H < 1 || data.length !== W * H) fail('灰尘蒙版无效。');
+  const store = new RunStore();
+  let prevStart = 0, prevEnd = 0;
+  for (let y = 0; y < H; y++) {
+    const currentStart = store.length;
+    let prior = prevStart;
+    for (let x = 0; x < W;) {
+      if (!data[y * W + x]) { x++; continue; }
+      const x0 = x++;
+      while (x < W && data[y * W + x]) x++;
+      const id = store.push(y, x0, x);
+      // Eight-connected components: diagonal neighbours belong together.
+      while (prior < prevEnd && store.x1[prior] < x0) prior++;
+      for (let p = prior; p < prevEnd && store.x0[p] <= x; p++) store.union(id, p);
+    }
+    prevStart = currentStart; prevEnd = store.length;
+  }
+  const groups = new Map();
+  for (let r = 0; r < store.length; r++) {
+    const root = store.find(r);
+    if (!groups.has(root)) {
+      if (groups.size >= MAX_REGIONS) fail('灰尘点位过多，请降低灵敏度后重新分析。');
+      groups.set(root, { id: groups.size + 1, x: W, y: H, x1: 0, y1: 0, pixels: 0 });
+    }
+    const g = groups.get(root);
+    g.x = Math.min(g.x, store.x0[r]); g.y = Math.min(g.y, store.y[r]);
+    g.x1 = Math.max(g.x1, store.x1[r]); g.y1 = Math.max(g.y1, store.y[r] + 1);
+    g.pixels += store.x1[r] - store.x0[r];
+  }
+  const regions = [...groups.values()].map(g => ({ id: g.id, x: g.x, y: g.y, width: g.x1 - g.x, height: g.y1 - g.y, pixels: g.pixels }));
+  if (Buffer.byteLength(JSON.stringify(regions)) > 1_500_000) fail('灰尘点位数据过多，请降低灵敏度后重新分析。');
+  const runs = Buffer.alloc(24 + store.length * 16);
+  RUN_MAGIC.copy(runs); runs.writeUInt32LE(store.length, 8); runs.writeUInt32LE(W, 12); runs.writeUInt32LE(H, 16); runs.writeUInt32LE(regions.length, 20);
+  for (let r = 0; r < store.length; r++) {
+    const at = 24 + r * 16;
+    runs.writeUInt32LE(groups.get(store.find(r)).id, at); runs.writeUInt32LE(store.y[r], at + 4);
+    runs.writeUInt32LE(store.x0[r], at + 8); runs.writeUInt32LE(store.x1[r], at + 12);
+  }
+  return { regions, runs };
+}
+
+async function makeAsset(job, filename, digest) {
+  const actual = await fs.realpath(filename);
+  if (!inside(job, actual)) fail('审核交换文件超出工作目录。');
+  const stat = await fs.stat(actual);
+  if (!stat.isFile() || stat.size > 2_000_000_000) fail('审核交换文件无效。');
+  if (digest) {
+    if (stat.size !== digest.size) fail('审核交换文件写入不完整。');
+    return { path: path.relative(job, actual), ...digest };
+  }
+  const hash = crypto.createHash('sha256');
+  for await (const chunk of require('node:fs').createReadStream(actual)) hash.update(chunk);
+  return { path: path.relative(job, actual), size: stat.size, sha256: hash.digest('hex') };
+}
+
+function publicReview(record, job) {
+  const full = key => path.join(job, record.assets[key].path);
+  return { id: record.id, sourceName: record.sourceName, sourcePath: full('source'), cleanedPath: full('cleaned'), maskPath: full('mask'),
+    width: record.width, height: record.height, depth: record.depth, regions: record.regions,
+    context: record.context, stats: record.stats, outputRoot: record.outputRoot };
+}
+
+async function prepareReview({ inputPath, sourceName, outputRoot, context = 'file', host = null, cacheRoot, preparedResult = null, options = {} } = {}) {
+  if (!['file', 'photocraft'].includes(context)) fail('未知的审核来源。');
+  if (!inputPath || !outputRoot) fail('请选择输入文件和结果保存目录。');
+  if (sourceName !== undefined && typeof sourceName !== 'string') fail('照片名称无效。');
+  const displayName = Array.from(path.basename(sourceName ?? inputPath).replace(/[\p{Cc}\p{Cf}]/gu, '')).slice(0, 255).join('') || 'scan.tiff';
+  const root = await cacheLocation(cacheRoot, true), key = await signingKey(root, true);
+  if (context === 'photocraft') {
+    if (!host?.workDir || !host.snapshot || !Number.isInteger(host.snapshot.index)) fail('缺少 PhotoCraft 原始文档快照。');
+    const hostRoot = await fs.realpath(host.workDir);
+    if (!inside(hostRoot, root)) fail('PhotoCraft 审核缓存必须位于授权交换目录内。');
+    host = { workDir: hostRoot, snapshot: host.snapshot };
+  } else host = null;
+  const id = crypto.randomUUID(), job = path.join(root, id);
+  await fs.mkdir(job, { mode: 0o700 });
+  try {
+    cancelled(options.signal);
+    const sourcePath = path.join(job, 'source.tiff');
+    const stat = await fs.stat(inputPath);
+    if (!stat.isFile() || stat.size < 8 || stat.size > 2_000_000_000) fail('请选择小于 2GB 的有效 TIFF 或 JPEG 文件。');
+    // APFS can freeze a copy-on-write snapshot without copying the whole TIFF.
+    // Node falls back to an independent copy on other file systems.
+    const jpeg = /\.jpe?g$/i.test(inputPath);
+    const snapshot = jpeg ? path.join(job, 'input.jpg') : sourcePath;
+    await fs.copyFile(inputPath, snapshot, fsConstants.COPYFILE_EXCL | fsConstants.COPYFILE_FICLONE);
+    if (jpeg) {
+      await fs.chmod(snapshot, 0o600);
+      await runImageCodec(['import-jpeg', snapshot, sourcePath], options.signal);
+      await fs.unlink(snapshot);
+    }
+    await fs.chmod(sourcePath, 0o600);
+    let candidate;
+    if (preparedResult) {
+      // Internal adoption avoids rerunning a large scan already processed by
+      // this application. No CLI flag or manifest can supply this shortcut.
+      const folder = await fs.mkdtemp(path.join(job, 'candidate-'));
+      const copied = {};
+      for (const name of ['cleaned', 'mask', 'report']) {
+        const filename = preparedResult.paths?.[name];
+        if (typeof filename !== 'string') fail('已有分析结果不完整。');
+        const item = await fs.stat(filename);
+        if (!item.isFile() || item.size < 1 || item.size > 2_000_000_000) fail('已有分析文件无效。');
+        copied[name] = path.join(folder, name === 'report' ? 'report.json' : name + '.tiff');
+        await fs.copyFile(filename, copied[name], require('node:fs').constants.COPYFILE_EXCL);
+        await fs.chmod(copied[name], 0o600);
+      }
+      candidate = { ...preparedResult, outputDir: folder, paths: copied };
+    } else candidate = await processFile(sourcePath, job, options, { captureReview: true });
+    cancelled(options.signal);
+    const captured = preparedResult ? null : candidate.reviewData;
+    const mask = captured?.mask ?? decodeTiff(await fs.readFile(candidate.paths.mask));
+    const { regions, runs } = connectedRegions(mask);
+    const runsPath = path.join(job, 'regions-runs.bin');
+    await fs.writeFile(runsPath, runs, { flag: 'wx', mode: 0o600 });
+    const imageInfo = captured?.image ?? JSON.parse(await fs.readFile(candidate.paths.report, 'utf8')).image;
+    if (preparedResult) {
+      const images = [];
+      for (const filename of [sourcePath, candidate.paths.cleaned]) {
+        const image = decodeTiff(await fs.readFile(filename));
+        if (image.width !== mask.width || image.height !== mask.height || image.depth !== imageInfo?.depth || image.channels !== imageInfo?.channels) fail('已有分析结果与原始快照尺寸或位深不一致。');
+        images.push(image);
+      }
+      if (!Buffer.from(images[0].icc || []).equals(Buffer.from(images[1].icc || []))) fail('已有分析结果的颜色描述与原始快照不一致。');
+      // An adopted result must be for this exact frozen original, not simply a
+      // different photograph having the same dimensions.
+      for (let pixel = 0; pixel < mask.data.length; pixel++) if (!mask.data[pixel]) {
+        for (let c = 0; c < images[0].channels; c++) {
+          const index = pixel * images[0].channels + c;
+          if (images[0].data[index] !== images[1].data[index]) fail('已有分析结果与原始快照不匹配，请重新分析。');
+        }
+      }
+    }
+    const assets = {};
+    for (const [name, filename] of Object.entries({ source: sourcePath, cleaned: candidate.paths.cleaned, mask: candidate.paths.mask, report: candidate.paths.report, runs: runsPath })) {
+      const digest = name === 'runs' ? { size: runs.length, sha256: sha256(runs) } : captured?.digests[name];
+      assets[name] = await makeAsset(job, filename, digest);
+      cancelled(options.signal);
+    }
+    const record = { schema: SCHEMA, version: 1, id, status: 'ready', createdAt: new Date().toISOString(),
+      context, host, outputRoot: path.resolve(outputRoot), sourceName: displayName,
+      width: mask.width, height: mask.height, depth: imageInfo.depth, channels: imageInfo.channels,
+      regions, stats: candidate.stats, assets };
+    const reviewPath = path.join(job, 'review.json');
+    await saveRecord(reviewPath, record, key);
+    return { reviewPath, review: publicReview(record, job) };
+  } catch (error) { await fs.rm(job, { recursive: true, force: true }); throw error; }
+}
+
+async function readReview(reviewPath, options = {}) {
+  const actual = await fs.realpath(reviewPath);
+  const explicitRoot = options.cacheRoot || workRootOverride();
+  const roots = [options.cacheRoot || defaultCacheRoot()];
+  if (!explicitRoot) roots.push(path.join(legacyWorkRoot(), 'reviews'));
+  let root;
+  for (const candidate of roots) {
+    try {
+      const resolved = await cacheLocation(candidate);
+      if (/^[0-9a-f-]{36}[\/]review\.json$/i.test(path.relative(resolved, actual)) && inside(resolved, actual)) {
+        root = resolved;
+        break;
+      }
+    } catch (error) {
+      if (explicitRoot || error.code !== 'ENOENT') throw error;
+    }
+  }
+  if (!root) fail('审核文件不属于本工具的缓存目录。');
+  const key = await signingKey(root);
+  const stat = await fs.stat(actual);
+  if (!stat.isFile() || stat.size > 16 * 1024 * 1024) fail('审核文件无效。');
+  let envelope;
+  try { envelope = JSON.parse(await fs.readFile(actual, 'utf8')); } catch { fail('审核文件损坏，请重新分析。'); }
+  const { record, signature: signed } = envelope;
+  if (!record || typeof signed !== 'string' || !/^[0-9a-f]{64}$/.test(signed)) fail('审核签名无效，请重新分析。');
+  const expected = signature(record, key);
+  if (!crypto.timingSafeEqual(Buffer.from(signed, 'hex'), Buffer.from(expected, 'hex'))) fail('审核文件已被修改，请重新分析。');
+  if (record.schema !== SCHEMA || record.version !== 1 || path.basename(path.dirname(actual)) !== record.id || !['file', 'photocraft'].includes(record.context)) fail('不支持此审核文件。');
+  const revising = options.reviseExport === true;
+  if (revising && record.context !== 'file') fail('仅文件审核可以修订已导出的结果。');
+  if (record.status !== 'ready' && !(revising && record.status === 'confirmed')) {
+    fail(record.status === 'confirmed' ? '此预览已经确认，不能重复应用。' : '此预览正在确认，请稍后检查结果。');
+  }
+  if (record.context === 'photocraft') {
+    const hostRoot = await fs.realpath(record.host.workDir);
+    if (!inside(hostRoot, root)) fail('PhotoCraft 审核缓存不在原授权目录内。');
+  }
+  return { root, key, record, job: path.dirname(actual), reviewPath: actual };
+}
+
+async function verifiedAsset(loaded, name) {
+  const asset = loaded.record.assets[name];
+  if (!asset || typeof asset.path !== 'string' || path.isAbsolute(asset.path)) fail('审核文件引用无效。');
+  const filename = await fs.realpath(path.join(loaded.job, asset.path));
+  if (!inside(loaded.job, filename)) fail('审核文件引用超出工作目录。');
+  const stat = await fs.stat(filename);
+  if (!stat.isFile() || stat.size !== asset.size || stat.size > 2_000_000_000) fail('审核图像已被修改，请重新分析。');
+  const data = await fs.readFile(filename);
+  if (sha256(data) !== asset.sha256) fail('审核图像已被修改，请重新分析。');
+  return data;
+}
+
+async function inspectReview(reviewPath, options = {}) {
+  const loaded = await readReview(reviewPath, { cacheRoot: options.cacheRoot });
+  for (const name of ['source', 'cleaned', 'mask', 'report', 'runs']) {
+    const expected = loaded.record.assets[name];
+    if (!expected || typeof expected.path !== 'string' || path.isAbsolute(expected.path)) fail('审核文件引用无效。');
+    const actual = await makeAsset(loaded.job, path.join(loaded.job, expected.path));
+    if (actual.path !== expected.path || actual.size !== expected.size || actual.sha256 !== expected.sha256) fail('审核图像已被修改，请重新分析。');
+    cancelled(options.signal);
+  }
+  return { reviewPath: loaded.reviewPath, review: publicReview(loaded.record, loaded.job) };
+}
+
+function checkedEdits(record, edits = {}) {
+  if (!edits || typeof edits !== 'object' || Array.isArray(edits) || Object.keys(edits).some(k => k !== 'excludedRegions' && k !== 'strokes')) fail('审核修改格式无效。');
+  const input = edits.excludedRegions ?? [];
+  if (!Array.isArray(input) || input.length > record.regions.length) fail('排除点位列表无效。');
+  const allowed = new Set(record.regions.map(r => r.id)), excluded = new Set();
+  for (const id of input) {
+    if (!Number.isInteger(id) || !allowed.has(id)) fail('排除列表包含未知灰尘点位。');
+    excluded.add(id);
+  }
+  return { excludedRegions: [...excluded].sort((a, b) => a - b), strokes: checkedStrokes(edits.strokes ?? [], record) };
+}
+
+async function recompose(loaded, edits, options = {}) {
+  const { record } = loaded;
+  const { excludedRegions, strokes } = checkedEdits(record, edits), excluded = new Set(excludedRegions);
+  const source = decodeTiff(await verifiedAsset(loaded, 'source'));
+  const candidate = decodeTiff(await verifiedAsset(loaded, 'cleaned'));
+  const originalMask = decodeTiff(await verifiedAsset(loaded, 'mask'));
+  const runs = await verifiedAsset(loaded, 'runs');
+  for (const image of [source, candidate]) {
+    if (image.width !== record.width || image.height !== record.height || image.channels !== record.channels || image.depth !== record.depth) fail('审核图像尺寸或位深已改变。');
+  }
+  if (!runs.subarray(0, 8).equals(RUN_MAGIC) || runs.length < 24 || runs.readUInt32LE(12) !== record.width || runs.readUInt32LE(16) !== record.height || runs.readUInt32LE(20) !== record.regions.length) fail('审核点位索引损坏。');
+  const count = runs.readUInt32LE(8);
+  if (count > MAX_RUNS || runs.length !== 24 + count * 16) fail('审核点位索引长度无效。');
+  // The signed candidate already contains original pixels outside the
+  // detected mask. Patch its private decode in place to avoid another
+  // full-resolution allocation for each brush preview.
+  const data = candidate.data, mask = originalMask.data;
+  let changedPixels = 0, acceptedPixels = 0;
+  for (let r = 0; r < count; r++) {
+    const at = 24 + r * 16, id = runs.readUInt32LE(at), y = runs.readUInt32LE(at + 4), x0 = runs.readUInt32LE(at + 8), x1 = runs.readUInt32LE(at + 12);
+    if (id < 1 || id > record.regions.length || y >= record.height || x0 >= x1 || x1 > record.width) fail('审核点位坐标无效。');
+    const keep = !excluded.has(id);
+    for (let x = x0; x < x1; x++) {
+      const pixel = y * record.width + x;
+      if (!mask[pixel]) fail('审核点位不在灰尘蒙版中。');
+      mask[pixel] = keep ? 65535 : 0;
+      if (keep) acceptedPixels++;
+      let changed = false;
+      for (let c = 0; c < source.channels; c++) {
+        const index = pixel * source.channels + c;
+        if (!keep) data[index] = source.data[index];
+        if (data[index] !== source.data[index]) changed = true;
+      }
+      if (changed) changedPixels++;
+    }
+    if (r % 1024 === 0) { cancelled(options.signal); await yieldNow(); }
+  }
+  const { changedDelta, addedPixels, restoredPixels } = strokes.length ?
+    await applyStrokes(source, data, mask, strokes, options.signal) : { changedDelta: 0, addedPixels: 0, restoredPixels: 0 };
+  cancelled(options.signal);
+  return { cleaned: { ...source, data }, mask: { ...originalMask, data: mask }, excludedRegions,
+    retainedRegions: record.regions.length - excluded.size, changedPixels: changedPixels + changedDelta,
+    acceptedPixels: acceptedPixels + addedPixels - restoredPixels, manualStrokes: strokes.length, addedPixels, restoredPixels };
+}
+
+async function writeStage(loaded, composed, prefix, options) {
+  cancelled(options.signal);
+  await requireWorkSpace(loaded.job, composed.cleaned);
+  const stage = await fs.mkdtemp(path.join(loaded.job, prefix));
+  const paths = { cleaned: path.join(stage, 'cleaned.tiff'), mask: path.join(stage, 'dust-mask.tiff'), report: path.join(stage, 'report.json') };
+  try {
+    await fs.writeFile(paths.cleaned, encodeTiff(composed.cleaned), { flag: 'wx', mode: 0o600 });
+    cancelled(options.signal);
+    await fs.writeFile(paths.mask, encodeTiff(composed.mask), { flag: 'wx', mode: 0o600 });
+    const originalReport = JSON.parse((await verifiedAsset(loaded, 'report')).toString('utf8'));
+    const stats = { ...loaded.record.stats, changed_pixels: composed.changedPixels, healed_pixels: composed.acceptedPixels,
+      review_regions: loaded.record.regions.length, excluded_regions: composed.excludedRegions.length, retained_regions: composed.retainedRegions,
+      manual_strokes: composed.manualStrokes, added_pixels: composed.addedPixels, restored_pixels: composed.restoredPixels };
+    const confirmed = prefix.startsWith('confirmed');
+    await fs.writeFile(paths.report, JSON.stringify({ ...originalReport, version, stats,
+      review: { id: loaded.record.id, excludedRegions: composed.excludedRegions, retainedRegions: composed.retainedRegions, confirmed,
+        ...(confirmed && { format: options.format }) } }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    cancelled(options.signal);
+    return { outputDir: stage, paths, stats, changed: composed.changedPixels > 0 };
+  } catch (error) { await fs.rm(stage, { recursive: true, force: true }); throw error; }
+}
+
+async function renderReviewPreview(reviewPath, edits = {}, options = {}) {
+  const loaded = await readReview(reviewPath, options);
+  const composed = await recompose(loaded, edits, options);
+  const result = await writeStage(loaded, composed, 'preview-', options);
+  return { cleanedPath: result.paths.cleaned, maskPath: result.paths.mask, excludedRegions: composed.excludedRegions,
+    retainedRegions: composed.retainedRegions, changed: result.changed, stats: result.stats };
+}
+
+async function confirmReview(reviewPath, edits = {}, options = {}) {
+  const format = options.format ?? 'tiff';
+  if (!['tiff', 'jpeg', 'png'].includes(format)) fail('请选择 TIFF、JPEG 或 PNG 导出。');
+  const loaded = await readReview(reviewPath, options), lockPath = path.join(loaded.job, 'confirm.lock');
+  if (loaded.record.context === 'photocraft' && format !== 'tiff') fail('导回 PhotoCraft 需要 TIFF。');
+  if (options.outputRoot !== undefined) {
+    if (loaded.record.context !== 'file') fail('仅文件审核可以在确认时更改保存位置。');
+    if (typeof options.outputRoot !== 'string' || !options.outputRoot || options.outputRoot.includes('\0')) fail('请选择有效的结果保存目录。');
+  }
+  if (options.includeMask !== undefined &&
+      (loaded.record.context !== 'file' || typeof options.includeMask !== 'boolean')) fail('仅文件审核可以选择是否导出蒙版。');
+  let lock;
+  try { lock = await fs.open(lockPath, 'wx', 0o600); }
+  catch (error) { if (error.code === 'EEXIST') fail('此预览正在确认，请勿重复应用。'); throw error; }
+  let published = null, stage = null, previous = null;
+  try {
+    // Another process could have completed confirmation between initial read
+    // and lock acquisition; re-read the signed state under the lock.
+    const current = await readReview(reviewPath, options);
+    const composed = await recompose(current, edits, options);
+    await saveRecord(current.reviewPath, { ...current.record, status: 'confirming' }, current.key);
+    previous = current;
+    stage = await writeStage(current, composed, 'confirmed-', { ...options, format });
+    // An explicit mask choice is the standalone app's photo export.
+    // Without that choice, keep the established CLI/PhotoCraft sidecars.
+    const exportPaths = options.includeMask === undefined ? { ...stage.paths } : { cleaned: stage.paths.cleaned };
+    if (options.includeMask === true) exportPaths.mask = stage.paths.mask;
+    if (format !== 'tiff') {
+      exportPaths.cleaned = path.join(stage.outputDir, format === 'jpeg' ? 'cleaned.jpg' : 'cleaned.png');
+      await runImageCodec(['export', stage.paths.cleaned, exportPaths.cleaned, format], options.signal);
+    }
+    const destination = options.outputRoot === undefined ? current.record.outputRoot : path.resolve(options.outputRoot);
+    await fs.mkdir(destination, { recursive: true });
+    published = await fs.mkdtemp(path.join(destination, 'PURENeg-reviewed-'));
+    const paths = {};
+    for (const [name, filename] of Object.entries(exportPaths)) {
+      paths[name] = path.join(published, path.basename(filename));
+      await fs.copyFile(filename, paths[name], require('node:fs').constants.COPYFILE_EXCL);
+    }
+    cancelled(options.signal);
+    const result = { outputDir: published, paths, format, stats: stage.stats, changed: stage.changed,
+      excludedRegions: composed.excludedRegions, retainedRegions: composed.retainedRegions,
+      context: current.record.context, host: current.record.host, stagedPaths: stage.paths };
+    await saveRecord(current.reviewPath, { ...current.record, status: 'confirmed', confirmedAt: new Date().toISOString(), result }, current.key);
+    return result;
+  } catch (error) {
+    if (published) await fs.rm(published, { recursive: true, force: true }).catch(() => {});
+    if (stage) await fs.rm(stage.outputDir, { recursive: true, force: true }).catch(() => {});
+    // Restore the state read under the lock, including any earlier export.
+    if (previous) await saveRecord(previous.reviewPath, previous.record, previous.key).catch(() => {});
+    throw error;
+  } finally { await lock.close(); await fs.rm(lockPath, { force: true }); }
+}
+
+module.exports = { prepareReview, inspectReview, renderReviewPreview, confirmReview, connectedRegions, defaultCacheRoot };
