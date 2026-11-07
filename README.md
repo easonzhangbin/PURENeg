@@ -53,10 +53,14 @@ macOS 界面使用 AppKit 和 SwiftUI。本机检测、审核和导出逻辑使�
 
 应用内的「帮助 → PURE Neg 使用指南」包含中英文操作说明。
 
-## 支持与截图来源
-
-如果你愿意支持后续开发和影像研究，可在支持页面查看支付宝二维码。 [支持 PURE Neg](SUPPORT.md)
+## 截图来源
 
 除尘审核截图中的照片由 PURE Neg 作者拍摄。
 
 观片台示例照片由 Jack Delano 拍摄，来自美国国会图书馆版画与摄影部 FSA/OWI 彩色摄影档案。 [铁路编组场](https://www.loc.gov/item/2017878015/) · [铁路站场](https://www.loc.gov/resource/fsac.1a34616/) · [机车车间](https://www.loc.gov/item/2017878063/) · [南水街货运站](https://www.loc.gov/item/2017878163/)
+
+## 支持 PURE Neg
+
+如果你愿意支持后续开发和影像研究，可以用支付宝扫码。付款前请核对收款方 **StudioPURE**。 [支持 PURE Neg](SUPPORT.md)
+
+<img src="assets/SupportAlipay.jpg" alt="支付宝收款码，收款方 StudioPURE" width="280">
