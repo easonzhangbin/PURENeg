@@ -4,6 +4,8 @@
 
 面向胶片扫描件的 macOS 除尘与修整工具。从一整卷里选出要处理的底片，检查自动标出的灰尘、划痕和纤维，再逐张修整和导出。
 
+PURE Neg 是独立维护的 macOS 应用。除尘引擎基于 Magnus Holmes 的 MIT 开源项目。 [上游项目 film-dust](https://github.com/magholmes/film-dust) · [基准提交 `fcf68d6`](https://github.com/magholmes/film-dust/commit/fcf68d6c6a77e4373db28f878c7f80f7b8934f3f)
+
 [下载 PURE Neg 0.4.6 正式版](https://github.com/easonzhangbin/PURENeg/releases/tag/v0.4.6) · Apple 芯片 Mac，macOS 14 或更新版本。
 
 [源码与构建](#源码与构建) · [技术内核与开源项目](#技术内核与开源项目) · [支持 PURE Neg](SUPPORT.md)
