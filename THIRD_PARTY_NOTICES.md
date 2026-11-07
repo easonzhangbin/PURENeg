@@ -19,3 +19,7 @@ The macOS application bundles the Node.js runtime. Its complete license, includi
 ## Application artwork
 
 The PURE Neg branding, support payment artwork, and the example photographs used in documentation are separate from the software's MIT license. See the project README for the photo credits.
+
+## Sparkle
+
+Updater-enabled macOS builds include Sparkle. Its license is bundled in the app's third-party licenses. [Sparkle source and license](https://github.com/sparkle-project/Sparkle)

@@ -117,3 +117,16 @@
 "Photoshop 没有返回可读取的临时 TIFF。" = "Photoshop did not return a readable temporary TIFF.";
 "Photoshop 无法创建临时副本。" = "Photoshop could not create a temporary copy.";
 "等待预览时，中央显示当前照片的模糊背景。细尘会成团卷过画面，近处偶尔掠过虚焦的颗粒。预览就绪后会显示清晰的修复结果。" = "While the preview loads, fine dust drifts in clouds over a blurred view of the photo, with occasional out-of-focus flecks in the foreground. The sharp repair preview appears as soon as it is ready.";
+"检查更新…" = "Check for Updates…";
+"GitHub 项目主页" = "Project on GitHub";
+"发现 PURE Neg 新版本" = "A new version of PURE Neg is available";
+"版本 %@ 已发布。打开 GitHub 下载更新。" = "Version %@ is available. Open GitHub to download the update.";
+"查看并下载更新" = "View and Download Update";
+"稍后" = "Later";
+"你使用的是最新版本" = "You’re using the latest version";
+"好" = "OK";
+"暂时无法检查更新" = "Couldn’t check for updates";
+"打开 GitHub 发布页并登录有访问权限的账号。" = "Open GitHub Releases and sign in with an account that has access.";
+"请检查网络后重试，也可以打开 GitHub 发布页。" = "Check your connection and try again, or open GitHub Releases.";
+"打开 GitHub 发布页" = "Open GitHub Releases";
+"关闭" = "Close";

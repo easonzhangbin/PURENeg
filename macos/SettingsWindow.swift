@@ -314,6 +314,7 @@ private struct PureNegSettingsView: View {
     @AppStorage(AppPreferences.Key.conserveMemory) private var conserveMemory = AppPreferences.defaultConserveMemory
     @AppStorage(AppPreferences.Key.autoDetectWhenIdle) private var autoDetectWhenIdle = true
     @AppStorage(AppPreferences.Key.language) private var language = "zh-Hans"
+    @AppStorage(AppUpdates.automaticChecksKey) private var automaticUpdateChecks = true
 
     var body: some View {
         let idleSeconds = Int(AppPreferences.idleDetectionDelay)
@@ -325,6 +326,10 @@ private struct PureNegSettingsView: View {
                 }
                 Text(label("重新打开 PURE Neg 后应用界面语言。", "Reopen PURE Neg to apply the interface language."))
                     .foregroundStyle(.secondary)
+                Toggle(label("自动检查更新", "Check for Updates Automatically"), isOn: $automaticUpdateChecks)
+                    .onChange(of: automaticUpdateChecks) { _, enabled in
+                        AppUpdates.shared.setAutomaticChecks(enabled)
+                    }
             }
             .formStyle(.grouped)
             .tabItem { Label(label("通用", "General"), systemImage: "gearshape") }

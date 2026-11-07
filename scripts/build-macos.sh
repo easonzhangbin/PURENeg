@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST_DIR="${DIST_DIR:-$PROJECT_DIR/dist/release-0.4.6}"
+DIST_DIR="${DIST_DIR:-$PROJECT_DIR/dist/release-0.4.7}"
 FINAL_APP_DIR="$DIST_DIR/PURE Neg.app"
 BUILD_DIR="$PROJECT_DIR/.build/macos"
 ICON_SOURCE="$PROJECT_DIR/assets/PURENeg.png"
@@ -11,6 +11,10 @@ LAUNCH_SOURCE="$PROJECT_DIR/assets/PURENeg-launch.png"
 SUPPORT_SOURCE="$PROJECT_DIR/assets/SupportAlipay.jpg"
 NODE_BINARY="${NODE_BINARY:-$(command -v node || true)}"
 NODE_LICENSE="${NODE_LICENSE:-}"
+SPARKLE_DIR="${SPARKLE_DIR:-}"
+PURENEG_APPCAST_URL="${PURENEG_APPCAST_URL:-}"
+PURENEG_UPDATE_PUBLIC_KEY="${PURENEG_UPDATE_PUBLIC_KEY:-}"
+PURENEG_UPDATE_TEST="${PURENEG_UPDATE_TEST:-0}"
 LAUNCHER="$PROJECT_DIR/scripts/打开 PURE Neg.command"
 package_mode=
 case "${APP_ONLY:-0}:${PACKAGE_BETA:-0}:${PACKAGE_RELEASE:-0}" in
@@ -65,6 +69,40 @@ if [[ -z "$NODE_LICENSE" || ! -f "$NODE_LICENSE" ]]; then
   exit 1
 fi
 
+app_frameworks=(-framework AppKit -framework UniformTypeIdentifiers)
+if [[ -n "$SPARKLE_DIR$PURENEG_APPCAST_URL$PURENEG_UPDATE_PUBLIC_KEY" || "$PURENEG_UPDATE_TEST" != 0 ]]; then
+  if [[ ! -f "$SPARKLE_DIR/Sparkle.framework/Sparkle" || ! -f "$SPARKLE_DIR/LICENSE" ||
+        -z "$PURENEG_APPCAST_URL" || ! "$PURENEG_UPDATE_PUBLIC_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    echo "Set SPARKLE_DIR to the extracted Sparkle distribution, PURENEG_APPCAST_URL, and PURENEG_UPDATE_PUBLIC_KEY to the 32-byte Base64 EdDSA public key." >&2
+    exit 1
+  fi
+  if [[ "$PURENEG_UPDATE_TEST" != 0 && ( "$PURENEG_UPDATE_TEST" != 1 || "${APP_ONLY:-0}" != 1 ) ]]; then
+    echo "PURENEG_UPDATE_TEST=1 is only supported with APP_ONLY=1." >&2
+    exit 1
+  fi
+  if ! "$NODE_BINARY" -e '
+    const address = process.argv[1];
+    const url = URL.canParse(address) ? new URL(address) : null;
+    const testing = process.argv[2] === "1";
+    const allowed = url && !url.username && !url.password && !url.hash &&
+      (url.protocol === "https:" ||
+        (testing && url.protocol === "http:" && ["localhost", "127.0.0.1"].includes(url.hostname)));
+    process.exit(allowed ? 0 : 1);
+  ' "$PURENEG_APPCAST_URL" "$PURENEG_UPDATE_TEST"; then
+    echo "PURENEG_APPCAST_URL must be HTTPS, or a localhost HTTP URL in a local update test." >&2
+    exit 1
+  fi
+  sparkle_version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw "$SPARKLE_DIR/Sparkle.framework/Resources/Info.plist")"
+  if ! "$NODE_BINARY" -e '
+    const version = /^2\.(\d+)\.\d+$/.exec(process.argv[1]);
+    process.exit(version && Number(version[1]) >= 9 ? 0 : 1);
+  ' "$sparkle_version"; then
+    echo "Use a stable Sparkle 2 release at version 2.9.0 or later." >&2
+    exit 1
+  fi
+  app_frameworks+=(-F "$SPARKLE_DIR" -framework Sparkle -Xlinker -rpath -Xlinker '@loader_path/../Frameworks')
+fi
+
 mkdir -p "$BUILD_DIR" "$DIST_DIR"
 STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/PURENeg-bundle.XXXXXX")"
 trap 'rm -rf "$STAGING_DIR"' EXIT
@@ -81,12 +119,13 @@ if [[ ( "$ARCH" == "arm64" && "$NODE_ARCH" != "arm64" ) || ( "$ARCH" == "x86_64"
 fi
 
 swiftc -parse-as-library -swift-version 5 -O -target "$ARCH-apple-macos14.0" \
-  -framework AppKit -framework UniformTypeIdentifiers \
+  "${app_frameworks[@]}" \
   "$PROJECT_DIR/macos/PURENeg.swift" "$PROJECT_DIR/macos/PreviewCanvas.swift" \
   "$PROJECT_DIR/macos/ReviewLoadingView.swift" \
   "$PROJECT_DIR/macos/BatchLightTable.swift" "$PROJECT_DIR/macos/BatchReviewSidebar.swift" \
   "$PROJECT_DIR/macos/PhotoshopImport.swift" "$PROJECT_DIR/macos/SupportWindows.swift" \
-  "$PROJECT_DIR/macos/SettingsWindow.swift" "$PROJECT_DIR/macos/Localization.swift" -o "$BUILD_DIR/PURENeg"
+  "$PROJECT_DIR/macos/SettingsWindow.swift" "$PROJECT_DIR/macos/Localization.swift" \
+  "$PROJECT_DIR/macos/AppUpdates.swift" -o "$BUILD_DIR/PURENeg"
 swiftc -parse-as-library -swift-version 5 -O -target "$ARCH-apple-macos14.0" \
   -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers \
   "$PROJECT_DIR/macos/ImageCodec.swift" -o "$BUILD_DIR/image-codec"
@@ -120,8 +159,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>PURE Neg</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.4.6</string>
-  <key>CFBundleVersion</key><string>18</string>
+  <key>CFBundleShortVersionString</key><string>0.4.7</string>
+  <key>CFBundleVersion</key><string>19</string>
   <key>CFBundleIconFile</key><string>PURENeg</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSAppleEventsUsageDescription</key><string>PURE Neg 需要读取 Photoshop 当前文档的可见图像，用于在本机生成除尘预览。</string>
@@ -133,6 +172,24 @@ PLIST
 
 if [[ "${APP_ONLY:-0}" == "1" ]]; then
   /usr/bin/plutil -replace CFBundleIdentifier -string local.filmdust.photocraft.review.validation "$APP_DIR/Contents/Info.plist"
+fi
+if [[ -n "$SPARKLE_DIR" ]]; then
+  sparkle_framework="$APP_DIR/Contents/Frameworks/Sparkle.framework"
+  app_plist="$APP_DIR/Contents/Info.plist"
+  mkdir -p "$APP_DIR/Contents/Frameworks"
+  ditto --norsrc --noextattr --noqtn "$SPARKLE_DIR/Sparkle.framework" "$sparkle_framework"
+  cp -X "$SPARKLE_DIR/LICENSE" "$APP_DIR/Contents/Resources/ThirdPartyLicenses/Sparkle-LICENSE"
+  /usr/bin/plutil -insert SUFeedURL -string "$PURENEG_APPCAST_URL" "$app_plist"
+  /usr/bin/plutil -insert SUPublicEDKey -string "$PURENEG_UPDATE_PUBLIC_KEY" "$app_plist"
+  /usr/bin/plutil -insert SUEnableAutomaticChecks -bool YES "$app_plist"
+  /usr/bin/plutil -insert SUScheduledCheckInterval -integer 3600 "$app_plist"
+  /usr/bin/plutil -insert SUAllowsAutomaticUpdates -bool NO "$app_plist"
+  /usr/bin/plutil -insert SUVerifyUpdateBeforeExtraction -bool YES "$app_plist"
+  /usr/bin/plutil -insert SURequireSignedFeed -bool YES "$app_plist"
+  /usr/bin/plutil -insert SUSignedFeedFailureExpirationInterval -integer 0 "$app_plist"
+  if [[ "$PURENEG_UPDATE_TEST" == 1 ]]; then
+    /usr/bin/plutil -insert NSAppTransportSecurity -xml '<dict><key>NSAllowsLocalNetworking</key><true/></dict>' "$app_plist"
+  fi
 fi
 
 ICONSET="$STAGING_DIR/PURENeg.iconset"
@@ -154,6 +211,14 @@ if [[ "${ADHOC_SIGN:-1}" == "1" ]]; then
     [[ -f "$addon" ]] || continue
     codesign --force --sign - "$addon"
   done
+  if [[ -n "$SPARKLE_DIR" ]]; then
+    sparkle_version_dir="$sparkle_framework/Versions/Current"
+    for helper in "$sparkle_version_dir/Autoupdate" "$sparkle_version_dir/Updater.app" "$sparkle_version_dir/XPCServices/"*.xpc; do
+      [[ -e "$helper" ]] || continue
+      codesign --force --sign - --preserve-metadata=flags,entitlements "$helper"
+    done
+    codesign --force --sign - "$sparkle_framework"
+  fi
   codesign --force --sign - "$APP_DIR"
   codesign --verify --deep --strict "$APP_DIR"
 fi
@@ -188,6 +253,12 @@ if [[ -n "$package_mode" ]]; then
   ditto -c -k --norsrc --keepParent "$package_dir" "$STAGING_DIR/distribution.zip"
   mv -f "$STAGING_DIR/distribution.zip" "$package_archive"
   echo "Distribution archive: $package_archive"
+  if [[ "$package_mode" == "release" && -n "$SPARKLE_DIR" ]]; then
+    update_archive="$DIST_DIR/PURE-Neg-$app_version-macos-$ARCH-update.zip"
+    ditto -c -k --norsrc --keepParent "$APP_DIR" "$STAGING_DIR/update.zip"
+    mv -f "$STAGING_DIR/update.zip" "$update_archive"
+    echo "Sparkle update archive: $update_archive"
+  fi
 fi
 
 echo "Built: $FINAL_APP_DIR"

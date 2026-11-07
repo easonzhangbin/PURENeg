@@ -107,3 +107,5 @@ macOS ZIP 包含应用、双击启动脚本、Node.js、引擎及权重，使用
 完整引擎基于 `magholmes/film-dust` 提交 `fcf68d6c6a77e4373db28f878c7f80f7b8934f3f`，项目加入按类别选择及原像素划痕／纤维增强。标准 Wasm 滤镜为独立的局部实现，算法设计参考该 MIT 项目。详见[第三方许可说明](../THIRD_PARTY_NOTICES.md)。
 
 软件源码采用 [MIT 许可](../LICENSE)。Photoshop 载入使用 macOS 自动化通信。独立文件处理无需安装 Photoshop。与 PhotoCraft 或原 film-dust 作者没有官方合作或背书关系。
+
+正式发布的更新签名与打包步骤见[发布更新说明](../UPDATE_RELEASES.md)。

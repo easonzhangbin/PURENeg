@@ -6,7 +6,7 @@
 
 PURE Neg 是独立维护的 macOS 应用。除尘引擎基于 Magnus Holmes 的 MIT 开源项目。 [上游项目 film-dust](https://github.com/magholmes/film-dust) · [基准提交 `fcf68d6`](https://github.com/magholmes/film-dust/commit/fcf68d6c6a77e4373db28f878c7f80f7b8934f3f)
 
-[下载 PURE Neg 0.4.6 正式版](https://github.com/easonzhangbin/PURENeg/releases/tag/v0.4.6) · Apple 芯片 Mac，macOS 14 或更新版本。
+[下载 PURE Neg 正式版](https://github.com/easonzhangbin/PURENeg/releases/latest) · Apple 芯片 Mac，macOS 14 或更新版本。
 
 [源码与构建](#源码与构建) · [技术内核与开源项目](#技术内核与开源项目) · [支持 PURE Neg](SUPPORT.md)
 
@@ -51,7 +51,9 @@ macOS 界面使用 AppKit 和 SwiftUI。本机检测、审核和导出逻辑使�
 
 从 [Releases](https://github.com/easonzhangbin/PURENeg/releases) 下载 macOS ZIP。解压后保留完整文件夹，双击「打开 PURE Neg.command」。安装包使用本地临时签名，尚未经过 Apple 公证。
 
-应用内的「帮助 → PURE Neg 使用指南」包含中英文操作说明。
+应用会定期检查 GitHub 正式版，发现新版时可在提示中下载安装。可从「PURE Neg → 检查更新…」立即检查，或在「设置 → 通用」调整自动检查。
+
+「帮助」菜单提供 GitHub 项目主页和中英文使用指南。
 
 ## 截图来源
 

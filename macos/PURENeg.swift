@@ -1430,6 +1430,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         NSApp.applicationIconImage = StudioStyle.appIcon
         createMenu()
         buildWindow()
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2)) { AppUpdates.shared.start() }
         if let index = CommandLine.arguments.firstIndex(of: "--open-review") {
             showMainWindow()
             guard CommandLine.arguments.indices.contains(index + 1) else { fail(L10n.text("缺少审核记录路径。")); return }
@@ -1536,6 +1537,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let about = NSMenuItem(title: L10n.text("关于 \(appTitle)"), action: #selector(showAbout), keyEquivalent: "")
         about.target = self
         appMenu.addItem(about)
+        let updates = NSMenuItem(title: L10n.surface("检查更新…"), action: #selector(checkForUpdates), keyEquivalent: "")
+        updates.target = self
+        appMenu.addItem(updates)
         let settings = NSMenuItem(title: L10n.text("设置…"), action: #selector(showSettings), keyEquivalent: ",")
         settings.target = self
         appMenu.addItem(settings)
@@ -1561,6 +1565,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let guide = NSMenuItem(title: SupportWindows.guideTitle, action: #selector(showGuide), keyEquivalent: "?")
         guide.target = self
         help.addItem(guide)
+        let project = NSMenuItem(title: L10n.surface("GitHub 项目主页"), action: #selector(openGitHubProject), keyEquivalent: "")
+        project.target = self
+        help.addItem(project)
         help.addItem(.separator())
         let support = NSMenuItem(title: SupportWindows.supportTitle, action: #selector(showSupport), keyEquivalent: "")
         support.target = self
@@ -1573,6 +1580,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     @objc private func showGuide() { SupportWindows.showGuide() }
     @objc private func showSupport() { SupportWindows.showSupport() }
+    @objc private func checkForUpdates() { AppUpdates.shared.checkManually() }
+    @objc private func openGitHubProject() { NSWorkspace.shared.open(AppUpdates.projectURL) }
     @MainActor @objc private func showSettings() {
         SettingsWindow.show { [weak self] in
             guard let self else { return false }
@@ -1591,11 +1600,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     @objc private func showAbout() {
+        let credits = NSMutableAttributedString(string: L10n.text("胶片扫描除尘与修整\n\n基于 Magnus Holmes 的 film-dust（MIT）。\n通过 PhotoCraft 本地控制接口建立修复图层与蒙版。\n第三方许可见应用 Resources 中的 vendor/film-dust。") + "\n\n")
+        credits.append(NSAttributedString(string: AppUpdates.projectURL.absoluteString,
+                                          attributes: [.link: AppUpdates.projectURL]))
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: appTitle,
-            .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.6",
+            .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
             .applicationIcon: StudioStyle.appIcon,
-            .credits: NSAttributedString(string: L10n.text("胶片扫描除尘与修整\n\n基于 Magnus Holmes 的 film-dust（MIT）。\n通过 PhotoCraft 本地控制接口建立修复图层与蒙版。\n第三方许可见应用 Resources 中的 vendor/film-dust。"))
+            .credits: credits
         ])
     }
 
