@@ -1,8 +1,12 @@
+![PURE Neg 启动画面。深色背景中并排显示应用图标和字标](docs/images/launch.png)
+
 # PURE Neg
 
 面向胶片扫描件的 macOS 除尘与修整工具。从一整卷里选出要处理的底片，检查自动标出的灰尘、划痕和纤维，再逐张修整和导出。
 
 [下载 PURE Neg 0.4.6 Beta 1](https://github.com/easonzhangbin/PURENeg/releases/tag/v0.4.6-beta.1) · Apple 芯片 Mac，macOS 14 或更新版本。
+
+[源码与构建](#源码与构建) · [技术内核与开源项目](#技术内核与开源项目) · [支持 PURE Neg](SUPPORT.md)
 
 ## 界面与操作
 
@@ -18,11 +22,9 @@
 
 中央画布可切换「原图」「修复后」和「分割对比」，也能缩放检查。左栏用可调颜色和不透明度的蒙版标出修复位置。用画笔补修漏点，用橡皮擦恢复误修，也可从点位列表排除整处。右栏保留原始帧号，显示检测进度和审核状态。批量处理时，默认闲置 4 秒后检测其余照片，操作时暂停。
 
-在 0.4.6 Beta 1 中，通过审核后可「导出当前」，或勾选多张照片后「导出所选」。支持按原始分辨率导出 TIFF、JPEG 或 PNG，并可另存修复蒙版。
+截图展示 0.4.6 Beta 1，先点「通过审核」，再导出当前或所选照片。仓库源码中的批量流程可直接导出预览就绪的照片。支持按原始分辨率导出 TIFF、JPEG 或 PNG，并可另存修复蒙版。
 
 ## 视觉设计
-
-![PURE Neg 启动画面。深色背景中并排显示应用图标和字标](docs/images/launch.png)
 
 观片台取自实体灯板和半透明底片袋。袋口、帧号与抽出底片的动作让整卷照片的位置一眼可辨。审核页把照片留在中央，工具和批次信息分列两侧。
 
@@ -30,11 +32,28 @@
 
 等待预览时，中央保留当前照片的模糊背景，细尘成团卷过画面，近处偶尔掠过虚焦颗粒。预览就绪后，等待画面淡入清晰的修复结果。
 
-## 安装与许可
+## 源码与构建
+
+macOS 界面使用 AppKit 和 SwiftUI。本机检测、审核和导出逻辑使用 JavaScript，支持通过 Node-API 调用 C++ 加速内核。 [macOS 界面](macos/) · [处理流程](src/) · [除尘引擎](vendor/film-dust/) · [构建指南](docs/BUILD.md) · [macOS 构建脚本](scripts/build-macos.sh)
+
+## 技术内核与开源项目
+
+- **film-dust**。自动检测与修补基于 Magnus Holmes 的 MIT 项目。PURE Neg 在原始像素上补充划痕检测和纤维追踪，并实现观片台、点位审核、蒙版修整与批量导出。 [基准提交 `fcf68d6`](https://github.com/magholmes/film-dust/commit/fcf68d6c6a77e4373db28f878c7f80f7b8934f3f)
+- **scikit-image**。film-dust 的骨架细化查表方法参考了该项目的实现。 [项目主页](https://scikit-image.org/)
+- **Torchvision**。按 film-dust 的上游说明，其场景判断模型基于 MobileNetV3-small ImageNet 权重。 [模型文档](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.mobilenet_v3_small.html)
+- **Node.js**。内测包随附本机运行环境，用于执行检测和修补引擎。 [项目主页](https://nodejs.org/)
+
+软件源码采用 MIT 许可。图标、字标、启动画面、收款码和示例照片分别保留各自的权利与署名。 [项目许可](LICENSE) · [第三方许可说明](THIRD_PARTY_NOTICES.md) · [引擎上游声明](vendor/film-dust/NOTICES.txt)
+
+## 安装与使用指南
 
 从 [Releases](https://github.com/easonzhangbin/PURENeg/releases) 下载 macOS 内测 ZIP。解压后保留完整文件夹，双击「打开 PURE Neg.command」。内测包采用临时签名，首次打开时可按 macOS 的提示完成授权。
 
-应用内的「帮助 → PURE Neg 使用指南」包含中英文操作说明。除尘引擎基于 Magnus Holmes 的 [film-dust](https://github.com/magholmes/film-dust)，完整第三方许可随应用提供。
+应用内的「帮助 → PURE Neg 使用指南」包含中英文操作说明。
+
+## 支持与截图来源
+
+如果你愿意支持后续开发和影像研究，可在支持页面查看支付宝二维码。 [支持 PURE Neg](SUPPORT.md)
 
 除尘审核截图中的照片由 PURE Neg 作者拍摄。
 
