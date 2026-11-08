@@ -44,13 +44,13 @@ Import a batch of TIFF or JPEG scans and click frames to move them from the film
 
 ### 除尘审核 · Repair review
 
-![PURE Neg 0.4.8 的除尘审核页。检查模式下，绿色蒙版标出 313 处自动修复，鼠标悬停的纤维外圈出现光圈和撤销提示](docs/images/review.png)
+![PURE Neg 0.4.8 的除尘审核页。检查模式下，绿色蒙版标出 313 处自动修复，鼠标悬停在啤酒杯口一处误识别上，外圈出现光圈和撤销提示](docs/images/review.png)
 
 中央画布可切换「原图」「修复后」和「分割对比」，也能缩放检查。左栏用可调颜色和不透明度的蒙版标出修复位置。在检查模式把鼠标移到修复点上，修复点外圈会出现呼吸光圈，提示会写明类别和「点击后可撤销此处修复」。用画笔补修漏点，用橡皮擦恢复误修，也可从点位列表排除整处；每张最多 1024 笔。撤销、重做或修整后重新计算时，画面右上角显示「正在更新…」。进入「分割对比」时自动隐藏蒙版，离开后恢复原设置。右栏保留原始帧号，显示检测进度和处理状态。检测中可直接点击另一张照片切换。批量处理时，默认闲置 4 秒后检测其余照片，操作时暂停。
 
 Switch between **Original**, **Repaired**, and **Split View**, and zoom in to inspect the repair mask. Hover a repair to see a glowing ring and a hint that a click undoes it. Use the brush on missed spots, the eraser to restore details, or the spot list to exclude a whole detection. An indicator shows while the preview updates, and Split View hides the mask until you leave it. The sidebar keeps the original frame numbers and shows processing progress. Batch detection starts after four seconds of inactivity by default and pauses while you work.
 
-![检查模式细节：悬停在一根纤维上，外圈出现暖色光圈，提示「毛发 / 纤维 · 点击后可撤销此处修复」](docs/images/review-hover.png)
+![检查模式细节：杯口高光被误认成纤维，悬停后外圈出现暖色光圈，提示「毛发 / 纤维 · 点击后可撤销此处修复」，点一下即可恢复原样](docs/images/review-hover.png)
 
 检查修复结果后，点左下角「导出当前」。也可在右侧勾选多张照片，再点「导出所选」。支持按原始分辨率导出 TIFF、JPEG 或 PNG。照片直接保存到所选目录，文件名为「原文件名-PN」，例如 `20250918-ECN213064-PN.jpg`；重名时自动加序号，不会覆盖。修复蒙版 TIFF 默认不导出，需要时在保存窗口勾选。导出后仍可继续修整，再导出一个新版本。
 
