@@ -59,6 +59,263 @@ private func engraved(_ text: String, x: CGFloat, y: CGFloat, size: CGFloat = 9,
     ])
 }
 
+// [Claude 2026-11-08] Frosted polypropylene (see claude/CHANGES.md). A sleeve or tray on
+// the lamp passes most of the light, but not evenly: the matte surface has a fine grain and
+// the sheet never lies quite flat on the glass. Both are drawn as darkening only (black with
+// a varying alpha), so they look the same over the SDR diffuser and in the HDR mask.
+private enum Frost {
+    private static func noise(width: Int, height: Int, seed: UInt32, smoothing: Int) -> CGImage? {
+        var state = seed &* 2_654_435_761 &+ 1
+        func next() -> Float {
+            state = state &* 1_664_525 &+ 1_013_904_223
+            return Float(state >> 8) / 16_777_216
+        }
+        var values = (0..<(width * height)).map { _ in next() }
+        // Wrap-around box blur, so tiled copies join without a seam.
+        for _ in 0..<smoothing {
+            var blurred = values
+            for y in 0..<height {
+                for x in 0..<width {
+                    var sum: Float = 0
+                    for dy in -1...1 {
+                        for dx in -1...1 {
+                            sum += values[((y + dy + height) % height) * width + (x + dx + width) % width]
+                        }
+                    }
+                    blurred[y * width + x] = sum / 9
+                }
+            }
+            values = blurred
+        }
+        let count = Float(values.count)
+        let mean = values.reduce(0, +) / count
+        let spread = max(1e-6, (values.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / count).squareRoot())
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        for i in values.indices {
+            // Mean one half, three standard deviations to either end.
+            let level = 0.5 + (values[i] - mean) / spread / 6
+            bytes[4 * i + 3] = UInt8((min(1, max(0, level)) * 255).rounded())
+        }
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: width * 4, space: space,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+    }
+
+    /// The matte surface: grain about a point across, tiled.
+    private static let grain = noise(width: 128, height: 128, seed: 7, smoothing: 1)
+
+    /// Darkens the inside of `path` by up to `grainDepth` in fine grain and up to
+    /// `mottleDepth` in a few broad swells across it (the same swells for the same seed).
+    static func texture(_ path: NSBezierPath, seed: Int, grainDepth: CGFloat, mottleDepth: CGFloat) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        NSGraphicsContext.saveGraphicsState()
+        path.addClip()
+        if let grain {
+            context.setAlpha(grainDepth)
+            context.draw(grain, in: CGRect(x: 0, y: 0, width: 128, height: 128), byTiling: true)
+        }
+        if let mottle = noise(width: 10, height: 6, seed: UInt32(truncatingIfNeeded: seed &+ 1000), smoothing: 0) {
+            context.setAlpha(mottleDepth)
+            context.interpolationQuality = .high
+            context.draw(mottle, in: path.bounds)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+    }
+}
+
+/// A heat-sealed seam: the sleeve's two layers fused into one clearer band, the sealing
+/// bar's fine ribs pressed across it and its two edges just visible.
+private func weldedSeam(_ band: NSRect, vertical: Bool) {
+    guard band.width > 0, band.height > 0 else { return }
+    fill(NSBezierPath(rect: band), neutral(1, 0.42))
+    let ribs = NSBezierPath()
+    let edges = NSBezierPath()
+    if vertical {
+        var y = band.minY + 0.8
+        while y < band.maxY {
+            ribs.move(to: NSPoint(x: band.minX, y: y))
+            ribs.line(to: NSPoint(x: band.maxX, y: y))
+            y += 1.6
+        }
+        for x in [band.minX, band.maxX] {
+            edges.move(to: NSPoint(x: x, y: band.minY))
+            edges.line(to: NSPoint(x: x, y: band.maxY))
+        }
+    } else {
+        var x = band.minX + 0.8
+        while x < band.maxX {
+            ribs.move(to: NSPoint(x: x, y: band.minY))
+            ribs.line(to: NSPoint(x: x, y: band.maxY))
+            x += 1.6
+        }
+        for y in [band.minY, band.maxY] {
+            edges.move(to: NSPoint(x: band.minX, y: y))
+            edges.line(to: NSPoint(x: band.maxX, y: y))
+        }
+    }
+    stroke(ribs, neutral(0.30, 0.07), width: 0.45)
+    stroke(edges, neutral(0.30, 0.20), width: 0.5)
+}
+
+// [Claude 2026-11-07] HDR light-table surfaces (see claude/CHANGES.md).
+// Over the EDR lamp, Core Animation blends in linear light against a backdrop many
+// times brighter than SDR white, so antialiased text, hairlines and the edges of the
+// tilted strips lose their intermediate shades and look jagged. These surfaces instead
+// render their standard lit look over white in gamma space, as without HDR, and hand
+// Core Animation only a transmission mask: black with alpha 1 - T. Compositing that
+// over the lamp multiplies it by T, so every edge keeps the gradation it was drawn with.
+private enum LampTransmission {
+    private static let linear: [Float] = (0..<256).map { value in
+        let c = Float(value) / 255
+        return c <= 0.04045 ? c / 12.92 : powf((c + 0.055) / 1.055, 2.4)
+    }
+
+    static func mask(bounds: NSRect, flipped: Bool, scale: CGFloat, diffusion: Bool, density: Float = 1,
+                     draw: (NSRect) -> Void) -> CGImage? {
+        let width = Int((bounds.width * scale).rounded(.up))
+        let height = Int((bounds.height * scale).rounded(.up))
+        guard width > 0, height > 0, width * height <= 16_777_216,
+              let srgb = CGColorSpace(name: CGColorSpace.sRGB),
+              let linearSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB),
+              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                      bytesPerRow: width * 4, space: srgb,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        context.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.setShouldSmoothFonts(false)
+        context.scaleBy(x: CGFloat(width) / bounds.width, y: CGFloat(height) / bounds.height)
+        if flipped {
+            context.translateBy(x: 0, y: bounds.height)
+            context.scaleBy(x: 1, y: -1)
+        }
+        context.translateBy(x: -bounds.minX, y: -bounds.minY)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: flipped)
+        draw(bounds)
+        NSGraphicsContext.restoreGraphicsState()
+        guard let data = context.data else { return nil }
+
+        let count = width * height
+        let rgba = data.bindMemory(to: UInt8.self, capacity: count * 4)
+        var opacity = [Float](repeating: 0, count: count)
+        for i in 0..<count {
+            let o = 4 * i
+            var transmitted = min(1, max(0, 0.2126 * linear[Int(rgba[o])] + 0.7152 * linear[Int(rgba[o + 1])]
+                + 0.0722 * linear[Int(rgba[o + 2])]))
+            if density < 1 {
+                // [Claude 2026-11-08] Darken whatever lies on the lamp, but leave the bare lamp
+                // (around the surface, through the sleeve's holes) at full brightness: the
+                // factor climbs from density to 1 only over the last few percent.
+                let t2 = transmitted * transmitted, t4 = t2 * t2, t8 = t4 * t4, t32 = t8 * t8 * t8 * t8
+                transmitted *= density + (1 - density) * t32 * t8
+            }
+            opacity[i] = 1 - transmitted
+        }
+        // Print on a frosted sleeve sits in the diffusing plastic: soften it by
+        // about a third of a point, as light scattered by the frosting does.
+        if diffusion, width > 2, height > 2 {
+            var row = [Float](repeating: 0, count: count)
+            for y in 0..<height {
+                let r = y * width
+                for x in 0..<width {
+                    let left = opacity[r + max(0, x - 1)], right = opacity[r + min(width - 1, x + 1)]
+                    row[r + x] = 0.25 * left + 0.5 * opacity[r + x] + 0.25 * right
+                }
+            }
+            for y in 0..<height {
+                let up = max(0, y - 1) * width, down = min(height - 1, y + 1) * width, r = y * width
+                for x in 0..<width {
+                    opacity[r + x] = 0.25 * row[up + x] + 0.5 * row[r + x] + 0.25 * row[down + x]
+                }
+            }
+        }
+        var pixels = [Float16](repeating: 0, count: count * 4)
+        for i in 0..<count { pixels[4 * i + 3] = Float16(opacity[i]) }
+        let bytes = pixels.withUnsafeBytes { Data($0) }
+        guard let provider = CGDataProvider(data: bytes as CFData) else { return nil }
+        let format = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+            .union([.floatComponents, .byteOrder16Little])
+        return CGImage(width: width, height: height, bitsPerComponent: 16, bitsPerPixel: 64,
+                       bytesPerRow: width * 8, space: linearSpace, bitmapInfo: format,
+                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+    }
+}
+
+/// A surface lying on the diffuser. Under the HDR lamp it is shown as a transmission
+/// mask of its standard lit drawing; otherwise AppKit draws it as usual.
+private class LampLitSurface: NSView {
+    private var maskFailed = false
+    var backlight = DiffuserEmission.Mode.off {
+        didSet {
+            guard oldValue != backlight else { return }
+            maskFailed = false
+            if !transmitsLamp { layer?.contents = nil }
+            backlightDidChange()
+            needsDisplay = true
+        }
+    }
+
+    /// Print and outlines diffused by frosted plastic (sleeves, tray); film is sharp.
+    var diffusesPrint: Bool { false }
+
+    /// [Claude 2026-11-08] Under the HDR lamp, the share of its standard-lit transmission this
+    /// surface passes. The bare lamp stays at the screen's peak, so a sleeve or the tray reads
+    /// as a sheet lying on a far brighter light, as on a real light box.
+    var lampDensity: Float { 1 }
+
+    var transmitsLamp: Bool {
+        if case .high = backlight { return !maskFailed }
+        return false
+    }
+
+    override var wantsUpdateLayer: Bool { transmitsLamp }
+
+    override func updateLayer() {
+        guard let layer else { return }
+        let scale = window?.backingScaleFactor ?? max(1, layer.contentsScale)
+        guard let mask = LampTransmission.mask(bounds: bounds, flipped: isFlipped, scale: scale,
+                                               diffusion: diffusesPrint, density: lampDensity, draw: { rect in
+            self.drawSurface(rect, lit: .standard)
+        }) else {
+            // Fall back to drawing the HDR style directly.
+            maskFailed = true
+            layer.contents = nil
+            backlightDidChange()
+            needsDisplay = true
+            return
+        }
+        layer.contentsScale = scale
+        layer.contents = mask
+    }
+
+    override func draw(_ dirtyRect: NSRect) { drawSurface(dirtyRect, lit: backlight) }
+
+    func drawSurface(_ dirtyRect: NSRect, lit mode: DiffuserEmission.Mode) {}
+    func backlightDidChange() {}
+}
+
+/// Polls the lamp's screen for its potential EDR headroom. Holds the lamp weakly and stops once
+/// the lamp is gone, so the timer cannot keep it alive.
+@MainActor private final class HeadroomWatch: NSObject {
+    private weak var lamp: DiffuserEmission?
+
+    init(lamp: DiffuserEmission) {
+        self.lamp = lamp
+        super.init()
+    }
+
+    @objc func tick(_ timer: Timer) {
+        guard let lamp else {
+            timer.invalidate()
+            return
+        }
+        lamp.headroomMayHaveChanged()
+    }
+}
+
 private final class DiffuserEmission: NSView {
     enum Mode: Equatable { case off, standard, high(CGFloat) }
 
@@ -67,12 +324,25 @@ private final class DiffuserEmission: NSView {
     private let emitter = CALayer()
     private let aperture = CAShapeLayer()
     private var renderedMode: Mode?
+    private var headroomTimer: Timer?
     var modeChanged: ((Mode) -> Void)?
-    var isEnabled = false { didSet { updateForDisplay() } }
+    var isEnabled = false {
+        didSet {
+            if oldValue != isEnabled { switchFeedback(on: isEnabled) }
+            updateForDisplay()
+        }
+    }
+    /// [Claude 2026-11-08] A dark veil over the lamp, animated when it is switched: a
+    /// fluorescent tube's starter flickers a few times before it holds, and switching off
+    /// lets the light die away quickly. Clear when the lamp is steady.
+    private let veil = CALayer()
 
     init() {
         super.init(frame: .zero)
         aperture.fillColor = NSColor.white.cgColor
+        veil.backgroundColor = NSColor.black.cgColor
+        veil.opacity = 0
+        emitter.addSublayer(veil)
         emitter.mask = aperture
         layer = emitter
         wantsLayer = true
@@ -89,6 +359,7 @@ private final class DiffuserEmission: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         aperture.frame = bounds
+        veil.frame = bounds
         aperture.path = CGPath(roundedRect: aperture.bounds, cornerWidth: 5, cornerHeight: 5, transform: nil)
         CATransaction.commit()
     }
@@ -96,6 +367,16 @@ private final class DiffuserEmission: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         aperture.contentsScale = window?.backingScaleFactor ?? 1
+        // [Claude 2026-11-08] The potential headroom changes with screen brightness and posts
+        // no notification, so it is polled while the lamp is in a window.
+        headroomTimer?.invalidate()
+        headroomTimer = nil
+        if window != nil {
+            let timer = Timer(timeInterval: 0.5, target: HeadroomWatch(lamp: self),
+                              selector: #selector(HeadroomWatch.tick(_:)), userInfo: nil, repeats: true)
+            RunLoop.main.add(timer, forMode: .common)
+            headroomTimer = timer
+        }
         let center = NotificationCenter.default
         center.removeObserver(self)
         if let window {
@@ -116,6 +397,34 @@ private final class DiffuserEmission: NSView {
 
     @objc private func displayChanged(_ notification: Notification) {
         updateForDisplay()
+    }
+
+    func headroomMayHaveChanged() { updateForDisplay() }
+
+    private func switchFeedback(on: Bool) {
+        SwitchClick.play()
+        veil.removeAllAnimations()
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let animation = CAKeyframeAnimation(keyPath: "opacity")
+        if on && !reduceMotion {
+            // Starter flicker: dark, two short flashes, a weak glow that wavers, then full.
+            animation.values = [0.9, 0.9, 0.35, 0.9, 0.9, 0.15, 0.85, 0.85, 0.4, 0.5, 0.25, 0.32, 0.0]
+            animation.keyTimes = [0, 0.10, 0.14, 0.20, 0.33, 0.38, 0.44, 0.52, 0.58, 0.66, 0.74, 0.82, 1]
+            animation.duration = 1.0
+        } else if on {
+            animation.values = [0.9, 0.0]
+            animation.duration = 0.35
+        } else {
+            // Off: the light dies away over a moment instead of cutting out.
+            let fade = CATransition()
+            fade.type = .fade
+            fade.duration = reduceMotion ? 0.1 : 0.35
+            emitter.add(fade, forKey: "switch")
+            return
+        }
+        animation.isRemovedOnCompletion = true
+        veil.opacity = 0
+        veil.add(animation, forKey: "switch")
     }
 
     private func updateForDisplay() {
@@ -149,11 +458,21 @@ private final class DiffuserEmission: NSView {
         CATransaction.commit()
     }
 
+    /// [Claude 2026-11-08] The lamp runs at the brightest the panel holds over a large area.
+    /// On Apple's XDR panels the potential headroom is the 1600-nit peak over SDR white, but a
+    /// window-sized area is held to about 1000 nits. Asking for the full potential clipped the
+    /// lamp, the sleeve and the film base to the same white; following the headroom currently
+    /// granted locked the lamp near SDR white, because the screen grants only what is asked
+    /// for. So the lamp asks for 1000/1600 of the potential, and screens with little headroom
+    /// give all of theirs.
+    private static let sustainedShare: CGFloat = 0.625
+
     static func peak(potential: CGFloat) -> CGFloat? {
-        // Request the display's full potential so a current value of 1 doesn't suppress opt-in.
-        // Core Animation adapts the tagged image to the headroom actually available onscreen.
         guard potential.isFinite, potential > 1 else { return nil }
-        return potential
+        if potential <= 2.5 { return potential }
+        let lamp = max(2.5, potential * sustainedShare)
+        // In eighths of a stop, rounded down, so brightness drift doesn't re-render every surface.
+        return pow(2, (log2(lamp) * 8).rounded(.down) / 8)
     }
 
     private static let width = 96
@@ -324,22 +643,25 @@ private final class FrameSlot: NSView {
     }
 }
 
-private final class CandidateTray: NSView {
+private final class CandidateTray: LampLitSurface {
     private let title = NSTextField(labelWithString: L10n.surface("候选区 · 点击下方底片移入"))
     private let inset: CGFloat = 12
     private let gap: CGFloat = 10
     private let headerHeight: CGFloat = 27
     private var slots: [UUID: FrameSlot] = [:]
     private(set) var ids: [UUID] = []
-    var backlight = DiffuserEmission.Mode.off {
-        didSet {
-            guard oldValue != backlight else { return }
-            if case .high = backlight {
-                title.textColor = neutral(0.35, 0.76)
-            } else {
-                title.textColor = neutral(0.22)
-            }
-            needsDisplay = true
+
+    override var diffusesPrint: Bool { true }
+    // About three quarters of the lamp passes the tray (0.9 x its standard-lit 0.83).
+    override var lampDensity: Float { 0.9 }
+
+    override func backlightDidChange() {
+        // Under the HDR lamp the title is printed into the tray's transmission mask.
+        title.isHidden = transmitsLamp
+        if case .high = backlight {
+            title.textColor = neutral(0.35, 0.76)
+        } else {
+            title.textColor = neutral(0.22)
         }
     }
 
@@ -408,11 +730,19 @@ private final class CandidateTray: NSView {
             }
             rowTop -= rowHeight + gap
         }
+        if transmitsLamp { needsDisplay = true }
     }
 
-    override func draw(_ dirtyRect: NSRect) {
+    override func drawSurface(_ dirtyRect: NSRect, lit mode: DiffuserEmission.Mode) {
         let outline = rounded(bounds.insetBy(dx: 1, dy: 1), 6)
-        if case .high = backlight {
+        defer {
+            if transmitsLamp, !title.stringValue.isEmpty, let font = title.font {
+                (title.stringValue as NSString).draw(in: title.frame.insetBy(dx: 2, dy: 0), withAttributes: [
+                    .font: font, .foregroundColor: neutral(0.22)
+                ])
+            }
+        }
+        if case .high = mode {
             // Reduce transmitted light so the tray stays visible against the HDR diffuser.
             shade(outline, from: neutral(0.32, 0.54), to: neutral(0.28, 0.61))
             NSGraphicsContext.saveGraphicsState()
@@ -422,6 +752,20 @@ private final class CandidateTray: NSView {
             NSGraphicsContext.restoreGraphicsState()
             frostedStroke(rounded(bounds.insetBy(dx: 3.5, dy: 3.5), 4),
                           white: 0.48, opacity: 0.48, width: 0.7)
+        } else if mode != .off {
+            // [Claude 2026-11-08] Frosted like the sleeve, a little clearer, with a seal under
+            // the header. This is also the HDR look, through LampTransmission.
+            fill(outline, neutral(0.31, 0.11))
+            Frost.texture(outline, seed: 97, grainDepth: 0.06, mottleDepth: 0.07)
+            if bounds.height > headerHeight + 8 {
+                NSGraphicsContext.saveGraphicsState()
+                outline.addClip()
+                weldedSeam(NSRect(x: 8, y: bounds.maxY - headerHeight - 1.2,
+                                  width: max(0, bounds.width - 16), height: 2.4), vertical: false)
+                NSGraphicsContext.restoreGraphicsState()
+            }
+            stroke(rounded(bounds.insetBy(dx: 2.2, dy: 2.2), 5), neutral(1, 0.36), width: 1.1)
+            stroke(outline, neutral(0.26, 0.36), width: 0.7)
         } else {
             fill(outline, neutral(0.31, 0.10))
             stroke(outline, neutral(0.24, 0.34), width: 0.8)
@@ -798,18 +1142,21 @@ private final class LightTable: NSView {
     }
 }
 
-private final class ArchivalSleeve: NSView {
+private final class ArchivalSleeve: LampLitSurface {
     let frames: [FrameButton]
     private let number: Int
     private let first: Int
     private let last: Int
     private var slots: [FilmStripSlot] = []
-    var backlight = DiffuserEmission.Mode.off {
-        didSet {
-            guard oldValue != backlight else { return }
-            needsDisplay = true
-            for frame in frames { frame.setBacklight(backlight) }
-        }
+
+    override var diffusesPrint: Bool { true }
+    // About 60 % of the lamp passes the sleeve's pockets (0.85 x their standard-lit 0.7);
+    // the sealed seams pass a little more and the punched holes all of it.
+    override var lampDensity: Float { 0.85 }
+
+    override func backlightDidChange() {
+        for frame in frames { frame.setBacklight(backlight) }
+        for slot in slots { slot.setBacklight(backlight) }
     }
 
     init(number: Int, first: Int, last: Int, frames: [FrameButton], frameSlots: [FrameSlot]) {
@@ -849,12 +1196,18 @@ private final class ArchivalSleeve: NSView {
         }
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        let lit = backlight != .off
-        let hdr = if case .high = backlight { true } else { false }
+    override func drawSurface(_ dirtyRect: NSRect, lit mode: DiffuserEmission.Mode) {
+        let lit = mode != .off
+        let hdr = if case .high = mode { true } else { false }
         let sheet = rounded(bounds.insetBy(dx: 2, dy: 2), 6)
         let holes = [0.22, 0.45, 0.55, 0.78].map { fraction in
             NSBezierPath(ovalIn: NSRect(x: 10, y: bounds.height * fraction - 3.5, width: 7, height: 7))
+        }
+        // The standard lit look is also what the HDR lamp shows, through LampTransmission;
+        // the code below it is the lamp-off look and the HDR fallback.
+        if lit && !hdr {
+            drawFrosted(sheet: sheet, holes: holes)
+            return
         }
         if lit {
             // Neutral density lets the EDR light through while keeping the plastic visible.
@@ -917,9 +1270,48 @@ private final class ArchivalSleeve: NSView {
         engraved(range, x: bounds.maxX - rangeWidth - 19, y: bounds.maxY - 20, size: 8,
                  color: hdr ? neutral(0.43, 0.74) : neutral(0.37))
     }
+
+    /// [Claude 2026-11-08] The sleeve as frosted plastic rather than an outline: a body that
+    /// passes about three quarters of the lamp, with grain and broad swells; a binding margin
+    /// and seams sealed through, so clearer than the pockets; holes punched to the bare lamp;
+    /// a soft cut edge. The printing sits in the plastic and is softened by LampTransmission.
+    private func drawFrosted(sheet: NSBezierPath, holes: [NSBezierPath]) {
+        let plastic = NSBezierPath()
+        plastic.append(sheet)
+        for hole in holes { plastic.append(hole) }
+        plastic.windingRule = .evenOdd
+        fill(plastic, neutral(0.35, 0.19))
+        Frost.texture(plastic, seed: number, grainDepth: 0.07, mottleDepth: 0.09)
+
+        NSGraphicsContext.saveGraphicsState()
+        plastic.addClip()
+        fill(NSBezierPath(rect: NSRect(x: 0, y: 0, width: 25, height: bounds.height)), neutral(1, 0.32))
+        weldedSeam(NSRect(x: 25, y: 5, width: 2.6, height: max(0, bounds.height - 10)), vertical: true)
+        var seams = [bounds.maxY - 25, 12]
+        if slots.count > 1 { seams.append(bounds.midY - 7) }
+        for y in seams {
+            weldedSeam(NSRect(x: 27.6, y: y - 1.5, width: max(0, bounds.maxX - 6 - 27.6), height: 3), vertical: false)
+        }
+        // Plastic stressed by the punch: a faint ring around each hole.
+        for hole in holes { stroke(hole, neutral(0.32, 0.10), width: 2.4) }
+        NSGraphicsContext.restoreGraphicsState()
+        for hole in holes { stroke(hole, neutral(0.32, 0.42), width: 0.6) }
+
+        // The perimeter seal just inside the edge is clear; the cut edge scatters a little.
+        stroke(rounded(bounds.insetBy(dx: 3.3, dy: 3.3), 4.8), neutral(1, 0.40), width: 1.3)
+        stroke(sheet, neutral(0.30, 0.42), width: 0.75)
+
+        engraved(String(format: "ARCHIVAL SLEEVE  /  ROLL %03d", number),
+                 x: 34, y: bounds.maxY - 20, color: neutral(0.28))
+        let range = String(format: "FRAMES %02d—%02d", first, last)
+        let rangeWidth = (range as NSString).size(withAttributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 8, weight: .medium)
+        ]).width
+        engraved(range, x: bounds.maxX - rangeWidth - 19, y: bounds.maxY - 20, size: 8, color: neutral(0.37))
+    }
 }
 
-private final class FilmStrip: NSView {
+private final class FilmStrip: LampLitSurface {
     private let frameRow: NSStackView
 
     init(frameRow: NSStackView) {
@@ -936,7 +1328,9 @@ private final class FilmStrip: NSView {
         if frameRow.spacing != gap { frameRow.spacing = gap }
     }
 
-    override func draw(_ dirtyRect: NSRect) {
+    override func drawSurface(_ dirtyRect: NSRect, lit mode: DiffuserEmission.Mode) {
+        // The backing is inset from the bounds, so the tilted layer's own edge
+        // falls on transparent pixels and the visible edge keeps its gradation.
         let film = bounds.insetBy(dx: 1, dy: 1)
         let backing = rounded(film, 3)
         castShadow(backing, blur: 3.5, depth: 1.5, opacity: 0.38)
@@ -959,6 +1353,8 @@ private final class FilmStripSlot: NSView {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    func setBacklight(_ mode: DiffuserEmission.Mode) { strip.backlight = mode }
 
     override func layout() {
         super.layout()
@@ -1021,6 +1417,9 @@ private final class IlluminatedThumbnail: NSView {
         CATransaction.commit()
     }
 
+    /// Share of the lamp passed by clear film base (tune here if frames look too bright).
+    static let filmBaseTransmission: Float = 0.8
+
     static func image(_ thumbnail: NSImage, mode: DiffuserEmission.Mode) -> CGImage? {
         guard let source = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil),
               let colorSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB) else { return nil }
@@ -1042,9 +1441,12 @@ private final class IlluminatedThumbnail: NSView {
         let gain: Float
         let ceiling: Float
         if case .high(let peak) = mode {
+            // [Claude 2026-11-07] A frame on a light box is the lamp seen through the film:
+            // clear base passes about 80 % of it, so the highlights sit just under the
+            // diffuser instead of at a fixed SDR multiple far below it.
             headroom = Float(peak)
-            gain = 1.44 + min(1, log2(headroom) * 0.28)
-            ceiling = min(headroom, max(1.02, headroom * 0.80))
+            gain = Self.filmBaseTransmission * headroom
+            ceiling = gain
         } else {
             headroom = 1
             gain = 1.44
@@ -1068,7 +1470,8 @@ private final class IlluminatedThumbnail: NSView {
         guard let provider = CGDataProvider(data: data as CFData) else { return nil }
         let format = floatFormat.union(.byteOrder16Little)
         if #available(macOS 26.0, *), case .high = mode {
-            return CGImage(headroom: imagePeak, width: width, height: height, bitsPerComponent: 16,
+            // Tag the frame with the lamp's headroom so both are tone mapped alike.
+            return CGImage(headroom: max(imagePeak, headroom), width: width, height: height, bitsPerComponent: 16,
                            bitsPerPixel: 64, bytesPerRow: width * 8, space: colorSpace, bitmapInfo: format,
                            provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
         }
@@ -1419,5 +1822,42 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
         StudioStyle.embed(horizontal(views), in: panel, horizontal: 14, vertical: 6)
         panel.heightAnchor.constraint(equalToConstant: height).isActive = true
         return panel
+    }
+}
+
+
+/// [Claude 2026-11-08] The light table's power switch sound: a short two-part mechanical
+/// click (the rocker and its catch), made in code so the app needs no sound file.
+@MainActor private enum SwitchClick {
+    private static let sound: NSSound? = {
+        let rate = 44_100, length = Int(0.09 * Double(rate))
+        var samples = [Int16](repeating: 0, count: length)
+        var seed: UInt32 = 12345
+        func noise() -> Double { seed = seed &* 1_664_525 &+ 1_013_904_223; return Double(seed) / Double(UInt32.max) * 2 - 1 }
+        // Two transients 28 ms apart: a sharp snap, then a softer, lower catch.
+        for (start, gain, decay, tone) in [(0.0, 0.85, 0.0016, 3_400.0), (0.028, 0.45, 0.0025, 1_900.0)] {
+            let s0 = Int(start * Double(rate))
+            for i in 0..<Int(0.02 * Double(rate)) where s0 + i < length {
+                let t = Double(i) / Double(rate)
+                let v = gain * exp(-t / decay) * (0.55 * noise() + 0.45 * sin(2 * .pi * tone * t))
+                samples[s0 + i] = Int16(clamping: Int(Double(samples[s0 + i]) + v * 26_000))
+            }
+        }
+        var data = Data()
+        func put<T: FixedWidthInteger>(_ v: T) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        data.append(contentsOf: Array("RIFF".utf8)); put(UInt32(36 + length * 2))
+        data.append(contentsOf: Array("WAVEfmt ".utf8)); put(UInt32(16)); put(UInt16(1)); put(UInt16(1))
+        put(UInt32(rate)); put(UInt32(rate * 2)); put(UInt16(2)); put(UInt16(16))
+        data.append(contentsOf: Array("data".utf8)); put(UInt32(length * 2))
+        for v in samples { put(v) }
+        let sound = NSSound(data: data)
+        sound?.volume = 0.6
+        return sound
+    }()
+
+    static func play() {
+        guard let sound else { return }
+        sound.stop()
+        sound.play()
     }
 }

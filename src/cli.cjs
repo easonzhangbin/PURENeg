@@ -9,6 +9,7 @@ const { processFile, optionsChecked, cancelled } = require('./processor.cjs');
 const { workRootOverride, defaultWorkRoot, legacyWorkRoot } = require('./workspace.cjs');
 const version = require('./version.cjs');
 const runFile = promisify(execFile);
+const thresholdFlags = ['dust-sensitivity', 'fiber-sensitivity', 'scratch-sensitivity'];
 
 const englishMessages = process.env.PURENEG_LANGUAGE === 'en' ? require('./engine-messages-en.json') : null;
 const emit = (event) => {
@@ -30,7 +31,7 @@ function parseArgs(args) {
   const command = args.shift() || 'help';
   const flags = {};
   const switches = new Set(['launch', 'revise-export']);
-  const allowed = new Set(['input', 'source-name', 'output', 'polarity', 'sensitivity', 'detect', 'work-dir', 'app', 'launch', 'review', 'edits', 'format', 'mask', 'revise-export']);
+  const allowed = new Set(['input', 'source-name', 'output', 'polarity', 'sensitivity', 'detect', 'work-dir', 'app', 'launch', 'review', 'edits', 'format', 'mask', 'revise-export', ...thresholdFlags]);
   while (args.length) {
     const key = args.shift();
     if (!key.startsWith('--') || !allowed.has(key.slice(2))) throw new Error('未知参数：' + key);
@@ -85,6 +86,9 @@ async function main(argv) {
   // v0.2 makes the previous commands safe aliases: analysis never commits to a
   // PhotoCraft document or publishes final files without a separate confirm.
   const command = ({ process: 'prepare', photocraft: 'prepare-photocraft' })[parsed.command] || parsed.command;
+  if (command !== 'redetect' && thresholdFlags.some(key => Object.hasOwn(flags, key))) {
+    throw new Error('分类灵敏度仅用于重新检测。');
+  }
   if (flags.format !== undefined && command !== 'confirm') throw new Error('请在确认审核时选择导出格式。');
   if (flags['source-name'] !== undefined && command !== 'prepare') throw new Error('仅在准备审核时可指定来源名称。');
   const reviseExport = flags['revise-export'] === true;
@@ -97,22 +101,23 @@ async function main(argv) {
       'prepare --input scan.tiff|scan.jpg --output folder [--polarity auto|bright|dark] [--sensitivity 1] [--detect dust,scratches,fibers]',
       'doctor [--launch] [--app /Applications/PhotoCraft.app]',
       'prepare-photocraft --output folder [--polarity auto|bright|dark] [--sensitivity 1] [--detect dust,scratches,fibers]',
+      'redetect --review review.json [--edits edits.json] --dust-sensitivity 1 --fiber-sensitivity 1 --scratch-sensitivity 1',
       'preview --review review.json --edits edits.json [--revise-export]',
       'inspect-review --review review.json',
       'confirm --review review.json --edits edits.json [--format tiff|jpeg|png] [--output folder] [--mask yes|no] [--revise-export]',
     ] });
     return;
   }
-  if (!['prepare', 'doctor', 'prepare-photocraft', 'preview', 'confirm', 'inspect-review'].includes(command)) throw new Error('未知命令：' + command);
+  if (!['prepare', 'doctor', 'prepare-photocraft', 'preview', 'confirm', 'inspect-review', 'redetect'].includes(command)) throw new Error('未知命令：' + command);
   const settings = optionsChecked({ polarity: flags.polarity ?? 'auto', sensitivity: flags.sensitivity === undefined ? 1 : Number(flags.sensitivity), detect: flags.detect });
   const options = { ...settings, conserveMemory: process.env.PURENEG_CONSERVE_MEMORY === '1',
     signal: controller.signal, onProgress: (event) => emit({ type: 'progress', ...event }) };
   const root = workRoot(flags), cacheRoot = path.join(root, 'reviews');
   const hasExplicitRoot = Boolean(flags['work-dir'] || workRootOverride());
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
-  if (command === 'preview' || command === 'confirm' || command === 'inspect-review') {
+  if (command === 'preview' || command === 'confirm' || command === 'inspect-review' || command === 'redetect') {
     if (!flags.review) throw new Error('缺少审核记录；请先分析并预览扫描件。');
-    const { renderReviewPreview, confirmReview, inspectReview } = require('./review.cjs');
+    const { renderReviewPreview, confirmReview, inspectReview, redetectReview } = require('./review.cjs');
     const reviewOptions = { ...options, reviseExport };
     if (hasExplicitRoot) reviewOptions.cacheRoot = cacheRoot;
     if (command === 'inspect-review') {
@@ -122,9 +127,15 @@ async function main(argv) {
     let edits = { excludedRegions: [] };
     if (flags.edits) {
       const editStat = await fs.stat(flags.edits);
-      if (!editStat.isFile() || editStat.size > 1_000_000) throw new Error('审核选择文件无效或过大。');
+      if (!editStat.isFile() || editStat.size > 8_000_000) throw new Error('审核选择文件无效或过大。');
       try { edits = JSON.parse(await fs.readFile(flags.edits, 'utf8')); }
       catch { throw new Error('无法读取审核选择，请重新打开预览。'); }
+    }
+    if (command === 'redetect') {
+      const [dustSensitivity, fiberSensitivity, scratchSensitivity] = thresholdFlags.map(key => Number(flags[key]));
+      const result = await redetectReview(flags.review, edits, { ...reviewOptions, dustSensitivity, fiberSensitivity, scratchSensitivity });
+      emit({ type: 'redetected', ...result });
+      return;
     }
     if (command === 'preview') {
       const preview = await renderReviewPreview(flags.review, edits, reviewOptions);

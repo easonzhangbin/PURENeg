@@ -36,6 +36,11 @@ test('final mask shields low-amplitude intermediate changes and preserves alpha'
 
 test('rejects unsupported modes, transparency and invalid options before processing', () => {
   assert.throws(() => optionsChecked({ sensitivity: NaN }), /灵敏度/);
+  for (const key of ['dustSensitivity', 'fiberSensitivity', 'scratchSensitivity']) {
+    assert.equal(optionsChecked({ [key]: 0.5 })[key], 0.5);
+    assert.equal(optionsChecked({ [key]: 2 })[key], 2);
+    for (const value of [NaN, 0.49, 2.01]) assert.throws(() => optionsChecked({ [key]: value }), /灵敏度/);
+  }
   assert.throws(() => optionsChecked({ polarity: 'negative' }), /灰尘类型/);
   for (const detect of ['', [], 'dust,unknown', 'dust,dust']) {
     assert.throws(() => optionsChecked({ detect }), /识别类型/);
@@ -62,6 +67,44 @@ test('scratch and dust selection changes the real mask independently', async () 
   assert.deepEqual(dust.stats.detection_types, ['dust']);
   assert.ok(dust.mask.data[at(50, 50)], 'the isolated spot belongs in the dust mask');
   assert.equal(dust.mask.data[at(310, 27)], 0, 'the scratch was not selected');
+});
+
+test('per-category sensitivity changes dust and scratches independently on separated features', async () => {
+  const width = 656, height = 440;
+  const data = new Uint16Array(width * height);
+  const at = (x, y) => y * width + x;
+  const spots = Array.from({ length: 9 }, (_, i) => [70 + 60 * i, 75 + 32 * (i % 2), 550 + 250 * i]);
+  let seed = 129763;
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    let value = 30000 + 3 * y + ((seed >>> 24) - 128) * 3;
+    if (y >= 224 && y <= 226 && x >= 150 && x < 400) value += 260;
+    if (y >= 320 && y < 343) value += 4500;
+    for (const [cx, cy, contrast] of spots) if ((x - cx) ** 2 + (y - cy) ** 2 <= 4) value += contrast;
+    data[at(x, y)] = value;
+  }
+  const image = { width, height, channels: 1, colorChannels: 1, alpha: false, depth: 16, data };
+  const run = options => processScan(image, { polarity: 'bright', ...options });
+  const baseline = await run();
+  const explicit = await run({ dustSensitivity: 1, fiberSensitivity: 1, scratchSensitivity: 1 });
+  assert.deepEqual(explicit.mask.data, baseline.mask.data);
+  assert.deepEqual(explicit.cleaned.data, baseline.cleaned.data);
+
+  const weakSpot = at(190, 75), strongerSpot = at(430, 75), scratch = at(280, 225);
+  assert.equal(baseline.mask.data[weakSpot], 0);
+  assert.ok(baseline.mask.data[strongerSpot]);
+  assert.equal(baseline.mask.data[scratch], 0);
+  const dust = await run({ dustSensitivity: 2 });
+  assert.ok(dust.mask.data[weakSpot]);
+  assert.equal(dust.mask.data[scratch], 0);
+  const conservativeDust = await run({ dustSensitivity: 0.5 });
+  assert.equal(conservativeDust.mask.data[strongerSpot], 0);
+  const scratches = await run({ scratchSensitivity: 2 });
+  assert.deepEqual(scratches.mask.data.subarray(0, 140 * width), baseline.mask.data.subarray(0, 140 * width));
+  assert.ok(scratches.mask.data[scratch]);
+  for (let y = 315; y <= 348; y++) for (let x = 35; x < width - 35; x++) {
+    assert.equal(scratches.mask.data[at(x, y)], 0, 'the broad scene stripe stays intact at high scratch sensitivity');
+  }
 });
 
 test('aborted jobs never enter the engine', async () => {
@@ -107,3 +150,16 @@ test('TIFF file workflow preserves source and creates independent result/mask/re
 });
 
 module.exports = { fixture };
+
+// [Claude 2026-11-08] Catchlights: repairs inside an eye found by Vision are taken back.
+test('leaves specks inside a given eye alone and still repairs the others', async () => {
+  const plain = await processScan(fixture(), { detect: ['dust'] });
+  const [inside, outside] = [[50, 50], [115, 50]];
+  const at = ([x, y]) => y * 384 + x;
+  assert.ok(plain.mask.data[at(inside)] && plain.mask.data[at(outside)], 'fixture specks are repaired without eyes');
+  const result = await processScan(fixture(), { detect: ['dust'], eyes: [{ x: 50, y: 50, r: 9 }] });
+  assert.equal(result.mask.data[at(inside)], 0);
+  assert.ok(result.mask.data[at(outside)]);
+  assert.ok(result.marks.some(mark => mark.why === 'a catchlight in an eye'));
+  assert.equal(result.stats.eyes_found, 1);
+});

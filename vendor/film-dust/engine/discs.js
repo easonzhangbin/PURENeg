@@ -7,6 +7,7 @@
 //   find(): the candidates, with what they look like (size, contrast, roundness, tint, edges near)
 const F = require("./filters");
 const { skinLike } = require("./maps");
+const { selectK } = require("./regions");
 
 const Q = 4;                                        // the search runs at 1/Q of the working size
 const SIGMAS = [1.2, 1.9, 3.0, 4.8, 7.7, 12.3];      // Gaussians at 1/Q size; a DoG between neighbours per scale
@@ -44,7 +45,9 @@ function blockNoise(D, w, h, b, inside) {
       for (let y = by * b; y < Math.min(h, (by + 1) * b); y += 2) {
         for (let x = bx * b; x < Math.min(w, (bx + 1) * b); x += 2) { const i = y * w + x; if (!inside || inside[i]) vals.push(Math.abs(D[i])); }
       }
-      if (vals.length >= 16) { vals.sort((p, q) => p - q); raw[by * bw + bx] = vals[vals.length >> 1] * 1.4826; }
+      if (vals.length >= 16) {
+        raw[by * bw + bx] = selectK(vals, vals.length, vals.length >> 1) * 1.4826;
+      }
     }
   }
   const out = new Float32Array(bw * bh);

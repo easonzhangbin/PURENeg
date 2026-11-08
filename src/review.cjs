@@ -7,7 +7,7 @@ const { constants: fsConstants } = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { setImmediate: yieldNow } = require('node:timers/promises');
-const { processFile, cancelled, requireWorkSpace } = require('./processor.cjs');
+const { processFile, optionsChecked, cancelled, requireWorkSpace } = require('./processor.cjs');
 const { decodeTiff, encodeTiff } = require('./tiff.cjs');
 const { checkedStrokes, applyStrokes } = require('./brush.cjs');
 const { runImageCodec } = require('./image-codec.cjs');
@@ -18,6 +18,7 @@ const SCHEMA = 'photocraft-film-dust-review';
 const MAX_RUNS = 2_000_000;
 const MAX_REGIONS = 20_000;
 const RUN_MAGIC = Buffer.from('FDRUNS01');
+const DETECTION_KINDS = ['dust', 'scratches', 'fibers'];
 const fail = message => { throw new Error(message); };
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const inside = (root, filename) => {
@@ -128,17 +129,22 @@ async function makeAsset(job, filename, digest) {
   return { path: path.relative(job, actual), size: stat.size, sha256: hash.digest('hex') };
 }
 
-function publicReview(record, job) {
+function publicReview(record, job, settings = record.detectionSettings) {
   const full = key => path.join(job, record.assets[key].path);
+  const baseline = settings?.sensitivity ?? 1;
+  const thresholds = { dust: settings?.dustSensitivity ?? baseline, fibers: settings?.fiberSensitivity ?? baseline,
+    scratches: settings?.scratchSensitivity ?? 1 };
   return { id: record.id, sourceName: record.sourceName, sourcePath: full('source'), cleanedPath: full('cleaned'), maskPath: full('mask'),
-    width: record.width, height: record.height, depth: record.depth, regions: record.regions,
-    context: record.context, stats: record.stats, outputRoot: record.outputRoot };
+    width: record.width, height: record.height, depth: record.depth, regions: record.regions, runsPath: full('runs'),
+    context: record.context, stats: record.stats, outputRoot: record.outputRoot, thresholds };
 }
 
-async function prepareReview({ inputPath, sourceName, outputRoot, context = 'file', host = null, cacheRoot, preparedResult = null, options = {} } = {}) {
+async function prepareReview({ inputPath, sourceName, outputRoot, context = 'file', host = null, cacheRoot,
+  preparedResult = null, expectedSource = null, options = {} } = {}) {
   if (!['file', 'photocraft'].includes(context)) fail('未知的审核来源。');
   if (!inputPath || !outputRoot) fail('请选择输入文件和结果保存目录。');
   if (sourceName !== undefined && typeof sourceName !== 'string') fail('照片名称无效。');
+  const detectionSettings = optionsChecked(options);
   const displayName = Array.from(path.basename(sourceName ?? inputPath).replace(/[\p{Cc}\p{Cf}]/gu, '')).slice(0, 255).join('') || 'scan.tiff';
   const root = await cacheLocation(cacheRoot, true), key = await signingKey(root, true);
   if (context === 'photocraft') {
@@ -186,9 +192,11 @@ async function prepareReview({ inputPath, sourceName, outputRoot, context = 'fil
     const captured = preparedResult ? null : candidate.reviewData;
     const mask = captured?.mask ?? decodeTiff(await fs.readFile(candidate.paths.mask));
     const { regions, runs } = connectedRegions(mask);
+    const report = captured ?? JSON.parse(await fs.readFile(candidate.paths.report, 'utf8'));
+    const attributed = attributeRegions({ regions, width: mask.width, height: mask.height }, runs, report.marks);
     const runsPath = path.join(job, 'regions-runs.bin');
     await fs.writeFile(runsPath, runs, { flag: 'wx', mode: 0o600 });
-    const imageInfo = captured?.image ?? JSON.parse(await fs.readFile(candidate.paths.report, 'utf8')).image;
+    const imageInfo = report.image;
     if (preparedResult) {
       const images = [];
       for (const filename of [sourcePath, candidate.paths.cleaned]) {
@@ -212,10 +220,13 @@ async function prepareReview({ inputPath, sourceName, outputRoot, context = 'fil
       assets[name] = await makeAsset(job, filename, digest);
       cancelled(options.signal);
     }
+    if (expectedSource && (assets.source.size !== expectedSource.size || assets.source.sha256 !== expectedSource.sha256)) {
+      fail('审核图像已被修改，请重新分析。');
+    }
     const record = { schema: SCHEMA, version: 1, id, status: 'ready', createdAt: new Date().toISOString(),
       context, host, outputRoot: path.resolve(outputRoot), sourceName: displayName,
       width: mask.width, height: mask.height, depth: imageInfo.depth, channels: imageInfo.channels,
-      regions, stats: candidate.stats, assets };
+      regions: attributed, regionKindsVersion: 1, stats: candidate.stats, detectionSettings, assets };
     const reviewPath = path.join(job, 'review.json');
     await saveRecord(reviewPath, record, key);
     return { reviewPath, review: publicReview(record, job) };
@@ -252,7 +263,8 @@ async function readReview(reviewPath, options = {}) {
   if (record.schema !== SCHEMA || record.version !== 1 || path.basename(path.dirname(actual)) !== record.id || !['file', 'photocraft'].includes(record.context)) fail('不支持此审核文件。');
   const revising = options.reviseExport === true;
   if (revising && record.context !== 'file') fail('仅文件审核可以修订已导出的结果。');
-  if (record.status !== 'ready' && !(revising && record.status === 'confirmed')) {
+  const recheckingFile = options.redetect === true && record.context === 'file';
+  if (record.status !== 'ready' && !((revising || recheckingFile) && record.status === 'confirmed')) {
     fail(record.status === 'confirmed' ? '此预览已经确认，不能重复应用。' : '此预览正在确认，请稍后检查结果。');
   }
   if (record.context === 'photocraft') {
@@ -262,16 +274,27 @@ async function readReview(reviewPath, options = {}) {
   return { root, key, record, job: path.dirname(actual), reviewPath: actual };
 }
 
-async function verifiedAsset(loaded, name) {
+async function reviewAssetPath(loaded, name) {
   const asset = loaded.record.assets[name];
   if (!asset || typeof asset.path !== 'string' || path.isAbsolute(asset.path)) fail('审核文件引用无效。');
   const filename = await fs.realpath(path.join(loaded.job, asset.path));
   if (!inside(loaded.job, filename)) fail('审核文件引用超出工作目录。');
   const stat = await fs.stat(filename);
   if (!stat.isFile() || stat.size !== asset.size || stat.size > 2_000_000_000) fail('审核图像已被修改，请重新分析。');
+  return filename;
+}
+
+async function verifiedAsset(loaded, name) {
+  const filename = await reviewAssetPath(loaded, name);
   const data = await fs.readFile(filename);
-  if (sha256(data) !== asset.sha256) fail('审核图像已被修改，请重新分析。');
+  if (sha256(data) !== loaded.record.assets[name].sha256) fail('审核图像已被修改，请重新分析。');
   return data;
+}
+
+async function originalDetectionSettings(loaded, report) {
+  if (loaded.record.detectionSettings) return optionsChecked(loaded.record.detectionSettings);
+  report ??= JSON.parse((await verifiedAsset(loaded, 'report')).toString('utf8'));
+  return optionsChecked(report.settings ?? { detect: loaded.record.stats?.detection_types });
 }
 
 async function inspectReview(reviewPath, options = {}) {
@@ -283,7 +306,14 @@ async function inspectReview(reviewPath, options = {}) {
     if (actual.path !== expected.path || actual.size !== expected.size || actual.sha256 !== expected.sha256) fail('审核图像已被修改，请重新分析。');
     cancelled(options.signal);
   }
-  return { reviewPath: loaded.reviewPath, review: publicReview(loaded.record, loaded.job) };
+  const record = loaded.record;
+  const needsKinds = record.regionKindsVersion !== 1;
+  const report = needsKinds || !record.detectionSettings ? JSON.parse((await verifiedAsset(loaded, 'report')).toString('utf8')) : undefined;
+  const settings = record.detectionSettings ?? await originalDetectionSettings(loaded, report);
+  const regions = needsKinds && record.regions.length && Array.isArray(report?.marks) && report.marks.length ?
+    attributeRegions(record, await verifiedAsset(loaded, 'runs'), report.marks) : record.regions;
+  cancelled(options.signal);
+  return { reviewPath: loaded.reviewPath, review: publicReview({ ...record, regions }, loaded.job, settings) };
 }
 
 function checkedEdits(record, edits = {}) {
@@ -298,6 +328,137 @@ function checkedEdits(record, edits = {}) {
   return { excludedRegions: [...excluded].sort((a, b) => a - b), strokes: checkedStrokes(edits.strokes ?? [], record) };
 }
 
+function runCount(runs, record) {
+  if (!runs.subarray(0, 8).equals(RUN_MAGIC) || runs.length < 24 || runs.readUInt32LE(12) !== record.width ||
+      runs.readUInt32LE(16) !== record.height || runs.readUInt32LE(20) !== record.regions.length) fail('审核点位索引损坏。');
+  const count = runs.readUInt32LE(8);
+  if (count > MAX_RUNS || runs.length !== 24 + count * 16) fail('审核点位索引长度无效。');
+  return count;
+}
+
+function detectionKind(mark) {
+  if (mark?.verdict !== 'defect') return undefined;
+  if (mark.kind === 'scratch') return 'scratches';
+  if (mark.kind === 'hair/fibre' || mark.fibre === 'patch' || mark.fibreDisc === true) return 'fibers';
+  if (['dust', 'speck', 'soft'].includes(mark.kind)) return 'dust';
+  return undefined;
+}
+
+function attributeRegions(record, runs, marks) {
+  if (!record.regions.length || !Array.isArray(marks) || !marks.length) return record.regions;
+  const count = runCount(runs, record);
+  const kinds = new Map();
+  const row = index => runs.readUInt32LE(28 + 16 * index);
+  for (const mark of marks) {
+    const kind = detectionKind(mark);
+    if (!kind || ![mark.x0, mark.y0, mark.x1, mark.y1].every(Number.isFinite)) continue;
+    const x0 = Math.max(0, Math.floor(mark.x0)), y0 = Math.max(0, Math.floor(mark.y0));
+    // Detector reports include both exclusive and inclusive upper coordinates.
+    const x1 = Math.min(record.width, Math.floor(mark.x1) + 1), y1 = Math.min(record.height, Math.floor(mark.y1) + 1);
+    if (x0 >= x1 || y0 >= y1) continue;
+    let first = 0, end = count;
+    while (first < end) {
+      const middle = (first + end) >>> 1;
+      if (row(middle) < y0) first = middle + 1;
+      else end = middle;
+    }
+    const overlaps = new Map();
+    let total = 0, best = 0, winner;
+    for (let i = first; i < count && row(i) < y1; i++) {
+      const at = 24 + 16 * i;
+      const pixels = Math.min(x1, runs.readUInt32LE(at + 12)) - Math.max(x0, runs.readUInt32LE(at + 8));
+      if (pixels <= 0) continue;
+      const id = runs.readUInt32LE(at);
+      const hits = (overlaps.get(id) ?? 0) + pixels;
+      overlaps.set(id, hits);
+      total += pixels;
+      if (hits > best) { best = hits; winner = id; }
+    }
+    // Require a clear majority of the mask pixels inside the mark and a
+    // material share of its reported area. A neighbouring spot inside a
+    // mostly empty bounding box is not sufficient evidence of provenance.
+    const minimum = Number.isFinite(mark.area) ? Math.max(1, Math.ceil(mark.area * 0.2)) : 1;
+    if (best < minimum || best * 2 <= total) continue;
+    if (!kinds.has(winner)) kinds.set(winner, new Set());
+    kinds.get(winner).add(kind);
+  }
+  return record.regions.map(region => {
+    const labels = kinds.get(region.id);
+    return labels ? { ...region, kinds: DETECTION_KINDS.filter(kind => labels.has(kind)) } : region;
+  });
+}
+
+async function remapExclusions(previous, next, ids, signal) {
+  if (!ids.length) return [];
+  const excluded = new Set(ids);
+  const oldRuns = await verifiedAsset(previous, 'runs');
+  const newRuns = await verifiedAsset(next, 'runs');
+  const oldEnd = 24 + 16 * runCount(oldRuns, previous.record);
+  const newEnd = 24 + 16 * runCount(newRuns, next.record);
+  const overlap = new Map();
+  let oldAt = 24, newAt = 24, checked = 0;
+  while (oldAt < oldEnd && newAt < newEnd) {
+    if (checked++ % 4096 === 0) { cancelled(signal); await yieldNow(); }
+    const oldID = oldRuns.readUInt32LE(oldAt);
+    const oldY = oldRuns.readUInt32LE(oldAt + 4), newY = newRuns.readUInt32LE(newAt + 4);
+    const oldRight = oldRuns.readUInt32LE(oldAt + 12), newRight = newRuns.readUInt32LE(newAt + 12);
+    if (oldY === newY && excluded.has(oldID)) {
+      const left = Math.max(oldRuns.readUInt32LE(oldAt + 8), newRuns.readUInt32LE(newAt + 8));
+      const pixels = Math.min(oldRight, newRight) - left;
+      if (pixels > 0) {
+        const newID = newRuns.readUInt32LE(newAt);
+        if (!overlap.has(oldID)) overlap.set(oldID, new Map());
+        const matches = overlap.get(oldID);
+        matches.set(newID, (matches.get(newID) ?? 0) + pixels);
+      }
+    }
+    if (oldY < newY || (oldY === newY && oldRight <= newRight)) oldAt += 16;
+    if (newY < oldY || (oldY === newY && newRight <= oldRight)) newAt += 16;
+  }
+  // A match must cover most of both components. A small old exclusion cannot
+  // hide an unrelated new correction when their components merge.
+  const mapped = [];
+  for (const [oldID, matches] of overlap) {
+    for (const [newID, pixels] of matches) {
+      if (2 * pixels > previous.record.regions[oldID - 1].pixels &&
+          2 * pixels > next.record.regions[newID - 1].pixels) mapped.push(newID);
+    }
+  }
+  return mapped.sort((a, b) => a - b);
+}
+
+async function redetectReview(reviewPath, edits = {}, { dustSensitivity, fiberSensitivity, scratchSensitivity, ...options } = {}) {
+  const targets = [dustSensitivity, fiberSensitivity, scratchSensitivity];
+  if (targets.some(value => !Number.isFinite(value) || value < 0.5 || value > 2)) {
+    fail('重新检测需要三个 0.5 到 2 之间的灵敏度。');
+  }
+  const previous = await readReview(reviewPath, { cacheRoot: options.cacheRoot, redetect: true });
+  const { excludedRegions, strokes } = checkedEdits(previous.record, edits);
+  const { polarity, sensitivity, detect } = await originalDetectionSettings(previous);
+  const settings = {
+    ...options, polarity, sensitivity, detect,
+    ...(dustSensitivity === sensitivity ? {} : { dustSensitivity }),
+    ...(fiberSensitivity === sensitivity ? {} : { fiberSensitivity }),
+    ...(scratchSensitivity === 1 ? {} : { scratchSensitivity }),
+  };
+  const { sourceName, outputRoot, context, host, assets } = previous.record;
+  const inputPath = await reviewAssetPath(previous, 'source');
+  const result = await prepareReview({ inputPath, sourceName, outputRoot, context, host, cacheRoot: previous.root,
+    expectedSource: assets.source, options: settings });
+  try {
+    cancelled(options.signal);
+    const next = await readReview(result.reviewPath, { cacheRoot: previous.root });
+    const exclusions = await remapExclusions(previous, next, excludedRegions, options.signal);
+    const preview = exclusions.length || strokes.length ? await renderReviewPreview(result.reviewPath,
+      { excludedRegions: exclusions, strokes }, { cacheRoot: previous.root, signal: options.signal }) : undefined;
+    cancelled(options.signal);
+    return { ...result, excludedRegions: exclusions, preview, unmatchedExclusions: excludedRegions.length - exclusions.length };
+  } catch (error) {
+    await fs.rm(path.dirname(result.reviewPath), { recursive: true, force: true });
+    throw error;
+  }
+}
+
 async function recompose(loaded, edits, options = {}) {
   const { record } = loaded;
   const { excludedRegions, strokes } = checkedEdits(record, edits), excluded = new Set(excludedRegions);
@@ -308,9 +469,7 @@ async function recompose(loaded, edits, options = {}) {
   for (const image of [source, candidate]) {
     if (image.width !== record.width || image.height !== record.height || image.channels !== record.channels || image.depth !== record.depth) fail('审核图像尺寸或位深已改变。');
   }
-  if (!runs.subarray(0, 8).equals(RUN_MAGIC) || runs.length < 24 || runs.readUInt32LE(12) !== record.width || runs.readUInt32LE(16) !== record.height || runs.readUInt32LE(20) !== record.regions.length) fail('审核点位索引损坏。');
-  const count = runs.readUInt32LE(8);
-  if (count > MAX_RUNS || runs.length !== 24 + count * 16) fail('审核点位索引长度无效。');
+  const count = runCount(runs, record);
   // The signed candidate already contains original pixels outside the
   // detected mask. Patch its private decode in place to avoid another
   // full-resolution allocation for each brush preview.
@@ -388,6 +547,7 @@ async function confirmReview(reviewPath, edits = {}, options = {}) {
   try { lock = await fs.open(lockPath, 'wx', 0o600); }
   catch (error) { if (error.code === 'EEXIST') fail('此预览正在确认，请勿重复应用。'); throw error; }
   let published = null, stage = null, previous = null;
+  const written = [];
   try {
     // Another process could have completed confirmation between initial read
     // and lock acquisition; re-read the signed state under the lock.
@@ -406,11 +566,38 @@ async function confirmReview(reviewPath, edits = {}, options = {}) {
     }
     const destination = options.outputRoot === undefined ? current.record.outputRoot : path.resolve(options.outputRoot);
     await fs.mkdir(destination, { recursive: true });
-    published = await fs.mkdtemp(path.join(destination, 'PURENeg-reviewed-'));
     const paths = {};
-    for (const [name, filename] of Object.entries(exportPaths)) {
-      paths[name] = path.join(published, path.basename(filename));
-      await fs.copyFile(filename, paths[name], require('node:fs').constants.COPYFILE_EXCL);
+    if (options.includeMask === undefined) {
+      // CLI and PhotoCraft: a folder of their own with the established sidecar names.
+      published = await fs.mkdtemp(path.join(destination, 'PURENeg-reviewed-'));
+      for (const [name, filename] of Object.entries(exportPaths)) {
+        paths[name] = path.join(published, path.basename(filename));
+        await fs.copyFile(filename, paths[name], require('node:fs').constants.COPYFILE_EXCL);
+      }
+    } else {
+      // [Claude 2026-11-08] The app's photo export goes straight into the chosen folder,
+      // named after the scan: "scan-PN.jpg" (and "scan-PN-mask.tiff"), so a batch of many
+      // frames is one folder of photos rather than a folder per photo. A name already taken
+      // gets a number: "scan-PN-2.jpg".
+      const stem = path.basename(current.record.sourceName || 'scan').replace(/\.[^.]*$/, '') || 'scan';
+      const ext = path.extname(exportPaths.cleaned);
+      const names = n => {
+        const base = stem + '-PN' + (n > 1 ? '-' + n : '');
+        return { cleaned: base + ext, mask: base + '-mask.tiff' };
+      };
+      let n = 1;
+      for (;; n++) {
+        const taken = await Promise.all(Object.keys(exportPaths).map(name =>
+          fs.access(path.join(destination, names(n)[name])).then(() => true, () => false)));
+        if (!taken.some(Boolean)) break;
+        if (n > 9999) fail('导出文件名已被占用。');
+      }
+      published = destination;
+      for (const [name, filename] of Object.entries(exportPaths)) {
+        paths[name] = path.join(destination, names(n)[name]);
+        await fs.copyFile(filename, paths[name], require('node:fs').constants.COPYFILE_EXCL);
+        written.push(paths[name]);
+      }
     }
     cancelled(options.signal);
     const result = { outputDir: published, paths, format, stats: stage.stats, changed: stage.changed,
@@ -419,7 +606,8 @@ async function confirmReview(reviewPath, edits = {}, options = {}) {
     await saveRecord(current.reviewPath, { ...current.record, status: 'confirmed', confirmedAt: new Date().toISOString(), result }, current.key);
     return result;
   } catch (error) {
-    if (published) await fs.rm(published, { recursive: true, force: true }).catch(() => {});
+    if (written.length) for (const file of written) await fs.rm(file, { force: true }).catch(() => {});
+    else if (published) await fs.rm(published, { recursive: true, force: true }).catch(() => {});
     if (stage) await fs.rm(stage.outputDir, { recursive: true, force: true }).catch(() => {});
     // Restore the state read under the lock, including any earlier export.
     if (previous) await saveRecord(previous.reviewPath, previous.record, previous.key).catch(() => {});
@@ -427,4 +615,4 @@ async function confirmReview(reviewPath, edits = {}, options = {}) {
   } finally { await lock.close(); await fs.rm(lockPath, { force: true }); }
 }
 
-module.exports = { prepareReview, inspectReview, renderReviewPreview, confirmReview, connectedRegions, defaultCacheRoot };
+module.exports = { prepareReview, inspectReview, redetectReview, renderReviewPreview, confirmReview, connectedRegions, defaultCacheRoot };

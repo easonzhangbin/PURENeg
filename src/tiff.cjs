@@ -118,33 +118,36 @@ function decodeTiff(input, options = {}) {
   const magic = u16(2);
   if (magic === 43) fail('BigTIFF is not supported; export a classic TIFF smaller than 4 GiB');
   if (magic !== 42) fail('invalid TIFF signature');
-  const ifd = u32(4);
-  if (ifd < 8) fail('missing image directory');
-  const count = u16(ifd);
-  if (count > 4096) fail('too many directory entries');
-  range(ifd + 2, count * 12 + 4);
-  if (u32(ifd + 2 + count * 12) !== 0) fail('multi-page TIFF is not supported; export one flattened frame');
-  const tags = new Map();
-  for (let i = 0; i < count; i++) {
-    const at = ifd + 2 + i * 12, tag = u16(at), type = u16(at + 2), n = u32(at + 4), size = TYPE_SIZE[type];
-    if (tags.has(tag)) fail(`duplicate TIFF tag ${tag}`);
-    if (!size) continue; // Unknown private tags do not affect the pixel boundary.
-    const len = n * size;
-    if (!Number.isSafeInteger(len)) fail('tag size overflows');
-    const offset = len <= 4 ? at + 8 : u32(at + 8);
-    range(offset, len);
-    tags.set(tag, { type, n, offset, len });
-  }
-  const ints = (tag, fallback) => {
-    const t = tags.get(tag);
+  const readDirectory = ifd => {
+    if (ifd < 8) fail('missing image directory');
+    const count = u16(ifd);
+    if (count > 4096) fail('too many directory entries');
+    range(ifd + 2, count * 12 + 4);
+    const entries = new Map();
+    for (let i = 0; i < count; i++) {
+      const at = ifd + 2 + i * 12, tag = u16(at), type = u16(at + 2), n = u32(at + 4), size = TYPE_SIZE[type];
+      if (entries.has(tag)) fail(`duplicate TIFF tag ${tag}`);
+      if (!size) continue; // Unknown private tags do not affect the pixel boundary.
+      const len = n * size;
+      if (!Number.isSafeInteger(len)) fail('tag size overflows');
+      const offset = len <= 4 ? at + 8 : u32(at + 8);
+      range(offset, len);
+      entries.set(tag, { type, n, offset, len });
+    }
+    return { entries, next: u32(ifd + 2 + count * 12) };
+  };
+  const ifd = u32(4), { entries: tags, next } = readDirectory(ifd);
+  const ints = (tag, fallback, entries = tags) => {
+    const t = entries.get(tag);
     if (!t) return fallback;
     if (![1, 3, 4, 13].includes(t.type) || t.n > 1_000_000) fail(`invalid integer tag ${tag}`);
     const out = [];
     for (let k = 0; k < t.n; k++) out.push(t.type === 1 ? buf[t.offset + k] : t.type === 3 ? u16(t.offset + 2 * k) : u32(t.offset + 4 * k));
     return out;
   };
-  const one = (tag, fallback) => {
-    const v = ints(tag, fallback === undefined ? undefined : [fallback]);
+  const one = (tag, fallback, entries = tags) => {
+    if ((entries.get(tag)?.n ?? 1) !== 1) fail(`missing or invalid tag ${tag}`);
+    const v = ints(tag, fallback === undefined ? undefined : [fallback], entries);
     if (!v || v.length !== 1) fail(`missing or invalid tag ${tag}`);
     return v[0];
   };
@@ -154,6 +157,21 @@ function decodeTiff(input, options = {}) {
   if (tags.has(330) || tags.has(50706)) fail('TIFF with sub-images or RAW/DNG metadata is not supported');
   if (one(254, 0) !== 0) fail('reduced-resolution or mask TIFF directory is not supported');
   const width = one(256), height = one(257), channels = one(277, 1), samples = checkedSize(width, height, channels, limits);
+  if (next) {
+    const seen = new Set([ifd]);
+    for (let offset = next; offset;) {
+      const multiPage = 'multi-page TIFF is not supported; export one flattened frame';
+      if (seen.has(offset) || seen.size >= 64) fail(multiPage);
+      seen.add(offset);
+      const preview = readDirectory(offset), entries = preview.entries;
+      // Some editors link a thumbnail after the full-size scan. Only skip a
+      // directory explicitly marked as a reduced-resolution image.
+      if (entries.get(254)?.type !== 4 || one(254, 0, entries) !== 1 || entries.has(330) || entries.has(50706)) fail(multiPage);
+      const w = one(256, 0, entries), h = one(257, 0, entries);
+      if (!w || !h || w > width || h > height || (w === width && h === height)) fail(multiPage);
+      offset = preview.next;
+    }
+  }
   const photo = one(262), colorChannels = photo === 2 ? 3 : (photo === 0 || photo === 1) ? 1 : 0;
   if (!colorChannels) fail(`unsupported photometric mode ${photo}; use RGB or grayscale`);
   const alpha = channels === colorChannels + 1;

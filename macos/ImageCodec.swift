@@ -1,8 +1,10 @@
 import CoreGraphics
+import CoreML
 import Darwin
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
+import Vision
 
 private struct CodecError: LocalizedError {
     let errorDescription: String?
@@ -182,6 +184,89 @@ private func writeImage(_ image: CGImage, to output: URL, type: UTType, resoluti
     try FileManager.default.moveItem(at: temporary, to: output)
 }
 
+/// [Claude 2026-11-08] The eyes of the faces in a scan, as JSON [{"x", "y", "r"}] in pixels
+/// from the top-left. The engine leaves repairs there alone: a catchlight is a small round
+/// bright speck on a dark ground, which is exactly what a dust speck looks like by itself.
+private func findEyes(in image: CGImage, to output: URL) throws {
+    let request = VNDetectFaceLandmarksRequest()
+    try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+    let size = CGSize(width: image.width, height: image.height)
+    var eyes: [[String: Double]] = []
+    for face in request.results ?? [] {
+        guard let landmarks = face.landmarks else { continue }
+        for (eye, pupil) in [(landmarks.leftEye, landmarks.leftPupil), (landmarks.rightEye, landmarks.rightPupil)] {
+            guard let outline = eye?.pointsInImage(imageSize: size), !outline.isEmpty else { continue }
+            let xs = outline.map(\.x), ys = outline.map(\.y)
+            guard let left = xs.min(), let right = xs.max(), let bottom = ys.min(), let top = ys.max() else { continue }
+            let center = pupil?.pointsInImage(imageSize: size).first
+                ?? CGPoint(x: (left + right) / 2, y: (bottom + top) / 2)
+            // The opening of the eye, so a catchlight off the pupil is covered too.
+            let radius = max(0.45 * (right - left), 0.75 * (top - bottom), 6)
+            // Vision's origin is the bottom-left corner.
+            eyes.append(["x": Double(center.x), "y": Double(size.height - center.y), "r": Double(radius)])
+        }
+    }
+    try JSONSerialization.data(withJSONObject: eyes).write(to: output, options: .atomic)
+}
+
+/// [Claude 2026-11-08] The learned defect map: for every pixel, how likely it is dust or a
+/// fibre on the film (0-255), written as raw bytes, row by row. The model (FibreNet, a small
+/// U-Net trained on the user's corrected frames) sits next to this executable. It works on
+/// fixed 576 px tiles of RGB in 0...1; each tile keeps its central 512 px, so every kept
+/// pixel has 32 px of context. The engine only uses the map to find where fibres start;
+/// its own tracer and scene tests still decide what is repaired.
+private func fibreMap(in image: CGImage, to output: URL) throws {
+    let here = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
+    let configuration = MLModelConfiguration()
+    configuration.computeUnits = .all
+    let model = try MLModel(contentsOf: here.appendingPathComponent("FibreNet.mlmodelc"), configuration: configuration)
+    let W = image.width, H = image.height, T = 576, keep = 512, pad = (T - keep) / 2
+    var rgba = [UInt8](repeating: 0, count: W * H * 4)
+    guard let context = CGContext(data: &rgba, width: W, height: H, bitsPerComponent: 8, bytesPerRow: W * 4,
+                                  space: image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { throw CodecError("无法读取图像像素。") }
+    context.draw(image, in: CGRect(x: 0, y: 0, width: W, height: H))
+    var map = [UInt8](repeating: 0, count: W * H)
+    let input = try MLMultiArray(shape: [1, 3, NSNumber(value: T), NSNumber(value: T)], dataType: .float32)
+    let plane = T * T
+    for ty in stride(from: 0, to: H, by: keep) {
+        for tx in stride(from: 0, to: W, by: keep) {
+            // The tile, edges repeated where it runs past the image (as in training).
+            let inPtr = input.dataPointer.bindMemory(to: Float32.self, capacity: 3 * plane)
+            for y in 0..<T {
+                let sy = min(max(ty - pad + y, 0), H - 1)
+                for x in 0..<T {
+                    let sx = min(max(tx - pad + x, 0), W - 1), s = (sy * W + sx) * 4, d = y * T + x
+                    inPtr[d] = Float32(rgba[s]) / 255
+                    inPtr[plane + d] = Float32(rgba[s + 1]) / 255
+                    inPtr[2 * plane + d] = Float32(rgba[s + 2]) / 255
+                }
+            }
+            let result = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: ["rgb": input]))
+            guard let prob = result.featureValue(for: "prob")?.multiArrayValue else { throw CodecError("模型没有输出。") }
+            let rowStride = prob.strides[2].intValue, colStride = prob.strides[3].intValue
+            let value: (Int) -> Float
+            switch prob.dataType {
+            case .float16:
+                let p = prob.dataPointer.bindMemory(to: Float16.self, capacity: prob.count)
+                value = { Float(p[$0]) }
+            case .float32:
+                let p = prob.dataPointer.bindMemory(to: Float32.self, capacity: prob.count)
+                value = { p[$0] }
+            default:
+                value = { prob[$0].floatValue }
+            }
+            for y in 0..<min(keep, H - ty) {
+                for x in 0..<min(keep, W - tx) {
+                    let v = value((y + pad) * rowStride + (x + pad) * colStride)
+                    map[(ty + y) * W + tx + x] = UInt8(max(0, min(255, (v * 255).rounded())))
+                }
+            }
+        }
+    }
+    try Data(map).write(to: output, options: .atomic)
+}
+
 @main
 private struct ImageCodec {
     static func main() {
@@ -203,6 +288,10 @@ private struct ImageCodec {
                 let source = try ImageFile(input, type: .tiff)
                 guard source.orientation == 1 else { throw CodecError("导出用 TIFF 的方向必须已规范化。") }
                 try writeImage(source.image, to: output, type: type, resolution: source.resolution)
+            case ("eyes", 3):
+                try findEyes(in: ImageFile(input, type: .tiff).image, to: output)
+            case ("fibremap", 3):
+                try fibreMap(in: ImageFile(input, type: .tiff).image, to: output)
             default: throw usage
             }
         } catch {

@@ -371,7 +371,7 @@ async function find(ctx, bright) {
   const z = new Float32Array(N), seeds = new Uint8Array(N);
   {
     // the parameters read once: per pixel they cost five times the loop
-    const sd = p.seed, soft = !!p.soft_dust, s3 = p.seed + 3, s5 = p.seed + 5;
+    const sd = p.seed, soft = !!p.soft_dust, s3 = p.dust_seed + 3, s5 = p.dust_seed + 5;
     for (let i = 0; i < N; i++) {
       const a = zs[i], b = zl[i], c = zx[i] * 0.85;
       z[i] = a > b ? (a > c ? a : c) : b > c ? b : c;
@@ -440,7 +440,7 @@ async function find(ctx, bright) {
     const sigma = maps.sigma;
     const g2 = ctx.g2 || (ctx.g2 = F.gaussianBlur(Y, W, H, 2.0));   // shared by both polarities
     const big = new Uint8Array(N);
-    { const s2 = p.seed + 2, s4 = p.seed + 4; for (let i = 0; i < N; i++) big[i] = zl[i] >= s2 || zx[i] >= s4 ? 1 : 0; }
+    { const s2 = p.dust_seed + 2, s4 = p.dust_seed + 4; for (let i = 0; i < N; i++) big[i] = zl[i] >= s2 || zx[i] >= s4 ? 1 : 0; }
     const B = R.label(big, W, H, 8);
     const bobjs = R.findObjects(B.lab, W, H, B.n);
     const sgn = bright ? 1 : -1;
@@ -810,6 +810,15 @@ async function find(ctx, bright) {
   const protectedMark = (f) => prot.some(([px, py]) => px >= f.x0 - 3 && px < f.x1 + 3 && py >= f.y0 - 3 && py < f.y1 + 3);
   for (let gi = 0; gi < gl.length; gi++) {
     const g = gl[gi], f = feats.get(g);
+    const fiber = f.kind === "hair/fibre";
+    const seed = fiber ? p.fiber_seed : p.dust_seed;
+    const tinySeed = fiber ? p.fiber_tiny_seed : p.dust_tiny_seed;
+    const minFine = fiber ? p.fiber_min_fine : p.dust_min_fine;
+    if ((seed > p.seed && f.z < seed) || (tinySeed > p.tiny_seed && f.area < p.tiny_area && f.z_fine < tinySeed)) {
+      f.verdict = "below-sensitivity";
+      f.why = "below the selected category sensitivity";
+      continue;
+    }
     const T = busy.T[Math.min(busy.hb - 1, Math.floor(f.cy / 64)) * busy.wb + Math.min(busy.wb - 1, Math.floor(f.cx / 64))];
     f.busy = r2(T);
     const around = ogrid.queryBox(f.cy, f.cx, Rf).filter((j) => j !== gi);
@@ -823,7 +832,17 @@ async function find(ctx, bright) {
     const lf = f.line;
     if (lf) {
       // a film fibre blocks light evenly along its length; a chain is links with gaps
-      if (lf.length >= 60 && (lf.gaps >= p.chain_gaps || lf.per >= p.chain_per)) { keepPhoto(f, "link texture along its length (chain/jewellery/beads)"); continue; }
+      if (lf.length >= 60 && (lf.gaps >= p.chain_gaps || lf.per >= p.chain_per)) {
+        // Grain in a pale, smooth area can make an unbroken ridge look periodic.
+        // Retain the veto here and let the full-resolution tracker verify its path.
+        if (p.detect_fibers !== false && bright && f.kind === "hair/fibre" && !f.frame && !f.print && !f.zone
+          && f.length <= 180 && f.width <= 8 && f.white >= 0.78 && f.bg_y >= 0.74 && f.detail <= 0.16 && T <= 1.75
+          && lf.gaps <= 0.06 && lf.per <= 0.52 && lf.one_med <= 0.16 && lf.one_frac <= 0.1 && lf.hf <= 0.18) {
+          f.quietBrightRidge = true;
+        }
+        keepPhoto(f, "link texture along its length (chain/jewellery/beads)");
+        continue;
+      }
       if (lf.one_med >= p.edge_one && lf.one_frac >= p.edge_frac) { keepPhoto(f, "rides along an edge (highlight, rim light or halo)"); continue; }
       if (f.zone && lf.straight <= p.straight_max && lf.length >= p.straight_len) { keepPhoto(f, "ruler-straight line on the film border (film/holder edge)"); continue; }
     }
@@ -843,7 +862,7 @@ async function find(ctx, bright) {
     const detailed = tex >= p.tex_min * ts && det >= p.detail_max * ts;
     const cy_ = f.core_y ?? (bright ? 0.0 : 1.0), by_ = f.bg_y ?? 0.5;
     const nearWhite = bright ? cy_ >= 0.95 || (cy_ >= p.paper_white && by_ <= 0.6) : cy_ <= 0.05 || (cy_ <= 1.0 - p.paper_white && by_ >= 0.4);
-    const strong = f.z >= 2.5 * p.seed && (f.area <= 1500 || f.width <= 8) && !detailed;
+    const strong = f.z >= 2.5 * seed && (f.area <= 1500 || f.width <= 8) && !detailed;
     const needCrisp = strong ? p.strong_crisp : p.soft_crisp;
     // a flake on smooth ground: a wide flake can't read as crisp as a thin mark, but against a
     // perfectly sharp mark of its own shape it does (crisp_rel ~1). Only where nothing in the photo
@@ -852,7 +871,7 @@ async function find(ctx, bright) {
     let flake = false;
     if (crisp < needCrisp && p.learned && f.area >= p.flake_area && f.width >= p.flake_width
       && f.length <= p.flake_elong * f.width && (f.crisp_rel ?? 0.0) >= p.flake_rel
-      && f.white >= p.flake_white && nb.length <= p.flake_field && f.z >= p.flake_z * p.seed
+      && f.white >= p.flake_white && nb.length <= p.flake_field && f.z >= p.flake_z * p.dust_seed
       && det <= p.flake_detail && tex <= p.flake_detail + 0.1 && !M.skinLike(f.bg)) {
       flake = LEARN.probability(f) >= p.flake_learned;
       if (flake) f.flake = true;
@@ -867,7 +886,7 @@ async function find(ctx, bright) {
       keepPhoto(f, "soft for dust on a small scan (picture detail)"); continue;
     }
     if ((f.broad ?? 1.0) < p.broad_min && !(f.kind === "speck" && f.z >= p.broad_speck_z)) { keepPhoto(f, "only bright against dark detail beside it (e.g. skin between tattoo lines)"); continue; }
-    if (detailed && !(crisp >= p.detail_crisp && f.white >= 0.5 && f.z >= p.seed * p.detail_gain * Math.max(det, 1.0))
+    if (detailed && !(crisp >= p.detail_crisp && f.white >= 0.5 && f.z >= seed * p.detail_gain * Math.max(det, 1.0))
       && !(f.kind === "speck" && f.z >= p.detail_speck_z && crisp >= p.detail_speck_crisp)) { keepPhoto(f, "in detailed photo texture (hair/fabric/foliage): left for safety"); continue; }
     if (p.texture_guard && f.kind === "hair/fibre") {
       const sy0 = Math.max(0, f.y0 - 34), sy1 = Math.min(H, f.y1 + 34), sx0 = Math.max(0, f.x0 - 34), sx1 = Math.min(W, f.x1 + 34);
@@ -893,15 +912,15 @@ async function find(ctx, bright) {
       if (f.length >= Math.max(30, p.stand_len * refLen) && f.width <= p.stand_hair_width && debrisLook) reasons.push("much longer than the marks around it");
       if (f.z >= p.stand_z * refZ && f.white >= 0.35) reasons.push("much brighter than the marks around it");
       if (f.white >= refWhite + p.stand_white && f.sharp >= 0.8) reasons.push("whiter and crisper than the marks around it");
-      if (reasons.length && f.z_fine < p.min_fine) keepPhoto(f, "too faint for a second pass");
+      if (reasons.length && f.z_fine < minFine) keepPhoto(f, "too faint for a second pass");
       else if (reasons.length && protectedMark(f)) keepPhoto(f, "left as skin texture in the first pass");
       else if (reasons.length) { f.verdict = "defect"; f.why = reasons.join("; "); accepted.add(g); }
       else keepPhoto(f, onSkin && nb.length < p.field_count ? `on skin with ${nb.length} look-alikes around it (sweat/pores/skin texture)` : `one of ${nb.length} similar marks around it`);
       continue;
     }
-    const need = p.seed * Math.min(Math.max(1 + p.busy_gain * (T - p.busy_start), 1.0), p.busy_cap);
+    const need = seed * Math.min(Math.max(1 + p.busy_gain * (T - p.busy_start), 1.0), p.busy_cap);
     if (f.z_fine < need && !(bigm || longThin)) { keepPhoto(f, `faint mark in busy texture (needs z ${need.toFixed(0)})`); continue; }
-    if (f.z_fine < p.min_fine) { keepPhoto(f, "too faint for a second pass"); continue; }
+    if (f.z_fine < minFine) { keepPhoto(f, "too faint for a second pass"); continue; }
     if (protectedMark(f)) { keepPhoto(f, "left as skin texture in the first pass"); continue; }
     if (f.kind === "hair/fibre" && f.z < p.hair_seed) { keepPhoto(f, `faint thin line: photo texture more often than a film hair (needs z ${p.hair_seed.toFixed(0)})`); continue; }
     f.verdict = "defect"; f.why = "isolated";
@@ -944,6 +963,7 @@ async function find(ctx, bright) {
       if (f.net2 != null) pr = (1 - w2) * pr + w2 / (1 + Math.exp(-f.net2));
       f.learned = R.pyRoundTo(pr, 3);
       const onSubj = !!f.subject;
+      const minFine = f.kind === "hair/fibre" ? p.fiber_min_fine : p.dust_min_fine;
       // a flake's crispness is measured against its own shape, which the model can't see
       if (v === "defect" && f.flake) continue;
       // compact marks (specks, dots, blobs) are what glints, catchlights and chrome look like: they need more
@@ -956,7 +976,7 @@ async function find(ctx, bright) {
       if (v === "defect" && pr <= lo) { keepPhoto(f, "photo, by the decision learned from his answers"); accepted.delete(g); }
       // never a mark of 100 px or more tinted against white (a pale window reflection on a boat: white -3.76;
       // his 65 such answers are all >= 0; on tiny specks the measure is noise)
-      else if (v === "keep-photo" && pr >= (onSubj ? p.subject_hi : p.learned_hi) && f.z >= (LEARN.FLOOR[f.kind] ?? 99.0) && f.z_fine >= p.min_fine && !protectedMark(f)
+      else if (v === "keep-photo" && pr >= (onSubj ? p.subject_hi : p.learned_hi) && f.z >= (LEARN.FLOOR[f.kind] ?? 99.0) && f.z_fine >= minFine && !protectedMark(f)
         && !((f.area ?? 0) >= p.learned_flip_white_area && (f.white ?? 1) < p.learned_flip_white)) {
         // a line piece the rules call not crisp whose line runs on past its ends is a stem, twig or wire
         if (p.learned_reach && f.why.startsWith("not crisp") && f.length >= p.line_len && f.length <= p.line_max_len && f.length >= 2.5 * Math.max(f.width, 1.0)) {

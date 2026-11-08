@@ -95,16 +95,18 @@ void blob_tiles(const float* Y, const float* sl, int W, int H, int T, double sq,
         // the Gaussian (sep_conv on the window's crop, edges mirrored at the window): rows into A, columns into B
         parallel_rows(h, (int64_t)w * klen, [&](int a, int b) {
             std::vector<float> row(w + 2 * r);
+            std::vector<double> acc(w);
             for (int y = a; y < b; y++) {
                 const float* s = Y + (int64_t)(ya + y) * W + xa;
                 for (int x = -r; x < w + r; x++) row[x + r] = s[refl(x, w)];
                 float* o = A + (size_t)y * w;
-                for (int x = 0; x < w; x++) {
-                    const int c = x + r;
-                    double acc = (double)row[c] * kc;
-                    for (int j = 1; j <= r; j++) acc += (double)ker[r - j] * ((double)row[c - j] + (double)row[c + j]);
-                    o[x] = (float)acc;
+                // Vectorize across pixels while preserving each pixel's sum order.
+                for (int x = 0; x < w; x++) acc[x] = (double)row[x + r] * kc;
+                for (int j = 1; j <= r; j++) {
+                    const double kv = ker[r - j];
+                    for (int x = 0; x < w; x++) acc[x] += kv * ((double)row[x + r - j] + (double)row[x + r + j]);
                 }
+                for (int x = 0; x < w; x++) o[x] = (float)acc[x];
             }
         });
         parallel_rows(h, (int64_t)w * klen, [&](int a, int b) {
@@ -123,19 +125,30 @@ void blob_tiles(const float* Y, const float* sl, int W, int H, int T, double sq,
         // Lxx (d2 along x, smoothed along y), Lyy (smoothed along x, d2 along y), Lxy (d1, d1) and the response
         parallel_rows(h, (int64_t)w * 30, [&](int a, int b) {
             std::vector<float> bufs((size_t)9 * w);
-            float *d2u = &bufs[0], *d2m = d2u + w, *d2d = d2m + w, *su = d2d + w, *sm = su + w, *sd = sm + w, *d1u = sd + w,
-                  *d1m = d1u + w, *d1d = d1m + w;
+            int rowAt[3] = {-1, -1, -1};
+            // Adjacent output rows use the same horizontal Sobel rows.
+            auto filtered = [&](int sourceRow) {
+                const int slot = sourceRow % 3;
+                float* row = bufs.data() + (size_t)slot * 3 * w;
+                if (rowAt[slot] != sourceRow) {
+                    const float* src = B + (size_t)sourceRow * w;
+                    xpass(src, w, KD2, row);
+                    xpass(src, w, KS, row + w);
+                    xpass(src, w, KD1, row + 2 * w);
+                    rowAt[slot] = sourceRow;
+                }
+                return row;
+            };
             for (int y = a; y < b; y++) {
-                const float *gu = B + (size_t)refl(y - 1, h) * w, *gm = B + (size_t)y * w, *gd = B + (size_t)refl(y + 1, h) * w;
-                xpass(gu, w, KD2, d2u); xpass(gm, w, KD2, d2m); xpass(gd, w, KD2, d2d);
-                xpass(gu, w, KS, su); xpass(gm, w, KS, sm); xpass(gd, w, KS, sd);
-                xpass(gu, w, KD1, d1u); xpass(gm, w, KD1, d1m); xpass(gd, w, KD1, d1d);
+                const float* up = filtered(refl(y - 1, h));
+                const float* mid = filtered(y);
+                const float* down = filtered(refl(y + 1, h));
                 const float* sv = sl + (int64_t)(ya + y) * W + xa;
                 float* o = resp + (size_t)y * w;
                 for (int x = 0; x < w; x++) {
-                    const float lxx = ypass(KS, d2u[x], d2m[x], d2d[x]);
-                    const float lyy = ypass(KD2, su[x], sm[x], sd[x]);
-                    const float lxy = ypass(KD1, d1u[x], d1m[x], d1d[x]);
+                    const float lxx = ypass(KS, up[x], mid[x], down[x]);
+                    const float lyy = ypass(KD2, up[x + w], mid[x + w], down[x + w]);
+                    const float lxy = ypass(KD1, up[x + 2 * w], mid[x + 2 * w], down[x + 2 * w]);
                     const double p = sgn * (double)lxx, q = sgn * (double)lyy;
                     float v = 0.0f;
                     if (p < 0 && q < 0) {

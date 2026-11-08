@@ -38,6 +38,32 @@ function replaceStrip(buf, compression, strip) {
   return out;
 }
 
+function appendDirectory(buf, width, height, subfileType) {
+  let ifd = buf.readUInt32LE(4), nextAt;
+  do {
+    nextAt = ifd + 2 + 12 * buf.readUInt16LE(ifd);
+    ifd = buf.readUInt32LE(nextAt);
+  } while (ifd);
+  const directory = buf.length + (buf.length % 2);
+  const pixels = width * height;
+  const fields = [[256, 3, width], [257, 3, height], [258, 3, 8], [262, 3, 1],
+    [273, 4, 0], [277, 3, 1], [278, 4, height], [279, 4, pixels]];
+  if (subfileType !== undefined) fields.unshift([254, 4, subfileType]);
+  const strip = directory + 2 + fields.length * 12 + 4;
+  const out = Buffer.alloc(strip + pixels);
+  buf.copy(out);
+  out.writeUInt32LE(directory, nextAt);
+  out.writeUInt16LE(fields.length, directory);
+  fields.forEach(([tag, type, value], i) => {
+    const at = directory + 2 + 12 * i;
+    out.writeUInt16LE(tag, at); out.writeUInt16LE(type, at + 2); out.writeUInt32LE(1, at + 4);
+    if (type === 3) out.writeUInt16LE(value, at + 8);
+    else out.writeUInt32LE(tag === 273 ? strip : value, at + 8);
+  });
+  out.fill(175, strip);
+  return out;
+}
+
 for (const depth of [8, 16]) for (const channels of [1, 2, 3, 4]) for (const compression of ['none', 'deflate']) {
   test(`${depth}-bit ${channels}-channel ${compression} round trip keeps samples and ICC`, () => {
     const source = image(channels, depth), before = source.data.slice();
@@ -123,6 +149,19 @@ test('rejects unsupported TIFF interpretations before processing pixels', () => 
   assert.throws(() => decodeTiff(signed), /signed/);
   const associated = encodeTiff(image(4)); setScalar(associated, 338, 1);
   assert.throws(() => decodeTiff(associated), /straight.*alpha/);
+});
+
+test('skips explicitly tagged reduced previews and keeps the primary pixels and ICC', () => {
+  const original = image(3, 16);
+  original.icc = Buffer.from([0, 0, 0, 12, 0xff, 2, 7, 0, 0x80, 5, 9, 0]);
+  const primary = encodeTiff(original, { compression: 'deflate' });
+  const preview = appendDirectory(primary, 6, 4, 1);
+  const pyramid = appendDirectory(preview, 3, 2, 1);
+  assert.deepEqual(decodeTiff(pyramid), decodeTiff(primary));
+  assert.throws(() => decodeTiff(appendDirectory(preview, 6, 4)), /multi-page/, 'an unmarked second photo may also be small');
+  assert.throws(() => decodeTiff(appendDirectory(primary, original.width, original.height, 1)), /multi-page/);
+  assert.throws(() => decodeTiff(appendDirectory(primary, 6, 4, 3)), /multi-page/, 'page bit is still unsupported');
+  assert.throws(() => decodeTiff(appendDirectory(primary, 6, 4, 4)), /multi-page/, 'a transparency mask can affect compositing');
 });
 
 test('rejects multi-page, duplicate-tag and oversized images', () => {

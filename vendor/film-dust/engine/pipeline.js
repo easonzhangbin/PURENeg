@@ -65,6 +65,7 @@ async function cleanScan(img, W, H, C, opts = {}, hooks = {}) {
   const passes = healing ? (opts.passes ?? 2) : 1;
   const base = {
     polarity: opts.polarity || "auto", sensitivity: opts.sensitivity || 1.0,
+    dust_sensitivity: opts.dustSensitivity, fiber_sensitivity: opts.fiberSensitivity,
     detect_dust: opts.detectDust !== false, detect_fibers: opts.detectFibers !== false,
     soft_dust: !!opts.softDust, soft_path: opts.softPath !== false,
     // out-of-focus fibres follow the same switch as out-of-focus dust unless asked for separately

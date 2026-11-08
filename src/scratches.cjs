@@ -84,7 +84,7 @@ function extendTrack(luma, W, H, vertical, track, mean) {
   return [...ends[0].reverse(), ...samples, ...ends[1]];
 }
 
-async function alongAxis(luma, W, H, vertical, polarity, tick) {
+async function alongAxis(luma, W, H, vertical, polarity, tick, thresholdScale) {
   const along = vertical ? H : W, across = vertical ? W : H;
   if (along < 6 * BLOCK + 2 * BORDER || across <= 2 * BORDER) return [];
   const profile = new Int32Array(across), scores = new Int32Array(across);
@@ -164,7 +164,7 @@ async function alongAxis(luma, W, H, vertical, polarity, tick) {
     const samples = track.samples, first = samples[0], last = samples.at(-1);
     const length = last.t - first.t + BLOCK;
     const mean = track.sum / samples.length;
-    if (samples.length * BLOCK < 0.8 * length || mean < (length < 320 ? 350 : 190)) continue;
+    if (samples.length * BLOCK < 0.8 * length || mean < (length < 320 ? 350 : 190) * thresholdScale) continue;
     const slope = (last.q - first.q) / (last.t - first.t);
     if (Math.abs(slope) > 0.08 ||
         samples.filter(({ t, q }) => Math.abs(q - (first.q + (t - first.t) * slope)) <= 5).length < samples.length * 0.8) continue;
@@ -209,10 +209,11 @@ function isBroadRidgeNearFrame(luma, W, H, line, edges) {
   return broad * 3 >= samples.length * 2;
 }
 
-async function detectScratches(data, W, H, C, polarity = 'auto', tick = async () => {}, frame = null) {
+async function detectScratches(data, W, H, C, polarity = 'auto', tick = async () => {}, frame = null, sensitivity = 1) {
   const luma = luma16(data, W, H, C);
-  const horizontal = await alongAxis(luma, W, H, false, polarity, tick);
-  const vertical = await alongAxis(luma, W, H, true, polarity, tick);
+  const thresholdScale = 1 / sensitivity;
+  const horizontal = await alongAxis(luma, W, H, false, polarity, tick, thresholdScale);
+  const vertical = await alongAxis(luma, W, H, true, polarity, tick, thresholdScale);
   const lines = [...horizontal, ...vertical];
   const accepted = frame ? lines.filter(line => !isBroadRidgeNearFrame(luma, W, H, line, frame.edges)) : lines;
   return accepted.sort((a, b) => (b.score * Math.sqrt(b.length)) - (a.score * Math.sqrt(a.length)));

@@ -47,7 +47,108 @@ static inline int clamp_idx(int i, int n) { return i < 0 ? 0 : i >= n ? n - 1 : 
 
 // ---------- median ---------------------------------------------------------------------------
 
+// [PURE Neg / Claude 2026-11-07] Constant-time median (Perreault & Hebert 2007) for the large
+// windows residualMaps uses (15, 41, 61). The window and its REPLICATE border are median8's,
+// so the multiset and its rank-(k*k/2) value are the same: identical output, bit for bit.
+// Per thread band of rows, in stripes of columns: a 256-bin histogram per column over the
+// window's rows (one value in, one out per row), and per pixel a 16-bin coarse kernel
+// histogram updated from the two columns entering and leaving; the 16 fine bins of a coarse
+// bin are brought up to date only when the median falls in it.
+namespace {
+
+constexpr int kMedianStripe = 512;
+
+void median8_o1_band(const uint8_t* src, int w, int h, int k, uint8_t* dst, int ya, int yb) {
+    const int r = k >> 1;
+    const int half = (k * k) >> 1;
+    std::vector<uint16_t> fine, coarse;
+    for (int sx0 = 0; sx0 < w; sx0 += kMedianStripe) {
+        const int sx1 = std::min(w, sx0 + kMedianStripe);
+        const int c0 = std::max(0, sx0 - r), c1 = std::min(w - 1, sx1 - 1 + r), nc = c1 - c0 + 1;
+        fine.assign((size_t)nc * 256, 0);
+        coarse.assign((size_t)nc * 16, 0);
+        auto add = [&](int row, int delta) {
+            const uint8_t* s = src + (int64_t)row * w + c0;
+            for (int c = 0; c < nc; c++) {
+                const int v = s[c];
+                fine[(size_t)c * 256 + v] += (uint16_t)delta;
+                coarse[(size_t)c * 16 + (v >> 4)] += (uint16_t)delta;
+            }
+        };
+        for (int i = -r; i <= r; i++) add(clamp_idx(ya + i, h), 1);
+        for (int y = ya; y < yb; y++) {
+            if (y > ya) {
+                const int out = clamp_idx(y - 1 - r, h), in = clamp_idx(y + r, h);
+                if (out != in) {
+                    add(out, -1);
+                    add(in, 1);
+                }
+            }
+            // column index (relative to c0) of the clamped image column x
+            auto col = [&](int x) { return clamp_idx(x, w) - c0; };
+            uint16_t hc[16] = {0};
+            uint16_t hf[16][16];
+            int at[16];
+            for (int b = 0; b < 16; b++) at[b] = INT32_MIN;
+            for (int xx = sx0 - r; xx <= sx0 + r; xx++) {
+                const uint16_t* cc = &coarse[(size_t)col(xx) * 16];
+                for (int j = 0; j < 16; j++) hc[j] += cc[j];
+            }
+            uint8_t* o = dst + (int64_t)y * w;
+            for (int x = sx0; x < sx1; x++) {
+                if (x > sx0) {
+                    const int ci = col(x + r), co = col(x - r - 1);
+                    if (ci != co) {
+                        const uint16_t *a = &coarse[(size_t)ci * 16], *s = &coarse[(size_t)co * 16];
+                        for (int j = 0; j < 16; j++) hc[j] = (uint16_t)(hc[j] + a[j] - s[j]);
+                    }
+                }
+                int b = 0, sum = 0;
+                while (sum + hc[b] <= half) {
+                    sum += hc[b];
+                    b++;
+                }
+                uint16_t* f = hf[b];
+                if (at[b] != INT32_MIN && x - at[b] <= r) {
+                    for (int t = at[b] + 1; t <= x; t++) {
+                        const int ci = col(t + r), co = col(t - r - 1);
+                        if (ci == co) continue;
+                        const uint16_t *a = &fine[(size_t)ci * 256 + 16 * b], *s = &fine[(size_t)co * 256 + 16 * b];
+                        for (int j = 0; j < 16; j++) f[j] = (uint16_t)(f[j] + a[j] - s[j]);
+                    }
+                } else {
+                    for (int j = 0; j < 16; j++) f[j] = 0;
+                    for (int xx = x - r; xx <= x + r; xx++) {
+                        const uint16_t* a = &fine[(size_t)col(xx) * 256 + 16 * b];
+                        for (int j = 0; j < 16; j++) f[j] += a[j];
+                    }
+                }
+                at[b] = x;
+                int v = 0;
+                while (sum + f[v] <= half) {
+                    sum += f[v];
+                    v++;
+                }
+                o[x] = (uint8_t)(16 * b + v);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+static void median8_huang(const uint8_t* src, int w, int h, int k, uint8_t* dst);
+
 void median8(const uint8_t* src, int w, int h, int k, uint8_t* dst) {
+    // Odd windows only (median8's columns and rows agree there); counts must fit 16 bits.
+    if ((k & 1) && k >= 9 && k <= 255 && w > 0 && h > 0) {
+        parallel_rows(h, (int64_t)w * 64, [&](int ya, int yb) { median8_o1_band(src, w, h, k, dst, ya, yb); }, 16);
+        return;
+    }
+    median8_huang(src, w, h, k, dst);
+}
+
+static void median8_huang(const uint8_t* src, int w, int h, int k, uint8_t* dst) {
     const int r = k >> 1;
     const int half = (k * k) >> 1;
     parallel_rows(h, (int64_t)w * k, [&](int ya, int yb) {

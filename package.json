@@ -1,6 +1,6 @@
 {
   "name": "pure-neg",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "private": true,
   "description": "Local film cleanup with 16-bit scans and editable repair masks",
   "license": "MIT",

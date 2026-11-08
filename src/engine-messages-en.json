@@ -41,6 +41,8 @@
   "缺少审核记录；请先分析并预览扫描件。": "There is no review record. Scan and preview the image first.",
   "审核选择文件无效或过大。": "The edit selections file is invalid or too large.",
   "无法读取审核选择，请重新打开预览。": "Could not read the edit selections. Reopen the preview.",
+  "分类灵敏度仅用于重新检测。": "Individual detection sensitivities are only used for rescanning.",
+  "重新检测需要三个 0.5 到 2 之间的灵敏度。": "Rescanning requires three sensitivity values between 0.5 and 2.",
   "检测区域过于复杂，请降低灵敏度后重新分析。": "The detected regions are too complex. Lower the sensitivity and scan again.",
   "灰尘点位过多，请降低灵敏度后重新分析。": "Too many dust spots. Lower the sensitivity and scan again.",
   "灰尘点位数据过多，请降低灵敏度后重新分析。": "Too much dust region data. Lower the sensitivity and scan again.",

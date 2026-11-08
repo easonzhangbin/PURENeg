@@ -127,16 +127,24 @@ const DEFAULTS = {
 
 function params(over = {}) {
   const p = Object.assign({}, DEFAULTS, over);
-  p.seed = p.seed / p.sensitivity;
-  p.tiny_seed = p.tiny_seed / p.sensitivity;
-  p.soft_seed = p.soft_seed / p.sensitivity;
-  p.hair_seed = p.hair_seed / p.sensitivity;
-  p.broad_speck_z = p.broad_speck_z / p.sensitivity;
-  p.skin_speck_z = p.skin_speck_z / p.sensitivity;
-  p.detail_speck_z = p.detail_speck_z / p.sensitivity;
-  p.line_z = p.line_z / p.sensitivity;
-  p.line_zmed = p.line_zmed / p.sensitivity;
-  p.min_fine = p.second_pass ? p.second_gain * p.seed : 0.0;
+  const dust = p.dust_sensitivity ?? p.sensitivity;
+  const fiber = p.fiber_sensitivity ?? p.sensitivity;
+  // Sharp pieces share their residual maps and get a category after grouping.
+  p.dust_seed = p.seed / dust;
+  p.fiber_seed = p.seed / fiber;
+  p.seed = Math.min(p.dust_seed, p.fiber_seed);
+  p.dust_tiny_seed = p.tiny_seed / dust;
+  p.fiber_tiny_seed = p.tiny_seed / fiber;
+  p.tiny_seed = Math.min(p.dust_tiny_seed, p.fiber_tiny_seed);
+  p.soft_seed = p.soft_seed / dust;
+  p.hair_seed = p.hair_seed / fiber;
+  p.broad_speck_z = p.broad_speck_z / dust;
+  p.skin_speck_z = p.skin_speck_z / dust;
+  p.detail_speck_z = p.detail_speck_z / dust;
+  p.line_z = p.line_z / fiber;
+  p.line_zmed = p.line_zmed / fiber;
+  p.dust_min_fine = p.second_pass ? p.second_gain * p.dust_seed : 0.0;
+  p.fiber_min_fine = p.second_pass ? p.second_gain * p.fiber_seed : 0.0;
   return p;
 }
 

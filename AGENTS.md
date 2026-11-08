@@ -5,3 +5,7 @@
 1. 读取 `vendor/film-dust/UPSTREAM.json` 中的基准提交。在 [magholmes/film-dust](https://github.com/magholmes/film-dust) 核对最新正式发布的版本和对应提交，再查看默认分支的最新提交。以提交历史判断上游是否领先于基准。
 2. 如果上游有新版本或新提交，先提醒用户并附上链接。明确哪些改动已正式发布，哪些只在默认分支。由用户决定是否升级内核。
 3. 如果暂时无法连接 GitHub，说明本次未能核对。
+
+## Claude 的改动
+
+Claude 接手期间的改动、验证结果和工具放在 `claude/`，与本文件分开。继续开发前先读 `claude/README.md` 和 `claude/CHANGES.md`；源码里的相关位置标有 `[Claude 2026-11-07]`。

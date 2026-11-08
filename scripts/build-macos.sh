@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST_DIR="${DIST_DIR:-$PROJECT_DIR/dist/release-0.4.7}"
+DIST_DIR="${DIST_DIR:-$PROJECT_DIR/dist/release-0.4.8}"
 FINAL_APP_DIR="$DIST_DIR/PURE Neg.app"
 BUILD_DIR="$PROJECT_DIR/.build/macos"
 ICON_SOURCE="$PROJECT_DIR/assets/PURENeg.png"
@@ -127,13 +127,17 @@ swiftc -parse-as-library -swift-version 5 -O -target "$ARCH-apple-macos14.0" \
   "$PROJECT_DIR/macos/SettingsWindow.swift" "$PROJECT_DIR/macos/Localization.swift" \
   "$PROJECT_DIR/macos/AppUpdates.swift" -o "$BUILD_DIR/PURENeg"
 swiftc -parse-as-library -swift-version 5 -O -target "$ARCH-apple-macos14.0" \
-  -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers \
+  -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers -framework Vision -framework CoreML \
   "$PROJECT_DIR/macos/ImageCodec.swift" -o "$BUILD_DIR/image-codec"
+# [Claude 2026-11-08] The learned fibre/dust map model, compiled next to the codec.
+rm -rf "$BUILD_DIR/FibreNet.mlmodelc"
+xcrun coremlcompiler compile "$PROJECT_DIR/macos/Models/FibreNet.mlpackage" "$BUILD_DIR" > /dev/null
 
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources/runtime"
 cp -X "$BUILD_DIR/PURENeg" "$APP_DIR/Contents/MacOS/PURENeg"
 cp -X "$NODE_BINARY" "$APP_DIR/Contents/Resources/runtime/node"
 cp -X "$BUILD_DIR/image-codec" "$APP_DIR/Contents/Resources/runtime/image-codec"
+ditto --norsrc --noextattr --noqtn "$BUILD_DIR/FibreNet.mlmodelc" "$APP_DIR/Contents/Resources/runtime/FibreNet.mlmodelc"
 cp -X "$NODE_LICENSE" "$APP_DIR/Contents/Resources/runtime/LICENSE"
 mkdir -p "$APP_DIR/Contents/Resources/ThirdPartyLicenses"
 cp -X "$PROJECT_DIR/licenses/torchvision-LICENSE" "$APP_DIR/Contents/Resources/ThirdPartyLicenses/"
@@ -159,8 +163,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>PURE Neg</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.4.7</string>
-  <key>CFBundleVersion</key><string>19</string>
+  <key>CFBundleShortVersionString</key><string>0.4.8</string>
+  <key>CFBundleVersion</key><string>20</string>
   <key>CFBundleIconFile</key><string>PURENeg</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSAppleEventsUsageDescription</key><string>PURE Neg 需要读取 Photoshop 当前文档的可见图像，用于在本机生成除尘预览。</string>

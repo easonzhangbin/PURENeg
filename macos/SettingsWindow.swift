@@ -5,7 +5,9 @@ import UniformTypeIdentifiers
 enum AppPreferences {
     fileprivate enum Key {
         static let exportFormat = "settings.exportFormat"
-        static let includeMask = "settings.includeMask"
+        // [Claude 2026-11-08] A new key from 0.4.8: the repair mask TIFF is off by default, also
+        // for anyone who had it on in an earlier version; it is exported only when ticked.
+        static let includeMask = "settings.includeMaskTIFF"
         static let exportFolder = "settings.exportFolder"
         static let cpuMode = "settings.cpuMode"
         static let gpuPreview = "settings.gpuPreview"

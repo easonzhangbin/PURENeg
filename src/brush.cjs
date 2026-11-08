@@ -7,9 +7,12 @@ const { cancelled } = require('./processor.cjs');
 const TILE = 256;
 const HALO = 224;
 const ADD = 1, ERASE = 2;
+const MAX_STROKES = 1024, MAX_POINTS = 200_000;
 
 function checkedStrokes(strokes, { width, height }) {
-  if (!Array.isArray(strokes) || strokes.length > 128) throw new Error('笔画列表无效或超过 128 笔。');
+  // [Claude 2026-11-08] 128 strokes / 16 000 points ran out on one dusty frame. A 6 px
+  // stroke is about 13 rows per point, so 200 000 points stays far inside the span limit.
+  if (!Array.isArray(strokes) || strokes.length > MAX_STROKES) throw new Error(`笔画列表无效或超过 ${MAX_STROKES} 笔。`);
   let points = 0;
   for (const stroke of strokes) {
     if (!stroke || typeof stroke !== 'object' || Array.isArray(stroke) ||
@@ -18,7 +21,7 @@ function checkedStrokes(strokes, { width, height }) {
         stroke.radius < 1 || stroke.radius > 96 || !Array.isArray(stroke.points) ||
         stroke.points.length < 1 || stroke.points.length > 2048) throw new Error('笔画类型、半径或点数无效。');
     points += stroke.points.length;
-    if (points > 16000) throw new Error('笔画采样点过多。');
+    if (points > MAX_POINTS) throw new Error('笔画采样点过多。');
     for (const point of stroke.points) {
       if (!Array.isArray(point) || point.length !== 2 || !point.every(Number.isInteger) ||
           point[0] < 0 || point[0] >= width || point[1] < 0 || point[1] >= height) throw new Error('笔画坐标超出原图。');
@@ -38,7 +41,7 @@ async function rasterize(strokes, W, H, signal) {
     const stamp = (x, y) => {
       const y0 = Math.max(0, y - radius), y1 = Math.min(H - 1, y + radius);
       spanCount += y1 - y0 + 1;
-      if (spanCount > 8_000_000) throw new Error('笔画覆盖范围过大，请缩小画笔或分次处理。');
+      if (spanCount > 40_000_000) throw new Error('笔画覆盖范围过大，请缩小画笔或分次处理。');
       for (let v = y0; v <= y1; v++) {
         const dx = spans[v - y + radius], end = Math.min(W, x + dx + 1);
         const ty = Math.floor(v / TILE), base = (v % TILE) * TILE;
@@ -46,7 +49,9 @@ async function rasterize(strokes, W, H, signal) {
           const tx = Math.floor(u / TILE), key = ty * across + tx;
           let tile = tiles.get(key);
           if (!tile) {
-            if (tiles.size >= 512) throw new Error('笔画覆盖范围过大，请缩小画笔或分次处理。');
+            // Many small strokes spread over the frame touch many tiles; every tile of a
+            // 50MP scan (about 800, 64 KB each) fits.
+            if (tiles.size >= 2048) throw new Error('笔画覆盖范围过大，请缩小画笔或分次处理。');
             tile = { x: tx * TILE, y: ty * TILE, actions: new Uint8Array(TILE * TILE), hasAdd: false };
             tiles.set(key, tile);
           }

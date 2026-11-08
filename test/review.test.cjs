@@ -4,10 +4,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const { encodeTiff, decodeTiff } = require('../src/tiff.cjs');
-const { prepareReview, inspectReview, renderReviewPreview, confirmReview, connectedRegions } = require('../src/review.cjs');
+const { prepareReview, inspectReview, redetectReview, renderReviewPreview, confirmReview, connectedRegions } = require('../src/review.cjs');
 
 async function caseFiles(t, { empty = false, brush = false } = {}) {
   const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'pureneg-review-')));
@@ -47,6 +48,25 @@ test('run components join diagonals and keep nested bounding boxes separate', ()
   for (let y = 0; y < 5; y++) for (let x = 0; x < 5; x++) if (x === 0 || y === 0 || x === 4 || y === 4 || (x === 2 && y === 2)) nested[y * 5 + x] = 65535;
   const rings = connectedRegions({ width: 5, height: 5, channels: 1, data: nested });
   assert.deepEqual(rings.regions.map(r => [r.id, r.x, r.y, r.width, r.height, r.pixels]), [[1,0,0,5,5,16],[2,2,2,1,1,1]]);
+});
+
+test('accepted detector marks label matching mask components, including mixed components', async t => {
+  const fixture = await caseFiles(t);
+  const reportPath = fixture.preparedResult.paths.report;
+  const report = JSON.parse(await fs.readFile(reportPath, 'utf8'));
+  report.marks = [
+    { kind: 'scratch', verdict: 'defect', x0: 0, y0: 0, x1: 4, y1: 4, area: 16 },
+    { kind: 'speck', verdict: 'defect', x0: 0, y0: 4, x1: 0, y1: 4, area: 1 },
+    { kind: 'soft', fibreDisc: true, verdict: 'defect', x0: 2, y0: 2, x1: 2, y1: 2, area: 1 },
+    { kind: 'dust', verdict: 'keep-photo', x0: 2, y0: 2, x1: 2, y1: 2, area: 1 },
+    { kind: 'hair/fibre', verdict: 'defect', x0: 0, y0: 0, x1: 0, y1: 0, area: 50 },
+  ];
+  await fs.writeFile(reportPath, JSON.stringify(report));
+  const { review, reviewPath } = await prepareReview(fixture);
+  assert.deepEqual(review.regions.map(region => region.kinds), [['dust', 'scratches'], ['fibers']]);
+  assert.equal(path.dirname(review.runsPath), path.dirname(reviewPath));
+  assert.equal((await fs.readFile(review.runsPath)).subarray(0, 8).toString(), 'FDRUNS01');
+  assert.deepEqual((await inspectReview(reviewPath, { cacheRoot: fixture.cacheRoot })).review.regions, review.regions);
 });
 
 test('preparation freezes its own original, produces review data, and publishes nothing', async t => {
@@ -158,6 +178,82 @@ test('manual strokes recover false detections and heal missed dust across a tile
   assert.deepEqual(clean.icc, item.source.icc);
 });
 
+test('redetection from a confirmed file remaps changed region IDs and previews retained strokes', async t => {
+  const { dir, inputPath, outputRoot, cacheRoot } = await caseFiles(t);
+  const width = 656, height = 440, data = new Uint16Array(width * height);
+  let seed = 129763;
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    let value = 23000 + 3 * y + ((seed >>> 24) - 128);
+    if (x >= 56 && x < 561 && Math.abs(y - (71 + Math.round(x / 170))) <= 1) value += 580;
+    data[y * width + x] = value;
+  }
+  const spot = 165 * width + 350;
+  data[spot] = 60000;
+  await fs.writeFile(inputPath, encodeTiff({ width, height, channels: 1, colorChannels: 1, depth: 16, data }));
+  const parameters = { inputPath, outputRoot, cacheRoot, sourceName: 'Frame from Photoshop',
+    options: { polarity: 'bright', detect: ['scratches'], sensitivity: 1.4 } };
+  const baseline = await prepareReview(parameters);
+  assert.equal(baseline.review.regions.length, 1);
+  assert.deepEqual(baseline.review.regions[0].kinds, ['scratches']);
+  assert.deepEqual(baseline.review.thresholds, { dust: 1.4, fibers: 1.4, scratches: 1 });
+  const mask = decodeTiff(await fs.readFile(baseline.review.maskPath));
+  mask.data[10 * width + 10] = 65535; // A preceding component that the new scan will remove.
+  const oldMask = path.join(dir, 'old-mask.tiff');
+  await fs.writeFile(oldMask, encodeTiff(mask));
+  const report = path.join(path.dirname(baseline.review.cleanedPath), 'report.json');
+  const old = await prepareReview({ ...parameters, preparedResult: { stats: baseline.review.stats,
+    paths: { cleaned: baseline.review.cleanedPath, mask: oldMask, report } } });
+  assert.deepEqual(old.review.regions.map(region => region.id), [1, 2]);
+  // Older versions kept the detection settings only in the signed report asset.
+  const { record } = JSON.parse(await fs.readFile(old.reviewPath, 'utf8'));
+  delete record.detectionSettings;
+  delete record.regionKindsVersion;
+  for (const region of record.regions) delete region.kinds;
+  const key = await fs.readFile(path.join(cacheRoot, '.review-signing-key'));
+  const signature = crypto.createHmac('sha256', key).update(JSON.stringify(record)).digest('hex');
+  const legacy = JSON.stringify({ record, signature });
+  await fs.writeFile(old.reviewPath, legacy);
+  const inspected = (await inspectReview(old.reviewPath, { cacheRoot })).review;
+  assert.deepEqual(inspected.thresholds, baseline.review.thresholds);
+  assert.deepEqual(inspected.regions.map(region => region.kinds), [undefined, ['scratches']]);
+  assert.equal(await fs.readFile(old.reviewPath, 'utf8'), legacy);
+  const first = await confirmReview(old.reviewPath, {}, { cacheRoot });
+  const firstExport = await fs.readFile(first.paths.cleaned);
+  const previousRecord = await fs.readFile(old.reviewPath);
+  const strokes = [{ kind: 'add', radius: 2, points: [[350, 165]] }];
+  const edits = { excludedRegions: [1, 2], strokes };
+  const initialJobs = (await fs.readdir(cacheRoot)).sort();
+  const controller = new AbortController();
+  await assert.rejects(redetectReview(old.reviewPath, edits, { cacheRoot, signal: controller.signal,
+    dustSensitivity: 1.8, fiberSensitivity: 1.4, scratchSensitivity: 1, onProgress: () => controller.abort() }), { name: 'AbortError' });
+  assert.deepEqual((await fs.readdir(cacheRoot)).sort(), initialJobs);
+  assert.deepEqual(await fs.readFile(old.reviewPath), previousRecord);
+  const editsPath = path.join(dir, 'edit-input.json');
+  await fs.writeFile(editsPath, JSON.stringify(edits));
+  const { stdout } = await promisify(execFile)(process.execPath, [path.resolve(__dirname, '../src/cli.cjs'), 'redetect',
+    '--review', old.reviewPath, '--work-dir', path.dirname(cacheRoot), '--edits', editsPath,
+    '--dust-sensitivity', '1.8', '--fiber-sensitivity', '1.4', '--scratch-sensitivity', '1']);
+  const result = stdout.trim().split('\n').map(line => JSON.parse(line)).at(-1);
+  assert.equal(result.type, 'redetected');
+  assert.notEqual(result.reviewPath, old.reviewPath);
+  assert.deepEqual(result.review.thresholds, { dust: 1.8, fibers: 1.4, scratches: 1 });
+  assert.deepEqual(result.review.regions[0].kinds, ['scratches']);
+  assert.deepEqual(result.review.stats.detection_types, ['scratches']);
+  assert.equal(result.review.sourceName, parameters.sourceName);
+  assert.equal(result.review.outputRoot, outputRoot);
+  assert.deepEqual(await fs.readFile(result.review.sourcePath), await fs.readFile(old.review.sourcePath));
+  assert.deepEqual(result.excludedRegions, [1]);
+  assert.equal(result.unmatchedExclusions, 1);
+  assert.equal(result.preview.stats.manual_strokes, 1);
+  assert.equal(decodeTiff(await fs.readFile(result.preview.maskPath)).data[spot], 65535);
+  assert.equal(decodeTiff(await fs.readFile(result.preview.cleanedPath)).data[spot] < 25000, true);
+  const next = await confirmReview(result.reviewPath, { excludedRegions: result.excludedRegions, strokes }, { cacheRoot });
+  assert.deepEqual(await fs.readFile(next.paths.cleaned), await fs.readFile(result.preview.cleanedPath));
+  assert.deepEqual(await fs.readFile(old.reviewPath), previousRecord);
+  assert.deepEqual(await fs.readFile(first.paths.cleaned), firstExport);
+});
+
 test('file export can be revised from signed originals without overwriting the previous version', async t => {
   const item = await prepared(t, { brush: true });
   const firstEdits = { strokes: [{ kind: 'erase', radius: 2, points: [[40, 30]] }] };
@@ -191,8 +287,8 @@ test('file export can be revised from signed originals without overwriting the p
     '--review', item.reviewPath, '--edits', editsPath, '--work-dir', path.dirname(item.cacheRoot), '--mask', 'no', '--revise-export']);
   const result = JSON.parse(stdout.trim().split('\n').at(-1));
   assert.equal(result.type, 'result');
-  assert.notEqual(result.outputDir, first.outputDir);
-  assert.deepEqual(await fs.readdir(result.outputDir), ['cleaned.tiff']);
+  assert.equal(path.basename(result.paths.cleaned), 'source-PN.tiff');
+  assert.deepEqual(Object.keys(result.paths), ['cleaned']);
   const stage = path.dirname(result.reviewPreview.cleanedPath);
   assert.equal(path.dirname(stage), jobDir);
   assert.match(path.basename(stage), /^confirmed-/);
@@ -237,9 +333,23 @@ test('explicit mask choice exports a single photo by default or adds only the re
     const item = await prepared(t);
     const result = await confirmReview(item.reviewPath, {}, { cacheRoot: item.cacheRoot, includeMask });
     assert.deepEqual((await fs.readdir(result.outputDir)).sort(),
-      includeMask ? ['cleaned.tiff', 'dust-mask.tiff'] : ['cleaned.tiff']);
+      includeMask ? ['source-PN-mask.tiff', 'source-PN.tiff'] : ['source-PN.tiff']);
     assert.equal(Object.hasOwn(result.paths, 'mask'), includeMask);
   }
+});
+
+test('app exports share one folder and never overwrite: a taken name gets a number', async t => {
+  const chosen = path.join(os.tmpdir(), 'pureneg-flat-' + process.pid + '-' + Date.now());
+  t.after(() => fs.rm(chosen, { recursive: true, force: true }));
+  const names = [];
+  for (let i = 0; i < 2; i++) {
+    const item = await prepared(t);
+    const result = await confirmReview(item.reviewPath, {}, { cacheRoot: item.cacheRoot, outputRoot: chosen, includeMask: true });
+    assert.equal(result.outputDir, chosen);
+    names.push(path.basename(result.paths.cleaned), path.basename(result.paths.mask));
+  }
+  assert.deepEqual(names, ['source-PN.tiff', 'source-PN-mask.tiff', 'source-PN-2.tiff', 'source-PN-2-mask.tiff']);
+  assert.deepEqual((await fs.readdir(chosen)).sort(), [...names].sort());
 });
 
 test('unknown or non-integer region ids fail without consuming review', async t => {
@@ -297,15 +407,21 @@ test('PhotoCraft review stays inside its authorized root and does not import by 
   const fixture = await caseFiles(t);
   const host = { workDir: path.dirname(fixture.cacheRoot), snapshot: { index: 3, width: 5, height: 5, depth: 16, mode: 'rgb' } };
   await fs.mkdir(host.workDir, { recursive: true });
-  const pending = await prepareReview({ ...fixture, context: 'photocraft', host });
+  const pending = await prepareReview({ ...fixture, context: 'photocraft', host, options: { detect: ['scratches'] } });
   const reviseOptions = { cacheRoot: fixture.cacheRoot, reviseExport: true };
   await assert.rejects(renderReviewPreview(pending.reviewPath, {}, reviseOptions), /仅文件审核/);
   await assert.rejects(confirmReview(pending.reviewPath, {}, reviseOptions), /仅文件审核/);
-  const result = await confirmReview(pending.reviewPath, {}, { cacheRoot: fixture.cacheRoot });
+  const next = await redetectReview(pending.reviewPath, {}, { cacheRoot: fixture.cacheRoot,
+    dustSensitivity: 1, fiberSensitivity: 1, scratchSensitivity: 1 });
+  assert.notEqual(next.reviewPath, pending.reviewPath);
+  assert.equal(next.review.context, 'photocraft');
+  assert.ok(next.reviewPath.startsWith(host.workDir + path.sep));
+  assert.deepEqual(await inspectReview(pending.reviewPath, { cacheRoot: fixture.cacheRoot }), pending);
+  const result = await confirmReview(next.reviewPath, {}, { cacheRoot: fixture.cacheRoot });
   assert.deepEqual(result.host, host);
   assert.equal(result.context, 'photocraft');
   assert.ok(result.stagedPaths.cleaned.startsWith(host.workDir + path.sep));
-  await assert.rejects(confirmReview(pending.reviewPath, {}, { cacheRoot: fixture.cacheRoot }), /已经确认/);
+  await assert.rejects(confirmReview(next.reviewPath, {}, { cacheRoot: fixture.cacheRoot }), /已经确认/);
 });
 
 test('no-dust review and cancelled preview preserve the reviewable source', async t => {

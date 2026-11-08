@@ -8,6 +8,86 @@ struct DustRegion {
     /// Image pixels, measured from the top-left, matching the TIFF mask.
     let rect: NSRect
     let pixels: Int
+    let kinds: [DetectionKind]
+
+    init(id: Int, rect: NSRect, pixels: Int, kinds: [DetectionKind] = []) {
+        self.id = id
+        self.rect = rect
+        self.pixels = pixels
+        self.kinds = kinds
+    }
+
+    var categoryLabel: String {
+        kinds.isEmpty ? L10n.text("类别未知") : kinds.map(\.label).joined(separator: " · ")
+    }
+}
+
+/// The signed review's sparse mask runs are ordered by row and starting column.
+private struct ReviewSpotIndex {
+    private let data: Data
+    private let count: Int
+
+    init?(url: URL, width: Int, height: Int, regionCount: Int) {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              data.count >= 24, data.prefix(8).elementsEqual("FDRUNS01".utf8) else { return nil }
+        let count = data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> Int? in
+            let count = Self.word(bytes, at: 8)
+            guard count <= 2_000_000, data.count == 24 + count * 16,
+                  Self.word(bytes, at: 12) == width, Self.word(bytes, at: 16) == height,
+                  Self.word(bytes, at: 20) == regionCount else { return nil }
+            return count
+        }
+        guard let count else { return nil }
+        self.data = data
+        self.count = count
+    }
+
+    private static func word(_ bytes: UnsafeRawBufferPointer, at offset: Int) -> Int {
+        Int(UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+    }
+
+    func nearest(to point: NSPoint, radius: CGFloat, excluding: Set<Int>) -> Int? {
+        data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            var closestID: Int?
+            var closestDistance = radius * radius
+            var y = Int(floor(point.y - radius)), start = 0
+            let lastRow = Int(floor(point.y + radius))
+            while y <= lastRow {
+                // Both row and run end are monotonic within the row. Jump
+                // over unrelated columns instead of traversing full rows.
+                var lo = start, hi = count
+                while lo < hi {
+                    let mid = (lo + hi) / 2, offset = 24 + mid * 16
+                    let row = Self.word(bytes, at: offset + 4)
+                    if row < y || (row == y && CGFloat(Self.word(bytes, at: offset + 12)) < point.x - radius) { lo = mid + 1 }
+                    else { hi = mid }
+                }
+                guard lo < count else { break }
+                let row = Self.word(bytes, at: 28 + lo * 16)
+                if row > y { y = row; start = lo; continue }
+                let dy = max(CGFloat(y) - point.y, point.y - CGFloat(y + 1), 0)
+                while lo < count {
+                    let offset = 24 + lo * 16
+                    if Self.word(bytes, at: offset + 4) != y { break }
+                    let x0 = CGFloat(Self.word(bytes, at: offset + 8))
+                    if x0 > point.x + radius { break }
+                    let x1 = CGFloat(Self.word(bytes, at: offset + 12))
+                    let dx = max(x0 - point.x, point.x - x1, 0)
+                    let distance = dx * dx + dy * dy
+                    let id = Self.word(bytes, at: offset)
+                    if distance <= closestDistance && !excluding.contains(id) {
+                        if distance == 0 { return id }
+                        closestID = id
+                        closestDistance = distance
+                    }
+                    lo += 1
+                }
+                y += 1
+                start = lo
+            }
+            return closestID
+        }
+    }
 }
 
 enum PreviewMode: Int {
@@ -178,41 +258,82 @@ private final class PreviewRaster {
 }
 
 final class PreviewCanvasView: NSView {
-    var mode: PreviewMode = .repaired { didSet { needsDisplay = true; window?.invalidateCursorRects(for: self) } }
-    var showRegions = false { didSet { needsDisplay = true } }
-    var showMask = true { didSet { needsDisplay = true } }
-    var maskOpacity: CGFloat = 0.7 { didSet { needsDisplay = true } }
+    var mode: PreviewMode = .repaired { didSet { clearHover(); needsDisplay = true; window?.invalidateCursorRects(for: self) } }
+    var showRegions = false { didSet { clearHover(); needsDisplay = true } }
+    var showMask = true { didSet { clearHover(); needsDisplay = true } }
+    var maskOpacity: CGFloat = 0.7 { didSet { clearHover(); needsDisplay = true } }
     var maskColor: ReviewMaskColor = .fluorescentRed { didSet { needsDisplay = true } }
     var tool: ReviewTool = .inspect {
-        didSet { needsDisplay = true; window?.invalidateCursorRects(for: self) }
+        didSet {
+            if tool != oldValue { clearHover() }
+            if tool != .inspect { inspectionAnchor = nil }
+            needsDisplay = true
+            window?.invalidateCursorRects(for: self)
+        }
     }
     var brushRadius = 8 { didSet { needsDisplay = true } }
     var pendingStrokes: [ReviewStroke] = [] { didSet { needsDisplay = true } }
-    var excludedRegions = Set<Int>() { didSet { if excludedRegions != oldValue { needsDisplay = true } } }
-    var selectedRegionID: Int? { didSet { needsDisplay = true } }
+    var excludedRegions = Set<Int>() {
+        didSet {
+            guard excludedRegions != oldValue else { return }
+            clearHover()
+            needsDisplay = true
+            if let id = selectedRegionID, inspectionAnchor != nil, excludedRegions.contains(id) != oldValue.contains(id) {
+                updateInspectionAccessibility()
+                updateInspectionOverlay()
+            }
+        }
+    }
+    var selectedRegionID: Int? {
+        didSet {
+            if selectedRegionID != oldValue { inspectionAnchor = nil }
+            needsDisplay = true
+        }
+    }
     var splitFraction: Double = 0.5 {
         didSet {
             if !splitFraction.isFinite { splitFraction = 0.5 }
             splitFraction = max(0, min(1, splitFraction))
+            clearHover()
             needsDisplay = true
         }
     }
-    var onToggleRegion: ((Int) -> Void)?
     var onSelectRegion: ((Int) -> Void)?
+    var onToggleInspectedRegion: ((Int) -> Void)? { didSet { updateInspectionOverlay() } }
     var onStroke: ((ReviewStroke) -> Void)?
-    var onUndoStroke: (() -> Void)?
+    var onUndoEdit: (() -> Void)?
+    var onRedoEdit: (() -> Void)?
     var onToolChange: ((ReviewTool) -> Void)?
+    var onBrushRadiusChange: ((Int) -> Void)?
     var onDisplayReadyChange: (() -> Void)?
     /// A percentage: 100 means one source pixel per physical display pixel.
     var onZoomChange: ((Double) -> Void)?
-    var isUserInteractionEnabled = true
+    var isUserInteractionEnabled = true {
+        didSet {
+            guard isUserInteractionEnabled != oldValue else { return }
+            if !isUserInteractionEnabled { clearHover() }
+            updateInspectionOverlay()
+        }
+    }
 
     private(set) var zoomScale: CGFloat = 1
     private(set) var regions: [DustRegion] = []
+    private var regionsByID: [Int: DustRegion] = [:]
     private(set) var imageSize = NSSize.zero
     private var sourceImage: PreviewRaster?
     private var cleanedImage: PreviewRaster?
     private var maskImage: PreviewRaster?
+    private var spotIndex: ReviewSpotIndex?
+    private var inspectionAnchor: NSPoint? {
+        didSet {
+            guard inspectionAnchor != oldValue else { return }
+            updateInspectionAccessibility()
+            updateInspectionOverlay()
+        }
+    }
+    private lazy var inspectionActionButton = NSButton(title: "", target: self, action: #selector(toggleInspectedRegion))
+    private var inspectionBubble: SpotCaption?
+    private var hoverBubble: SpotCaption?
     private let renderQueue = DispatchQueue(label: "PURENeg.previewRaster", qos: .userInitiated)
     private var rasterizing = false
     private var metalRenderer: PreviewMetalRenderer?
@@ -235,6 +356,7 @@ final class PreviewCanvasView: NSView {
     private var panStartOrigin = NSPoint.zero
     private var fitted = true
     private var resizeObserver: NSObjectProtocol?
+    private var viewportObserver: NSObjectProtocol?
     private let margin: CGFloat = 20
 
     override var isFlipped: Bool { true }
@@ -247,24 +369,35 @@ final class PreviewCanvasView: NSView {
         setAccessibilityLabel(L10n.surface("胶片除尘审核预览"))
         setAccessibilityHelp(L10n.surface("修复蒙版显示实际修复像素。滚动缩放，按住空格拖动平移。使用画笔补修漏点，使用橡皮擦恢复原始像素。"))
         postsFrameChangedNotifications = true
+        inspectionActionButton.bezelStyle = .rounded
+        inspectionActionButton.controlSize = .small
+        inspectionActionButton.isHidden = true
+        addSubview(inspectionActionButton)
     }
 
     required init?(coder: NSCoder) { nil }
 
     deinit {
         if let observer = resizeObserver { NotificationCenter.default.removeObserver(observer) }
+        if let observer = viewportObserver { NotificationCenter.default.removeObserver(observer) }
     }
 
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
         if let observer = resizeObserver { NotificationCenter.default.removeObserver(observer) }
+        if let observer = viewportObserver { NotificationCenter.default.removeObserver(observer) }
         resizeObserver = nil
+        viewportObserver = nil
         if let clip = enclosingScrollView?.contentView {
             clip.postsBoundsChangedNotifications = true
             clip.postsFrameChangedNotifications = true
             resizeObserver = NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
                 guard let self = self else { return }
                 if self.fitted { self.fitToWindow() } else { self.updateDocumentFrame() }
+            }
+            viewportObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
+                self?.clearHover()
+                self?.updateInspectionOverlay()
             }
         }
     }
@@ -277,7 +410,8 @@ final class PreviewCanvasView: NSView {
         super.updateTrackingAreas()
     }
 
-    func load(sourceURL: URL, cleanedURL: URL, maskURL: URL, width: Int, height: Int, regions: [DustRegion]) throws {
+    func load(sourceURL: URL, cleanedURL: URL, maskURL: URL, width: Int, height: Int, regions: [DustRegion],
+              runsURL: URL? = nil, preserveViewport: Bool = false) throws {
         guard width > 0, height > 0, width <= 300_000_000 / height else { throw previewError(L10n.surface("无效的预览图像尺寸。")) }
         let source = try readImage(sourceURL, width: width, height: height)
         let cleaned = try readImage(cleanedURL, width: width, height: height)
@@ -293,13 +427,19 @@ final class PreviewCanvasView: NSView {
         self.sourceImage = PreviewRaster(source)
         self.cleanedImage = PreviewRaster(cleaned)
         self.maskImage = PreviewRaster(mask, isMask: true)
-        self.imageSize = NSSize(width: width, height: height)
+        let newImageSize = NSSize(width: width, height: height)
+        let keepViewport = preserveViewport && newImageSize == imageSize
+        let previousSplit = splitFraction
+        self.imageSize = newImageSize
         self.regions = regions
+        regionsByID = Dictionary(uniqueKeysWithValues: regions.map { ($0.id, $0) })
+        spotIndex = runsURL.flatMap { ReviewSpotIndex(url: $0, width: width, height: height, regionCount: regions.count) }
         self.excludedRegions = []
         self.selectedRegionID = nil
         resetImageInteraction()
         isDisplayReady = !usesDisplayCache
-        fitToWindow()
+        if keepViewport { splitFraction = previousSplit }
+        else { fitToWindow() }
         needsDisplay = true
     }
 
@@ -320,9 +460,10 @@ final class PreviewCanvasView: NSView {
     }
 
     func clearImages() {
-        sourceImage = nil; cleanedImage = nil; maskImage = nil
+        sourceImage = nil; cleanedImage = nil; maskImage = nil; spotIndex = nil
         if conserveMemory { metalRenderer = nil }
         imageSize = .zero; regions = []
+        regionsByID = [:]
         selectedRegionID = nil; excludedRegions = []
         resetImageInteraction()
         fitted = true
@@ -333,6 +474,8 @@ final class PreviewCanvasView: NSView {
 
     private func resetImageInteraction() {
         activeStroke = nil
+        clearHover()
+        inspectionAnchor = nil
         pendingStrokes = []
         brushLocation = nil
         spaceDown = false
@@ -389,7 +532,7 @@ final class PreviewCanvasView: NSView {
     }
 
     func focusRegion(id: Int) {
-        guard let region = regions.first(where: { $0.id == id }) else { return }
+        guard let region = regionsByID[id] else { return }
         selectedRegionID = id
         let center = NSPoint(x: region.rect.midX, y: region.rect.midY)
         if zoomScale * displayScale < 1 { setZoom(1 / displayScale, anchor: center) }
@@ -401,6 +544,8 @@ final class PreviewCanvasView: NSView {
         let viewport = viewportSize
         setFrameSize(NSSize(width: max(viewport.width, imageSize.width * zoomScale + 2 * margin),
                             height: max(viewport.height, imageSize.height * zoomScale + 2 * margin)))
+        clearHover()
+        updateInspectionOverlay()
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
     }
@@ -482,6 +627,7 @@ final class PreviewCanvasView: NSView {
             drawCaption("◀ ▶", at: NSPoint(x: grip.minX - 1, y: grip.minY + 7), fontSize: 10)
         }
         drawModeCaptions()
+        drawInspectionCaption()
         if !isDisplayReady && !cropped.isEmpty {
             let loading = zoomPercent >= 100 ? L10n.surface("正在载入原始像素…") : L10n.surface("正在载入预览…")
             drawCaption(loading, at: NSPoint(x: cropped.minX + 16, y: cropped.maxY - 30))
@@ -656,8 +802,6 @@ final class PreviewCanvasView: NSView {
             if selected {
                 NSColor.white.withAlphaComponent(0.95).setStroke()
                 let outer = NSBezierPath(ovalIn: box.insetBy(dx: -3, dy: -3)); outer.lineWidth = 1; outer.stroke()
-                let status = excluded ? L10n.surface("已排除") : L10n.surface("待修复")
-                drawCaption("#\(region.id) · \(status)", at: NSPoint(x: box.maxX + 5, y: box.minY - 3), fontSize: 11)
             }
         }
     }
@@ -684,14 +828,186 @@ final class PreviewCanvasView: NSView {
 
     private func drawCaption(_ text: String, at point: NSPoint, fontSize: CGFloat = 12) {
         let label = NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: fontSize, weight: .medium), .foregroundColor: NSColor.white])
-        let box = NSRect(origin: NSPoint(x: point.x - 5, y: point.y - 3), size: NSSize(width: label.size().width + 10, height: label.size().height + 6))
+        let size = label.size()
+        let box = NSRect(origin: NSPoint(x: point.x - 5, y: point.y - 3), size: NSSize(width: size.width + 10, height: size.height + 6))
         NSColor(calibratedWhite: 0.06, alpha: 0.78).setFill()
         NSBezierPath(roundedRect: box, xRadius: 4, yRadius: 4).fill()
         label.draw(at: point)
     }
 
-    private func region(at point: NSPoint) -> DustRegion? {
-        guard showRegions else { return nil }
+    private var inspectionCaption: String? {
+        guard inspectionAnchor != nil, let id = selectedRegionID, let region = regionsByID[id] else { return nil }
+        let status = excludedRegions.contains(region.id) ? L10n.surface("已排除") : L10n.surface("待修复")
+        return "\(L10n.text("第 \(region.id) 处")) · \(region.categoryLabel) · \(status)"
+    }
+
+    private struct SpotCaption {
+        let label: NSAttributedString
+        let frame: NSRect
+
+        func draw() {
+            NSColor(calibratedWhite: 0.06, alpha: 0.88).setFill()
+            NSBezierPath(roundedRect: frame, xRadius: 5, yRadius: 5).fill()
+            // [Claude 2026-11-08] Without .usesLineFragmentOrigin the rect's origin is taken as the
+            // baseline, so in this flipped view the glyphs rose above the bubble. Only the bubble
+            // is invalidated when it moves, so those glyphs were left behind on the image.
+            label.draw(with: frame.insetBy(dx: 5, dy: 3), options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+        }
+    }
+
+    private var inspectionViewport: NSRect { (enclosingScrollView?.documentVisibleRect ?? bounds).intersection(bounds) }
+
+    private func spotLabel(_ text: String) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingTail
+        return NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                                                           .foregroundColor: NSColor.white, .paragraphStyle: paragraph])
+    }
+
+    private func overlayOrigin(near anchor: NSPoint, size: NSSize, inside viewport: NSRect) -> NSPoint {
+        let x = anchor.x + 12 + size.width <= viewport.maxX ? anchor.x + 12 : anchor.x - 12 - size.width
+        let y = anchor.y + 12 + size.height <= viewport.maxY ? anchor.y + 12 : anchor.y - 12 - size.height
+        return NSPoint(x: max(viewport.minX, min(x, viewport.maxX - size.width)),
+                       y: max(viewport.minY, min(y, viewport.maxY - size.height)))
+    }
+
+    private func updateInspectionAccessibility() {
+        setAccessibilityValue(inspectionCaption)
+        NSAccessibility.post(element: self, notification: .valueChanged)
+    }
+
+    private func drawInspectionCaption() {
+        drawHoverGlow()
+        inspectionBubble?.draw()
+        hoverBubble?.draw()
+    }
+
+    // [Claude 2026-11-08] The repair under the pointer pulses with a soft glowing ring, so it
+    // is clear which spot the caption and a click refer to.
+    private var hoverGlowRegionID: Int?
+    private var hoverGlowTimer: Timer?
+    private var hoverGlowStart = Date()
+
+    private func hoverGlowRect() -> NSRect? {
+        guard let id = hoverGlowRegionID, let region = regionsByID[id] else { return nil }
+        return ringRect(region).insetBy(dx: -4, dy: -4)
+    }
+
+    private func setHoverGlow(_ id: Int?) {
+        guard id != hoverGlowRegionID else { return }
+        if let old = hoverGlowRect() { setNeedsDisplay(old.insetBy(dx: -14, dy: -14)) }
+        hoverGlowRegionID = id
+        hoverGlowTimer?.invalidate()
+        hoverGlowTimer = nil
+        guard id != nil else { return }
+        hoverGlowStart = Date()
+        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            guard let self, let rect = self.hoverGlowRect() else { return }
+            self.setNeedsDisplay(rect.insetBy(dx: -14, dy: -14))
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        hoverGlowTimer = timer
+    }
+
+    private func drawHoverGlow() {
+        guard let rect = hoverGlowRect() else { return }
+        let phase = 0.5 + 0.5 * sin(Date().timeIntervalSince(hoverGlowStart) * 2 * .pi / 1.1)
+        let alpha = 0.45 + 0.55 * phase
+        let color = NSColor(calibratedRed: 1.0, green: 0.78, blue: 0.35, alpha: 1)
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = color.withAlphaComponent(0.9 * alpha)
+        shadow.shadowBlurRadius = 6 + 6 * phase
+        shadow.shadowOffset = .zero
+        shadow.set()
+        let ring = NSBezierPath(ovalIn: rect)
+        ring.lineWidth = 1.5 + phase
+        color.withAlphaComponent(alpha).setStroke()
+        ring.stroke()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func updateInspectionOverlay() {
+        if let old = inspectionBubble { setNeedsDisplay(old.frame.insetBy(dx: -1, dy: -1)) }
+        inspectionBubble = nil
+        let visible = inspectionViewport, viewport = visible.insetBy(dx: 8, dy: 8)
+        guard tool == .inspect, !spaceDown, let anchor = inspectionAnchor.map({ viewRect(for: NSRect(origin: $0, size: .zero)).origin }),
+              let caption = inspectionCaption, let id = selectedRegionID, visible.contains(anchor),
+              viewport.width > 20, viewport.height > 20 else {
+            inspectionActionButton.isHidden = true
+            return
+        }
+        let title = excludedRegions.contains(id) ? L10n.text("恢复识别") : L10n.text("撤销识别")
+        if inspectionActionButton.title != title {
+            inspectionActionButton.title = title
+            inspectionActionButton.setAccessibilityLabel(title)
+        }
+        let label = spotLabel(caption), textSize = label.size()
+        let captionSize = NSSize(width: min(viewport.width, ceil(textSize.width) + 10), height: ceil(textSize.height) + 6)
+        let buttonFit = inspectionActionButton.intrinsicContentSize
+        let buttonSize = NSSize(width: max(76, ceil(buttonFit.width)), height: max(25, ceil(buttonFit.height)))
+        let showAction = onToggleInspectedRegion != nil && buttonSize.width <= viewport.width && captionSize.height + 4 + buttonSize.height <= viewport.height
+        let groupSize = showAction ? NSSize(width: max(captionSize.width, buttonSize.width), height: captionSize.height + 4 + buttonSize.height) : captionSize
+        let origin = overlayOrigin(near: anchor, size: groupSize, inside: viewport)
+        let bubble = SpotCaption(label: label, frame: NSRect(origin: origin, size: captionSize))
+        inspectionBubble = bubble
+        setNeedsDisplay(bubble.frame.insetBy(dx: -1, dy: -1))
+        if showAction {
+            inspectionActionButton.frame = NSRect(origin: NSPoint(x: origin.x, y: origin.y + captionSize.height + 4), size: buttonSize)
+            inspectionActionButton.toolTip = caption
+            inspectionActionButton.isEnabled = isUserInteractionEnabled
+        }
+        inspectionActionButton.isHidden = !showAction
+    }
+
+    @objc private func toggleInspectedRegion() {
+        guard isUserInteractionEnabled, tool == .inspect, !inspectionActionButton.isHidden,
+              inspectionAnchor != nil, let id = selectedRegionID else { return }
+        window?.makeFirstResponder(self)
+        onToggleInspectedRegion?(id)
+    }
+
+    private func clearHover() {
+        if let old = hoverBubble { setNeedsDisplay(old.frame.insetBy(dx: -1, dy: -1)) }
+        hoverBubble = nil
+        setHoverGlow(nil)
+    }
+
+    private func updateHover(at point: NSPoint) {
+        clearHover()
+        guard isUserInteractionEnabled, isDisplayReady, !spaceDown, !draggingPan, !draggingDivider,
+              inspectionViewport.contains(point),
+              inspectionActionButton.isHidden || !inspectionActionButton.frame.contains(point),
+              let region = region(at: point, allowingMarkers: false),
+              region.id != selectedRegionID || inspectionAnchor == nil else { return }
+        let viewport = inspectionViewport.insetBy(dx: 8, dy: 8)
+        guard viewport.width > 20, viewport.height > 20 else { return }
+        setHoverGlow(region.id)
+        // Say what a click does: until now it was only discoverable by trying.
+        let action = tool == .inspect && onToggleInspectedRegion != nil
+            ? (excludedRegions.contains(region.id) ? L10n.text("点击后可恢复此处修复") : L10n.text("点击后可撤销此处修复")) : nil
+        let label = spotLabel(action.map { "\(region.categoryLabel) · \($0)" } ?? region.categoryLabel), intrinsic = label.size()
+        let size = NSSize(width: min(viewport.width, ceil(intrinsic.width) + 10), height: ceil(intrinsic.height) + 6)
+        let preferred = overlayOrigin(near: point, size: size, inside: viewport)
+        let positions = [preferred, NSPoint(x: preferred.x, y: point.y - 12 - size.height), NSPoint(x: preferred.x, y: point.y + 12),
+                         NSPoint(x: point.x - 12 - size.width, y: preferred.y), NSPoint(x: point.x + 12, y: preferred.y)]
+        guard let frame = positions.lazy.map({ NSRect(origin: $0, size: size) }).first(where: {
+            viewport.contains($0) && inspectionBubble?.frame.intersects($0) != true &&
+                (inspectionActionButton.isHidden || !inspectionActionButton.frame.intersects($0))
+        }) else { return }
+        hoverBubble = SpotCaption(label: label, frame: frame)
+        setNeedsDisplay(frame.insetBy(dx: -1, dy: -1))
+    }
+
+    private func region(at point: NSPoint, allowingMarkers: Bool = true) -> DustRegion? {
+        let image = imageRect
+        let divider = image.minX + image.width * CGFloat(splitFraction)
+        let maskVisible = showMask && maskOpacity > 0 && mode != .original && (mode != .split || point.x >= divider)
+        if image.contains(point), maskVisible || showRegions,
+           let id = spotIndex?.nearest(to: imagePoint(from: point), radius: min(128, 5 / zoomScale),
+                                       excluding: showRegions ? [] : excludedRegions),
+           let region = regionsByID[id] { return region }
+        guard showRegions, allowingMarkers else { return nil }
         return regions.filter { ringRect($0).insetBy(dx: -4, dy: -4).contains(point) }.min { a, b in
             let ar = viewRect(for: a.rect), br = viewRect(for: b.rect)
             let da = pow(ar.midX - point.x, 2) + pow(ar.midY - point.y, 2)
@@ -725,14 +1041,16 @@ final class PreviewCanvasView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        if tool != .inspect { moveBrush(to: convert(event.locationInWindow, from: nil)) }
+        let point = convert(event.locationInWindow, from: nil)
+        if tool == .inspect { updateHover(at: point) }
+        else { moveBrush(to: point) }
     }
 
     override func mouseEntered(with event: NSEvent) {
-        if tool != .inspect { moveBrush(to: convert(event.locationInWindow, from: nil)) }
+        mouseMoved(with: event)
     }
 
-    override func mouseExited(with event: NSEvent) { moveBrush(to: nil) }
+    override func mouseExited(with event: NSEvent) { clearHover(); moveBrush(to: nil) }
 
     private func moveBrush(to point: NSPoint?) {
         let diameter = max(6, CGFloat(2 * brushRadius) * zoomScale + 5)
@@ -744,6 +1062,7 @@ final class PreviewCanvasView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         guard isUserInteractionEnabled else { return }
+        clearHover()
         window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
         if spaceDown || event.buttonNumber == 2 {
@@ -764,10 +1083,13 @@ final class PreviewCanvasView: NSView {
             moveBrush(to: point)
             return
         }
-        if let region = region(at: point) {
+        if tool == .inspect, let region = region(at: point) {
             selectedRegionID = region.id
+            inspectionAnchor = imagePoint(from: point)
             onSelectRegion?(region.id)
-            onToggleRegion?(region.id)
+        } else {
+            inspectionAnchor = nil
+            needsDisplay = true
         }
     }
 
@@ -805,16 +1127,20 @@ final class PreviewCanvasView: NSView {
     override func keyDown(with event: NSEvent) {
         guard isUserInteractionEnabled else { return }
         let key = event.charactersIgnoringModifiers?.lowercased()
-        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command && key == "z" {
-            onUndoStroke?()
-            return
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .control, .option])
+        if key == "z" {
+            if modifiers == .command { onUndoEdit?(); return }
+            if modifiers == [.command, .shift] { onRedoEdit?(); return }
         }
         if event.modifierFlags.intersection([.command, .control, .option]).isEmpty {
             if key == "v" { onToolChange?(.inspect); return }
             if key == "b" { onToolChange?(.add); return }
             if key == "e" { onToolChange?(.erase); return }
+            let characters = event.characters
+            if key == "[" || key == "【" || characters == "【" { onBrushRadiusChange?(-1); return }
+            if key == "]" || key == "】" || characters == "】" { onBrushRadiusChange?(1); return }
         }
-        if event.keyCode == 49 { spaceDown = true; window?.invalidateCursorRects(for: self) }
+        if event.keyCode == 49 { spaceDown = true; clearHover(); updateInspectionOverlay(); window?.invalidateCursorRects(for: self) }
         else if event.charactersIgnoringModifiers == "+" || event.charactersIgnoringModifiers == "=" { zoom(by: 1.25) }
         else if event.charactersIgnoringModifiers == "-" { zoom(by: 0.8) }
         else if event.charactersIgnoringModifiers == "0" { fitToWindow() }
@@ -822,12 +1148,13 @@ final class PreviewCanvasView: NSView {
     }
 
     override func keyUp(with event: NSEvent) {
-        if event.keyCode == 49 { spaceDown = false; window?.invalidateCursorRects(for: self) }
+        if event.keyCode == 49 { spaceDown = false; updateInspectionOverlay(); window?.invalidateCursorRects(for: self) }
         else { super.keyUp(with: event) }
     }
 
     override func scrollWheel(with event: NSEvent) {
         guard isUserInteractionEnabled else { return }
+        clearHover()
         let delta = event.scrollingDeltaY
         guard !spaceDown, delta != 0, abs(delta) >= abs(event.scrollingDeltaX) else {
             super.scrollWheel(with: event)
@@ -843,6 +1170,7 @@ final class PreviewCanvasView: NSView {
 
     override func magnify(with event: NSEvent) {
         guard isUserInteractionEnabled else { return }
+        clearHover()
         zoomAtPointer(by: 1 + event.magnification, event: event)
     }
 

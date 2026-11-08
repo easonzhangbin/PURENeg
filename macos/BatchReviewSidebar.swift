@@ -15,18 +15,15 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
 
     var onOpen: ((UUID) -> Void)?
     var onToggle: ((UUID) -> Void)?
-    var onExport: ((Set<UUID>) -> Void)?
     var onDetect: (() -> Void)?
     var onStop: (() -> Void)?
     var onThumbnailReady: ((URL, CGImage) -> Void)?
 
     private let table = NSTableView()
     private let frameCount = NSTextField(labelWithString: "")
-    private let exportCount = NSTextField(labelWithString: "")
     private let activity = NSTextField(wrappingLabelWithString: "")
     private let detectButton = NSButton(title: L10n.surface("检测本批"), target: nil, action: nil)
     private let stopButton = NSButton(title: L10n.surface("停止检测"), target: nil, action: nil)
-    private let checkedButton = NSButton(title: L10n.surface("导出所选"), target: nil, action: nil)
     private lazy var detectControl = StudioStyle.actionControl(detectButton)
     private lazy var stopControl = StudioStyle.actionControl(stopButton)
 
@@ -66,10 +63,6 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
         self.busy = busy
 
         frameCount.stringValue = L10n.surface("\(items.count) 张")
-        exportCount.stringValue = checked.isEmpty
-            ? L10n.surface("勾选已就绪的照片可批量导出。")
-            : L10n.surface("已勾选 \(checked.count) 张")
-        checkedButton.isEnabled = !busy && !checked.isEmpty
 
         guard needsReload else { return }
         detectionRow = detectionID.flatMap { id in items.firstIndex { $0.id == id } }
@@ -161,11 +154,6 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
         return cell
     }
 
-    @objc private func exportChecked() {
-        guard !busy, !checked.isEmpty else { return }
-        onExport?(checked)
-    }
-
     @objc private func detectBatch() { onDetect?() }
     @objc private func stopDetection() { onStop?() }
 
@@ -201,32 +189,23 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
         scroll.documentView = table
         scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 52).isActive = true
 
-        exportCount.font = .systemFont(ofSize: 11)
-        exportCount.textColor = StudioStyle.secondaryText
-        exportCount.lineBreakMode = .byTruncatingTail
         activity.font = .systemFont(ofSize: 11)
         activity.textColor = StudioStyle.secondaryText
         activity.maximumNumberOfLines = 2
         activity.lineBreakMode = .byTruncatingTail
-        for label in [exportCount, activity] {
-            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            label.setContentCompressionResistancePriority(.required, for: .vertical)
-        }
+        activity.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        activity.setContentCompressionResistancePriority(.required, for: .vertical)
 
         detectButton.target = self
         detectButton.action = #selector(detectBatch)
         stopButton.target = self
         stopButton.action = #selector(stopDetection)
-        checkedButton.target = self
-        checkedButton.action = #selector(exportChecked)
-        checkedButton.toolTip = L10n.surface("一起导出已勾选的照片。")
 
         let detectRow = NSStackView(views: [detectControl, stopControl, NSView()])
         detectRow.alignment = .centerY
-        let exports = StudioStyle.actionControl(checkedButton)
         let separator = NSBox()
         separator.boxType = .separator
-        let views = [header, scroll, separator, activity, detectRow, exportCount, exports] as [NSView]
+        let views = [header, scroll, separator, activity, detectRow] as [NSView]
         let content = NSStackView(views: views)
         content.orientation = .vertical
         content.alignment = .leading
