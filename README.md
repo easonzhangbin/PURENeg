@@ -116,11 +116,9 @@ The app checks GitHub for releases and verifies signatures on in-app updates. Us
 
 ## 截图来源 · Photo credits
 
-除尘审核截图与 0.4.8 对比图中的照片由 PURE Neg 作者拍摄。 The repair review screenshot and the 0.4.8 comparison use photos taken by the PURE Neg author.
+软件界面截图（观片台、除尘审核页与检查模式细节）中展示的照片由摄影师 **nothing老庄** 拍摄。0.4.8 对比图中的照片由 PURE Neg 作者提供。
 
-观片台示例照片由 Jack Delano 拍摄，来自美国国会图书馆版画与摄影部 FSA/OWI 彩色摄影档案。
-
-The light table samples are photos by Jack Delano from the Library of Congress Prints and Photographs Division’s FSA/OWI color collection. [铁路编组场 / Classification yard](https://www.loc.gov/item/2017878015/) · [铁路站场 / Rail yard](https://www.loc.gov/resource/fsac.1a34616/) · [机车车间 / Locomotive shop](https://www.loc.gov/item/2017878063/) · [南水街货运站 / South Water Street freight depot](https://www.loc.gov/item/2017878163/)
+The photos shown in the app screenshots (light table, repair review, and the inspection close-up) are by photographer **nothing老庄**. The 0.4.8 comparison uses photos provided by the PURE Neg author.
 
 ## 支持 PURE Neg · Support PURE Neg
 
