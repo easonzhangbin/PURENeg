@@ -164,7 +164,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>PURE Neg</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.4.8</string>
-  <key>CFBundleVersion</key><string>20</string>
+  <key>CFBundleVersion</key><string>21</string>
   <key>CFBundleIconFile</key><string>PURENeg</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSAppleEventsUsageDescription</key><string>PURE Neg 需要读取 Photoshop 当前文档的可见图像，用于在本机生成除尘预览。</string>

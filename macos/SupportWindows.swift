@@ -41,8 +41,10 @@ enum SupportWindows {
         window.title = title
         window.contentMinSize = minimumSize
         window.isReleasedWhenClosed = false
-        window.isOpaque = false
-        window.backgroundColor = .clear
+        // An opaque window background: with .clear the title bar and the
+        // guide's reading pane showed the window behind straight through.
+        window.isOpaque = true
+        window.backgroundColor = .windowBackgroundColor
         window.contentView = NSHostingView(rootView: content.environment(\.locale, L10n.locale))
         window.center()
         return window
