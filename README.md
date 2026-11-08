@@ -50,7 +50,7 @@ Import a batch of TIFF or JPEG scans and click frames to move them from the film
 
 Switch between **Original**, **Repaired**, and **Split View**, and zoom in to inspect the repair mask. Hover a repair to see a glowing ring and a hint that a click undoes it. Use the brush on missed spots, the eraser to restore details, or the spot list to exclude a whole detection. An indicator shows while the preview updates, and Split View hides the mask until you leave it. The sidebar keeps the original frame numbers and shows processing progress. Batch detection starts after four seconds of inactivity by default and pauses while you work.
 
-![检查模式细节：杯口高光被误认成纤维，悬停后外圈出现暖色光圈，提示「毛发 / 纤维 · 点击后可撤销此处修复」，点一下即可恢复原样](docs/images/review-hover-cup.png)
+![检查模式细节：杯口高光被误认成纤维，悬停后外圈出现暖色光圈，提示「毛发 / 纤维 · 点击后可撤销此处修复」，点一下即可恢复原样](docs/images/review-hover-cup-credit.png)
 
 检查修复结果后，点左下角「导出当前」。也可在右侧勾选多张照片，再点「导出所选」。支持按原始分辨率导出 TIFF、JPEG 或 PNG。照片直接保存到所选目录，文件名为「原文件名-PN」，例如 `20250918-ECN213064-PN.jpg`；重名时自动加序号，不会覆盖。修复蒙版 TIFF 默认不导出，需要时在保存窗口勾选。导出后仍可继续修整，再导出一个新版本。
 
