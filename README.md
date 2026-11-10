@@ -34,6 +34,10 @@ Apple 芯片 Mac，macOS 14 或更新版本。 · Requires an Apple silicon Mac 
 
 岸边样片的 SDR 局部对比。默认自动检测修复了岩石旁的一根弯曲纤维，白色标出这次实际写入的修复范围。
 
+![石板纹理上的交叠纤维，依次显示原始扫描、自动修复结果和修复蒙版](docs/images/v0.4.9-stone-tangled-fibers-sdr.jpg)
+
+石板样片的 SDR 局部对比。四类检测均开启，灵敏度与纤维参数均为 100%。右图白色标出实际修复范围，修复后仍可见少量细纤维。
+
 ## 界面与操作 · Workflow
 
 ### 观片台 · Light Table
