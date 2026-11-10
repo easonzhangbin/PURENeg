@@ -5,6 +5,215 @@ import UniformTypeIdentifiers
 
 private let appTitle = "PURE Neg"
 
+// [Claude 2026-11-08] Training-pack options for the engine's confirm command, chosen in the
+// export panel. The labels say whether the frame is fully cleaned and whether it is kept
+// aside as a test frame.
+// [Claude 2026-11-09] Export settings chosen in an export panel: colour space, bit depth,
+// TIFF compression and JPEG quality. "保持原样" everywhere writes the photo exactly as before.
+enum ExportSettingsUI {
+    private static let defaults = UserDefaults.standard
+    static let labelWidth: CGFloat = 112
+    private static let spaces = [("keep", "保持原样"), ("srgb", "sRGB"), ("p3", "Display P3"), ("adobergb", "Adobe RGB (1998)")]
+    private static let depths = [("keep", "保持原样"), ("8", "8 位"), ("16", "16 位")]
+    private static let compressions = [("none", "不压缩"), ("lzw", "LZW 无损压缩")]
+    private static let qualities = [(1.0, "最高 100%"), (0.95, "高 95%"), (0.85, "中 85%"), (0.75, "较小 75%")]
+
+    struct Controls {
+        let space: NSPopUpButton, depth: NSPopUpButton, compression: NSPopUpButton, quality: NSPopUpButton
+        let views: [NSView]
+        func arguments() -> [String] {
+            let settings: [String: Any] = [
+                "space": ExportSettingsUI.spaces[space.indexOfSelectedItem].0,
+                "depth": ExportSettingsUI.depths[depth.indexOfSelectedItem].0,
+                "compression": ExportSettingsUI.compressions[compression.indexOfSelectedItem].0,
+                "quality": ExportSettingsUI.qualities[quality.indexOfSelectedItem].0,
+            ]
+            ExportSettingsUI.defaults.set(space.indexOfSelectedItem, forKey: "settings.exportSpaceIndex")
+            ExportSettingsUI.defaults.set(depth.indexOfSelectedItem, forKey: "settings.exportDepthIndex")
+            ExportSettingsUI.defaults.set(compression.indexOfSelectedItem, forKey: "settings.exportCompressionIndex")
+            ExportSettingsUI.defaults.set(quality.indexOfSelectedItem, forKey: "settings.exportQualityIndex")
+            guard let data = try? JSONSerialization.data(withJSONObject: settings, options: [.sortedKeys]),
+                  let json = String(data: data, encoding: .utf8) else { return [] }
+            return ["--export-settings", json]
+        }
+    }
+
+    static func controls() -> Controls {
+        func popup(_ titles: [String], key: String, fallback: Int, label: String) -> (NSPopUpButton, NSView) {
+            let button = NSPopUpButton(frame: .zero, pullsDown: false)
+            button.addItems(withTitles: titles.map { L10n.text(String.LocalizationValue(stringLiteral: $0)) })
+            let stored = defaults.object(forKey: key) as? Int ?? fallback
+            button.selectItem(at: (0..<titles.count).contains(stored) ? stored : fallback)
+            button.controlSize = .small
+            button.isBordered = false
+            button.setAccessibilityLabel(L10n.text(String.LocalizationValue(stringLiteral: label)))
+            let title = NSTextField(labelWithString: L10n.text(String.LocalizationValue(stringLiteral: label)))
+            title.font = .systemFont(ofSize: 12)
+            title.widthAnchor.constraint(equalToConstant: labelWidth).isActive = true
+            let control = StudioStyle.glassControl(button, horizontal: 10, vertical: 2)
+            control.heightAnchor.constraint(greaterThanOrEqualToConstant: 26).isActive = true
+            let row = NSStackView(views: [title, control])
+            row.alignment = .centerY
+            row.spacing = 10
+            return (button, row)
+        }
+        let (space, spaceRow) = popup(spaces.map(\.1), key: "settings.exportSpaceIndex", fallback: 0, label: "色彩空间")
+        let (depth, depthRow) = popup(depths.map(\.1), key: "settings.exportDepthIndex", fallback: 0, label: "位深")
+        let (compression, compressionRow) = popup(compressions.map(\.1), key: "settings.exportCompressionIndex", fallback: 0, label: "TIFF 压缩")
+        let (quality, qualityRow) = popup(qualities.map(\.1), key: "settings.exportQualityIndex", fallback: 1, label: "JPEG 质量")
+        space.toolTip = L10n.text("「保持原样」沿用原图的色彩描述，不做转换。")
+        depth.toolTip = L10n.text("JPEG 总是 8 位。")
+        return Controls(space: space, depth: depth, compression: compression, quality: quality,
+                        views: [spaceRow, depthRow, compressionRow, qualityRow])
+    }
+}
+
+private final class PendingInputsList: NSScrollView, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
+    private var urls: [URL] = []
+    var onChange: (([URL]) -> Void)?
+    var editingEnabled = true {
+        didSet { if oldValue != editingEnabled { table.reloadData() } }
+    }
+    private let table = NSTableView()
+    private let rowHeight: CGFloat = 30
+    private lazy var preferredHeight = heightAnchor.constraint(equalToConstant: rowHeight)
+
+    init() {
+        super.init(frame: .zero)
+        drawsBackground = false
+        hasVerticalScroller = true
+        autohidesScrollers = true
+        scrollerStyle = .overlay
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        layer?.masksToBounds = true
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.12).cgColor
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("pending-input"))
+        column.resizingMask = .autoresizingMask
+        table.addTableColumn(column)
+        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        table.headerView = nil
+        table.style = .plain
+        table.backgroundColor = .clear
+        table.intercellSpacing = .zero
+        table.rowHeight = rowHeight
+        table.gridStyleMask = .solidHorizontalGridLineMask
+        table.gridColor = NSColor.white.withAlphaComponent(0.08)
+        table.allowsMultipleSelection = true
+        table.setAccessibilityLabel(L10n.text("待导入的照片"))
+        table.dataSource = self
+        table.delegate = self
+        documentView = table
+        let menu = NSMenu()
+        menu.addItem(withTitle: L10n.text("移除所选"), action: #selector(removeSelected), keyEquivalent: "").target = self
+        menu.addItem(withTitle: L10n.text("移除所选的文件夹"), action: #selector(removeFolders), keyEquivalent: "").target = self
+        table.menu = menu
+        // Keep the rest of the source page reachable in a short window.
+        preferredHeight.priority = .defaultLow
+        preferredHeight.isActive = true
+        heightAnchor.constraint(greaterThanOrEqualToConstant: rowHeight).isActive = true
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func replace(_ urls: [URL]) {
+        guard self.urls != urls else { return }
+        self.urls = urls
+        preferredHeight.constant = rowHeight * CGFloat(max(1, min(urls.count, 3)))
+        table.deselectAll(nil)
+        table.reloadData()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { urls.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let url = urls[row]
+        let name = NSTextField(labelWithString: url.lastPathComponent)
+        name.font = .systemFont(ofSize: 12, weight: .medium)
+        name.lineBreakMode = .byTruncatingMiddle
+        name.toolTip = url.path
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let folderPath = (url.deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath
+        let folder = NSTextField(labelWithString: folderPath)
+        folder.font = .systemFont(ofSize: 11)
+        folder.textColor = StudioStyle.secondaryText
+        folder.lineBreakMode = .byTruncatingMiddle
+        folder.toolTip = url.path
+        folder.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        folder.setContentHuggingPriority(.fittingSizeCompression, for: .horizontal)
+        let remove = NSButton(title: L10n.text("移除"), target: self, action: #selector(removeInput(_:)))
+        remove.font = .systemFont(ofSize: 11)
+        remove.setAccessibilityLabel(L10n.text("移除 \(url.lastPathComponent)"))
+        remove.isEnabled = editingEnabled
+        let rowContent = NSStackView(views: [name, folder, StudioStyle.actionControl(remove, horizontal: 8, vertical: 2)])
+        rowContent.alignment = .centerY
+        rowContent.distribution = .fill
+        rowContent.spacing = 10
+        let cell = NSTableCellView()
+        cell.textField = name
+        StudioStyle.embed(rowContent, in: cell, horizontal: 10, vertical: 0)
+        name.widthAnchor.constraint(equalTo: rowContent.widthAnchor, multiplier: 0.36).isActive = true
+        return cell
+    }
+
+    private var contextSelection: IndexSet {
+        let clicked = table.clickedRow
+        let selected = table.selectedRowIndexes
+        if urls.indices.contains(clicked), !selected.contains(clicked) {
+            return IndexSet(integer: clicked)
+        }
+        return selected
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        editingEnabled && !contextSelection.isEmpty
+    }
+
+    @objc private func removeInput(_ sender: NSButton) {
+        let row = table.row(for: sender)
+        guard editingEnabled, urls.indices.contains(row) else { return }
+        var remaining = urls
+        remaining.remove(at: row)
+        onChange?(remaining)
+    }
+
+    @objc private func removeSelected() {
+        let rows = contextSelection
+        guard editingEnabled, !rows.isEmpty else { return }
+        onChange?(urls.enumerated().filter { !rows.contains($0.offset) }.map(\.element))
+    }
+
+    @objc private func removeFolders() {
+        let folders = Set(contextSelection.map { urls[$0].deletingLastPathComponent().standardizedFileURL })
+        guard editingEnabled, !folders.isEmpty else { return }
+        onChange?(urls.filter { !folders.contains($0.deletingLastPathComponent().standardizedFileURL) })
+    }
+}
+
+enum TrainingPackExport {
+    static func arguments(enabled: Bool, clean: Bool, test: Bool) -> [String] {
+        guard enabled else { return [] }
+        return ["--training-pack", "yes", "--training-labels", "{\"clean\":\(clean),\"test\":\(test)}"]
+    }
+    // The checkboxes added to an export panel; nil when the pack is switched off.
+    static func controls() -> (pack: NSButton, clean: NSButton, test: NSButton, views: [NSView])? {
+        guard AppPreferences.exportTrainingPack else { return nil }
+        let note = NSTextField(labelWithString: AppPreferences.isTrainingBuild
+            ? L10n.text("训练版 · 训练数据包") : L10n.text("训练数据包"))
+        note.textColor = StudioStyle.amber
+        note.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+        let pack = NSButton(checkboxWithTitle: L10n.text("导出训练数据包"), target: nil, action: nil)
+        pack.state = .on
+        let clean = NSButton(checkboxWithTitle: L10n.text("这张已修干净（可用于训练）"), target: nil, action: nil)
+        clean.state = .on
+        let test = NSButton(checkboxWithTitle: L10n.text("留作测试片（不参与训练）"), target: nil, action: nil)
+        test.state = .off
+        return (pack, clean, test, [note, pack, clean, test])
+    }
+}
+
 private func makeIcon(_ size: CGFloat = 256) -> NSImage {
     NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
         StudioStyle.charcoal.setFill()
@@ -60,7 +269,7 @@ enum StudioStyle {
         return label
     }
 
-    static func installBackdrop(in window: NSWindow, root: NSView) {
+    static func installBackdrop(in window: NSWindow, root: NSView, contrastOpacity: CGFloat = 0.26) {
         window.isOpaque = false
         window.backgroundColor = .clear
         // Only the window chrome samples the desktop and other windows.
@@ -71,7 +280,7 @@ enum StudioStyle {
         // Keep white text readable over light wallpapers without adding a color cast.
         let contrastVeil = NSView()
         contrastVeil.wantsLayer = true
-        contrastVeil.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.26).cgColor
+        contrastVeil.layer?.backgroundColor = NSColor.black.withAlphaComponent(contrastOpacity).cgColor
         embed(contrastVeil, in: backdrop, horizontal: 0, vertical: 0)
         backdrop.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(backdrop, positioned: .below, relativeTo: nil)
@@ -102,10 +311,10 @@ enum StudioStyle {
         return header
     }
 
-    static func actionControl(_ button: NSButton) -> NSView {
+    static func actionControl(_ button: NSButton, horizontal: CGFloat = 12, vertical: CGFloat = 4) -> NSView {
         button.isBordered = false
         button.focusRingType = .exterior
-        let control = glassControl(button, horizontal: 12, vertical: 4)
+        let control = glassControl(button, horizontal: horizontal, vertical: vertical)
         if let primary = button as? PrimaryActionButton {
             primary.updateTreatment = { [weak control, weak primary] enabled in
                 let tint = enabled ? amber : nil
@@ -122,6 +331,13 @@ enum StudioStyle {
         }
         control.heightAnchor.constraint(greaterThanOrEqualToConstant: 28).isActive = true
         return control
+    }
+
+    static func backControl(_ button: NSButton) -> NSView {
+        button.image = NSImage(systemSymbolName: "chevron.left", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
+        button.imagePosition = .imageLeading
+        return actionControl(button)
     }
 
     fileprivate static func segmentedControl(_ control: StudioSegments) -> NSView {
@@ -394,13 +610,14 @@ final class LaserProgressBar: NSView {
 }
 
 enum DetectionKind: String, CaseIterable {
-    case dust, scratches, fibers
+    case dust, scratches, fibers, patches
 
     var label: String {
         switch self {
         case .dust: return L10n.text("灰尘")
         case .scratches: return L10n.text("划痕")
         case .fibers: return L10n.text("毛发／纤维")
+        case .patches: return L10n.text("斑块")
         }
     }
 }
@@ -409,6 +626,189 @@ private enum ReviewExportFormat: String, CaseIterable {
     case tiff, jpeg, png
 
     var label: String { rawValue.uppercased() }
+}
+
+private final class PhotoExportSheet: NSObject {
+    struct Selection {
+        let folder: URL
+        let format: ReviewExportFormat
+        let includeMask: Bool
+        let options: [String]
+    }
+
+    private let window: NSWindow
+    private var folder: URL
+    private let folderPath = NSTextField(labelWithString: "")
+    private let format = StudioSegments(labels: ReviewExportFormat.allCases.map(\.label))
+    private let settings = ExportSettingsUI.controls()
+    private let includeMask = NSButton(checkboxWithTitle: L10n.text("附带修复蒙版"), target: nil, action: nil)
+    private let training = TrainingPackExport.controls()
+
+    static func present(for host: NSWindow, count: Int, suggestedFolder: URL?, completion: @escaping (Selection?) -> Void) {
+        let sheet = PhotoExportSheet(count: count, suggestedFolder: suggestedFolder)
+        host.beginSheet(sheet.window) { response in
+            sheet.window.orderOut(nil)
+            completion(response == .OK ? sheet.selection : nil)
+        }
+    }
+
+    private init(count: Int, suggestedFolder: URL?) {
+        folder = Self.existingFolder(suggestedFolder)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 480),
+                          styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+        super.init()
+        window.title = count == 1 ? L10n.text("导出照片") : L10n.text("导出 \(count) 张照片")
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.isReleasedWhenClosed = false
+        build()
+    }
+
+    private var selectedFormat: ReviewExportFormat { ReviewExportFormat.allCases[format.selectedSegment] }
+
+    private var selection: Selection {
+        let packOptions = training.map {
+            TrainingPackExport.arguments(enabled: $0.pack.state == .on, clean: $0.clean.state == .on, test: $0.test.state == .on)
+        } ?? []
+        return Selection(folder: folder, format: selectedFormat, includeMask: includeMask.state == .on,
+                         options: packOptions + settings.arguments())
+    }
+
+    private func build() {
+        guard let root = window.contentView else { return }
+        StudioStyle.installBackdrop(in: window, root: root)
+        let title = NSTextField(labelWithString: window.title)
+        title.font = .systemFont(ofSize: 19, weight: .semibold)
+        title.textColor = StudioStyle.light
+        let header = row([title, NSView(), StudioStyle.wordmark(width: 112, maxHeight: 22, fallbackSize: 14)])
+
+        format.selectedSegment = ReviewExportFormat.allCases.firstIndex {
+            $0.rawValue == AppPreferences.exportFormat
+        } ?? 0
+        format.target = self
+        format.action = #selector(updateFormatOptions)
+        format.setAccessibilityLabel(L10n.text("修复图像导出格式"))
+        let formatLabel = NSTextField(labelWithString: L10n.text("导出格式"))
+        formatLabel.font = .systemFont(ofSize: 12)
+        formatLabel.widthAnchor.constraint(equalToConstant: ExportSettingsUI.labelWidth).isActive = true
+        let formatRow = row([formatLabel, StudioStyle.segmentedControl(format)])
+        let imageCard = card([StudioStyle.section("01", L10n.text("图像设置")), formatRow] + settings.views)
+        updateFormatOptions()
+
+        let folderIcon = NSImageView(image: NSImage(systemSymbolName: "folder", accessibilityDescription: nil) ?? NSImage())
+        folderIcon.contentTintColor = StudioStyle.secondaryText
+        folderIcon.setAccessibilityElement(false)
+        folderIcon.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        folderPath.font = .systemFont(ofSize: 12)
+        folderPath.lineBreakMode = .byTruncatingMiddle
+        folderPath.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        updateFolderPath()
+        let choose = NSButton(title: L10n.text("选择文件夹…"), target: self, action: #selector(chooseFolder))
+        let folderRow = row([folderIcon, folderPath, StudioStyle.actionControl(choose)])
+
+        includeMask.state = AppPreferences.includeMask ? .on : .off
+        var destinationViews: [NSView] = [StudioStyle.section("02", L10n.text("保存位置")), folderRow, checkboxRow(includeMask)]
+        if let training {
+            training.pack.target = self
+            training.pack.action = #selector(updateTrainingOptions)
+            destinationViews += training.views.map { view in
+                if let checkbox = view as? NSButton { return checkboxRow(checkbox) }
+                return view
+            }
+        }
+        let outputCard = card(destinationViews)
+
+        let cancel = NSButton(title: L10n.text("取消"), target: self, action: #selector(cancelExport))
+        cancel.keyEquivalent = "\u{1b}"
+        cancel.keyEquivalentModifierMask = []
+        let export = PrimaryActionButton(title: L10n.text("导出"), target: self, action: #selector(confirmExport))
+        export.keyEquivalent = "\r"
+        let actions = row([NSView(), StudioStyle.actionControl(cancel), StudioStyle.actionControl(export)])
+
+        let content = NSStackView(views: [header, imageCard, outputCard, actions])
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 12
+        content.widthAnchor.constraint(equalToConstant: 456).isActive = true
+        for view in content.arrangedSubviews { view.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true }
+        let height = ceil(content.fittingSize.height) + 36
+        window.setContentSize(NSSize(width: 500, height: height))
+        StudioStyle.embed(content, in: root, horizontal: 22, vertical: 18)
+    }
+
+    private func row(_ views: [NSView]) -> NSStackView {
+        let row = NSStackView(views: views)
+        row.alignment = .centerY
+        row.spacing = 10
+        return row
+    }
+
+    private func checkboxRow(_ checkbox: NSButton) -> NSStackView {
+        row([StudioStyle.checkboxControl(checkbox), NSView()])
+    }
+
+    private func card(_ views: [NSView]) -> GlassPanel {
+        let column = NSStackView(views: views)
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = 7
+        for view in views { view.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true }
+        let panel = GlassPanel()
+        panel.place(column, horizontal: 14, vertical: 11)
+        return panel
+    }
+
+    @objc private func updateFormatOptions() {
+        settings.depth.isEnabled = selectedFormat != .jpeg
+        settings.compression.isEnabled = selectedFormat == .tiff
+        settings.quality.isEnabled = selectedFormat == .jpeg
+    }
+
+    @objc private func updateTrainingOptions() {
+        guard let training else { return }
+        let enabled = training.pack.state == .on
+        training.clean.isEnabled = enabled
+        training.test.isEnabled = enabled
+    }
+
+    private func updateFolderPath() {
+        folderPath.stringValue = folder.path
+        folderPath.toolTip = folder.path
+        folderPath.setAccessibilityLabel(L10n.text("保存位置：\(folder.path)"))
+    }
+
+    private static func existingFolder(_ suggested: URL?) -> URL {
+        let files = FileManager.default
+        var folder = suggested ?? files.homeDirectoryForCurrentUser
+        var isDirectory: ObjCBool = false
+        while !files.fileExists(atPath: folder.path, isDirectory: &isDirectory) || !isDirectory.boolValue {
+            let parent = folder.deletingLastPathComponent()
+            if parent == folder { return files.homeDirectoryForCurrentUser }
+            folder = parent
+        }
+        return folder
+    }
+
+    @objc private func chooseFolder() {
+        guard window.attachedSheet == nil else { return }
+        let panel = NSOpenPanel()
+        panel.title = L10n.text("选择保存位置")
+        panel.prompt = L10n.text("选择")
+        panel.directoryURL = Self.existingFolder(folder)
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, let selected = panel.url else { return }
+            self.folder = selected
+            self.updateFolderPath()
+        }
+    }
+
+    @objc private func cancelExport() { window.sheetParent?.endSheet(window, returnCode: .cancel) }
+    @objc private func confirmExport() { window.sheetParent?.endSheet(window, returnCode: .OK) }
 }
 
 private struct ReviewSession {
@@ -423,6 +823,7 @@ private struct ReviewSession {
     let regions: [DustRegion]
     let detectionKinds: [DetectionKind]
     let detectionThresholds: DetectionThresholds
+    let rebateBakedIn: Bool
     let context: String
     let outputRoot: String?
 
@@ -473,7 +874,14 @@ private struct ReviewSession {
             guard let value = thresholds[kind.rawValue], (0.5...2).contains(value) else { return 1 }
             return value
         }
-        detectionThresholds = DetectionThresholds(dust: strength(.dust), fibers: strength(.fibers), scratches: strength(.scratches))
+        func shape(_ key: String) -> Double {
+            guard let value = thresholds[key], (0.5...2).contains(value) else { return 1 }
+            return value
+        }
+        detectionThresholds = DetectionThresholds(dust: strength(.dust), fibers: strength(.fibers), scratches: strength(.scratches),
+                                                  patches: strength(.patches),
+                                                  curl: shape("curl"), softness: shape("softness"))
+        rebateBakedIn = (review["rebateBakedIn"] as? Bool) ?? ((thresholds["keepRebate"] ?? 0) > 0)
         context = review["context"] as? String ?? "file"
         outputRoot = review["outputRoot"] as? String
     }
@@ -482,12 +890,18 @@ private struct ReviewSession {
 private struct ReviewRasters {
     let cleaned: URL
     let mask: URL
+    let protectedRegions: Set<Int>
 }
 
 private struct DetectionThresholds: Equatable {
     var dust: Double = 1
     var fibers: Double = 1
     var scratches: Double = 1
+    var patches: Double = 1
+    // [Claude 2026-11-09] Fibre shape: how curled (curl) and how soft or wide (softness) a
+    // line may be and still be repaired as a fibre. 1 = the tested defaults.
+    var curl: Double = 1
+    var softness: Double = 1
 
     static let standard = DetectionThresholds()
 
@@ -497,6 +911,7 @@ private struct DetectionThresholds: Equatable {
             case .dust: return dust
             case .scratches: return scratches
             case .fibers: return fibers
+            case .patches: return patches
             }
         }
         set {
@@ -504,6 +919,7 @@ private struct DetectionThresholds: Equatable {
             case .dust: dust = newValue
             case .scratches: scratches = newValue
             case .fibers: fibers = newValue
+            case .patches: patches = newValue
             }
         }
     }
@@ -543,16 +959,20 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
     private(set) var session: ReviewSession?
     let canvas = PreviewCanvasView(frame: .zero)
     let batchSidebar: BatchReviewSidebar?
-    var onConfirm: ((URL?, Bool) -> Void)?
+    var onConfirm: ((PhotoExportSheet.Selection?) -> Void)?
     var onExportCurrent: (() -> Void)?
     var onExportSelected: (() -> Void)?
     var onPreviewReady: (() -> Void)?
     var onDiscard: (() -> Void)?
     var onFinish: (() -> Void)?
+    var onViewRepair: (() -> Void)? { didSet { updateSelection() } }
     var onEditsChange: (() -> Void)?
     var onRedetect: ((DetectionThresholds) -> Void)? { didSet { updateDetectionControls() } }
     var onCancelRedetect: (() -> Void)? { didSet { updateDetectionControls() } }
     private(set) var excludedRegions = Set<Int>()
+    private(set) var keepRebate = false
+    private var protectedRegions = Set<Int>()
+    private var regions: [DustRegion] = []
     private(set) var strokes: [ReviewStroke] = []
     private(set) var editHistory = ReviewEditHistory()
     private var appliedStrokeCount = 0
@@ -599,22 +1019,46 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         value.widthAnchor.constraint(equalToConstant: 45).isActive = true
         return (kind: kind, slider: slider, value: value)
     }
+    private lazy var shapeControls: [(key: WritableKeyPath<DetectionThresholds, Double>, label: String, slider: NSSlider, value: NSTextField)] = [
+        (\DetectionThresholds.curl, L10n.text("纤维弯曲度"), L10n.text("调高后，弯成钩形、C 形的纤维和更短的纤维也会被修；画面里卷曲的发丝、褶皱边也更容易被误修。")),
+        (\DetectionThresholds.softness, L10n.text("纤维软度"), L10n.text("调高后，更宽、更模糊的纤维也会被修；画面里本身就软的线条（虚化的电线、窗框边）也更容易被误修。")),
+    ].map { key, label, help in
+        let slider = NSSlider(value: 100, minValue: 50, maxValue: 200, target: self, action: #selector(changeSensitivity(_:)))
+        slider.isContinuous = true
+        slider.controlSize = .small
+        slider.setAccessibilityLabel(label)
+        slider.toolTip = help
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) { slider.tintProminence = .none }
+        #endif
+        let value = NSTextField(labelWithString: "100%")
+        value.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        value.alignment = .right
+        value.widthAnchor.constraint(equalToConstant: 45).isActive = true
+        return (key: key, label: label, slider: slider, value: value)
+    }
+    private lazy var keepRebateBox: NSButton = {
+        let box = NSButton(checkboxWithTitle: L10n.text("保留片边和齿孔"), target: self, action: #selector(changeKeepRebate(_:)))
+        box.controlSize = .small
+        box.font = .systemFont(ofSize: 11)
+        return box
+    }()
     private var appliedThresholds = DetectionThresholds.standard
     private let message = NSTextField(wrappingLabelWithString: L10n.text("已准备好预览。"))
-    private let exportFormat = StudioSegments(labels: ReviewExportFormat.allCases.map(\.label))
     private let confirmButton = PrimaryActionButton(title: "", target: nil, action: nil)
     private lazy var exportSelectedButton = NSButton(title: L10n.surface("导出所选"), target: self, action: #selector(exportSelected))
     private let exportSelection = NSTextField(wrappingLabelWithString: "")
-    private let discardButton = NSButton(title: L10n.text("取消"), target: nil, action: nil)
+    private lazy var backButton = NSButton(title: isBatch ? L10n.text("返回灯板") : L10n.surface("返回来源"),
+                                          target: self, action: #selector(returnFromReview))
     private let undoButton = NSButton(title: L10n.text("撤销"), target: nil, action: nil)
     private let redoButton = NSButton(title: L10n.text("重做"), target: nil, action: nil)
     private let retryButton = NSButton(title: L10n.text("重试预览"), target: nil, action: nil)
     private lazy var fitButton = NSButton(title: L10n.text("适应"), target: self, action: #selector(fit))
     private lazy var sizeButton = NSButton(title: "100%", target: self, action: #selector(actualSize))
+    private lazy var viewRepairButton = PrimaryActionButton(title: L10n.text("在观片器中查看"), target: self, action: #selector(viewRepair))
     private lazy var listToggle = NSButton(checkboxWithTitle: L10n.text("展开点位列表"), target: self, action: #selector(changeList(_:)))
     private lazy var previousButton = NSButton(title: L10n.text("上一处"), target: self, action: #selector(previous))
     private lazy var nextButton = NSButton(title: L10n.text("下一处"), target: self, action: #selector(next))
-    private lazy var savedReturn = PrimaryActionButton(title: L10n.text("处理下一张"), target: self, action: #selector(nextPhoto))
     private let savedFilename = NSTextField(labelWithString: "")
     private let savedPath = NSTextField(wrappingLabelWithString: "")
     private weak var retryControl: NSView?
@@ -622,6 +1066,7 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
     private weak var savedControls: NSStackView?
     private var outputFile: URL?
     private var outputDirectory: URL?
+    private var repairedURL: URL?
     private var listBody: NSStackView?
     private var selectingRegion = false
     private var working = false
@@ -637,9 +1082,11 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
     private var hasDisplayedPreview = false
     private var canReturn = true
     private var isBatch: Bool { batchSidebar != nil }
-    private var regions: [DustRegion] { session?.regions ?? [] }
     private var canView: Bool { hasDisplayedPreview && !working && !redetecting && !choosingOutput }
     private var canEdit: Bool { canView && (!saved || session?.context == "file") }
+    private var canNavigateBack: Bool { canReturn && !working && !redetecting && !choosingOutput && !updatingRepairForViewing }
+    var settledRepairedURL: URL? { pending ? nil : repairedURL }
+    var updatingRepairForViewing: Bool { isBatch && session != nil && pending && (retryControl?.isHidden ?? true) }
     var canUndoEdit: Bool { canEdit && !editHistory.undo.isEmpty }
     var canRedoEdit: Bool { canEdit && !editHistory.redo.isEmpty }
     private var canAdjustDetection: Bool { canEdit && !pending && canvas.isDisplayReady && onRedetect != nil }
@@ -664,12 +1111,14 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         reviewWindow.center()
         buildInterface()
         reviewWindow.initialFirstResponder = canvas
+        setKeepRebate(session?.rebateBakedIn ?? false)
         setDetectionThresholds(session?.detectionThresholds ?? .standard)
         if let session {
             try loadPreview(session)
             hasDisplayedPreview = canvas.isDisplayReady
             if !hasDisplayedPreview { loadingView.setSource(URL(fileURLWithPath: session.sourcePath)) }
         }
+        setProtectedRegions([])
         loadingView.setAnimating(session != nil)
         batchSidebar?.onThumbnailReady = { [weak self] url, image in
             guard let self, self.loadingSourceURL == url, !self.hasDisplayedPreview else { return }
@@ -697,21 +1146,14 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
 
     required init?(coder: NSCoder) { nil }
 
-    private var selectedExportFormat: ReviewExportFormat {
-        let formats = ReviewExportFormat.allCases
-        return formats.indices.contains(exportFormat.selectedSegment) ? formats[exportFormat.selectedSegment] : .tiff
-    }
-
     private func loadPreview(_ session: ReviewSession, rasters: ReviewRasters? = nil, preserveViewport: Bool = false) throws {
+        let cleaned = rasters?.cleaned ?? URL(fileURLWithPath: session.cleanedPath)
         try canvas.load(sourceURL: URL(fileURLWithPath: session.sourcePath),
-                        cleanedURL: rasters?.cleaned ?? URL(fileURLWithPath: session.cleanedPath),
+                        cleanedURL: cleaned,
                         maskURL: rasters?.mask ?? URL(fileURLWithPath: session.maskPath),
                         width: session.width, height: session.height, regions: session.regions,
                         runsURL: session.runsURL, preserveViewport: preserveViewport)
-    }
-
-    var confirmationFormatArguments: [String] {
-        session?.context == "photocraft" ? [] : ["--format", selectedExportFormat.rawValue, "--revise-export"]
+        repairedURL = cleaned
     }
 
     private func setSourceName(_ name: String) {
@@ -750,33 +1192,61 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
             let percent = slider.doubleValue.rounded()
             if percent != (appliedThresholds[kind] * 100).rounded() { thresholds[kind] = percent / 100 }
         }
+        for control in shapeControls where control.slider.isEnabled {
+            let percent = control.slider.doubleValue.rounded()
+            if percent != (appliedThresholds[keyPath: control.key] * 100).rounded() { thresholds[keyPath: control.key] = percent / 100 }
+        }
         return thresholds
     }
 
     func setDetectionThresholds(_ values: DetectionThresholds) {
         appliedThresholds = values
         for (kind, slider, _) in sensitivityControls { slider.doubleValue = values[kind] * 100 }
+        for control in shapeControls { control.slider.doubleValue = values[keyPath: control.key] * 100 }
         updateDetectionControls()
+    }
+
+    private func setKeepRebate(_ value: Bool) {
+        keepRebate = value
+        keepRebateBox.state = value ? .on : .off
     }
 
     private func updateDetectionControls() {
         let kinds = session?.detectionKinds ?? []
         for (kind, slider, value) in sensitivityControls {
-            let selected = session != nil && (kinds.isEmpty || kinds.contains(kind))
+            let selected = session != nil && (kinds.contains(kind) || (kinds.isEmpty && kind != .patches))
             slider.isEnabled = selected && canAdjustDetection
             slider.setAccessibilityHelp(selected ? nil : L10n.text("此检测项目未启用。"))
             value.stringValue = selected ? "\(Int(slider.doubleValue.rounded()))%" : L10n.text("未启用")
             value.textColor = selected ? StudioStyle.amber : StudioStyle.secondaryText
         }
+        let bakedIn = session?.rebateBakedIn == true
+        keepRebateBox.isEnabled = session != nil && canEdit && canvas.isDisplayReady && !bakedIn
+        keepRebateBox.toolTip = bakedIn
+            ? L10n.text("这个旧预览已预先保护片边。重新检测一次后即可直接切换。")
+            : L10n.text("切换后自动更新预览。片边、齿孔和片号保留原样。")
+        let fibres = session != nil && (kinds.isEmpty || kinds.contains(.fibers))
+        for control in shapeControls {
+            control.slider.isEnabled = fibres && canAdjustDetection
+            control.value.stringValue = fibres ? "\(Int(control.slider.doubleValue.rounded()))%" : L10n.text("未启用")
+            control.value.textColor = fibres ? StudioStyle.amber : StudioStyle.secondaryText
+        }
         let title = redetecting ? L10n.text("取消重新检测") : L10n.text("重新检测")
         if redetectButton.title != title { redetectButton.title = title }
-        redetectButton.isEnabled = redetecting ? onCancelRedetect != nil : canAdjustDetection && draftThresholds != appliedThresholds
+        redetectButton.isEnabled = redetecting ? onCancelRedetect != nil : canAdjustDetection && (bakedIn || draftThresholds != appliedThresholds)
         let activity = redetectionStatus ?? redetectionNotice
         redetectionActivity.stringValue = activity ?? ""
         redetectionActivity.toolTip = activity
         redetectionProgressContent.isHidden = activity == nil
         redetectionPercentage.isHidden = !redetecting
         redetectionProgress.isHidden = !redetecting
+    }
+
+    @objc private func changeKeepRebate(_ sender: NSButton) {
+        let value = sender.state == .on
+        guard sender.isEnabled, keepRebate != value else { return }
+        setKeepRebate(value)
+        editsChanged()
     }
 
     @objc private func changeSensitivity(_ sender: NSSlider) {
@@ -794,6 +1264,11 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
             let title = text(kind.label, size: 11, secondary: true)
             title.widthAnchor.constraint(equalToConstant: 80).isActive = true
             return stack([title, slider, value], spacing: 8)
+        } + shapeControls.map { control in
+            let title = text(control.label, size: 11, secondary: true)
+            title.toolTip = control.slider.toolTip
+            title.widthAnchor.constraint(equalToConstant: 80).isActive = true
+            return stack([title, control.slider, control.value], spacing: 8)
         }
         let heading = text(L10n.text("检测灵敏度"), size: 12, weight: .semibold)
         heading.toolTip = L10n.text("100% 为默认灵敏度。调高会纳入更多候选。")
@@ -806,7 +1281,7 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         redetectionPercentage.textColor = StudioStyle.amber
         redetectionPercentage.alignment = .right
         let action = StudioStyle.actionControl(redetectButton)
-        let content = stack([heading] + rows + [action, redetectionProgressContent], vertical: true, spacing: 5)
+        let content = stack([heading] + rows + [keepRebateBox, action, redetectionProgressContent], vertical: true, spacing: 5)
         for view in rows + [action, redetectionProgressContent] {
             view.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         }
@@ -872,11 +1347,18 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         }
         #endif
         let wordmark = StudioStyle.wordmark(width: 142, maxHeight: 32, fallbackSize: 20)
+        backButton.keyEquivalent = "\u{1b}"
+        viewRepairButton.image = NSImage(systemSymbolName: "film", accessibilityDescription: nil)
+        viewRepairButton.imagePosition = .imageLeading
+        viewRepairButton.font = .systemFont(ofSize: 13, weight: .semibold)
         let toolbar = GlassPanel(material: .headerView, radius: 12)
+        let previewControls = stack([
+            StudioStyle.segmentedControl(viewMode), StudioStyle.actionControl(fitButton),
+            StudioStyle.actionControl(sizeButton), zoomLabel
+        ], spacing: 8)
         toolbar.place(stack([
-            wordmark, StudioStyle.segmentedControl(viewMode), NSView(),
-            StudioStyle.actionControl(fitButton), StudioStyle.actionControl(sizeButton), zoomLabel,
-            SupportWindows.supportControl()
+            StudioStyle.backControl(backButton), wordmark, NSView(), previewControls,
+            StudioStyle.actionControl(viewRepairButton, horizontal: 14, vertical: 6), SupportWindows.supportControl()
         ], spacing: 11), horizontal: 13, vertical: 7)
 
         let scroll = NSScrollView()
@@ -951,24 +1433,11 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
             overlayRow, opacityRow, StudioStyle.checkboxControl(markers), StudioStyle.checkboxControl(listToggle), listBody,
             separator(), StudioStyle.section("02", L10n.text("修整"), size: 14), toolsGlass, toolHint, radiusRow, historyActions
         ]
-        let exportHeading = StudioStyle.section("03", isBatch ? L10n.text("导出") : L10n.text("应用"), size: 14)
-        let discardControl = StudioStyle.actionControl(discardButton)
+        let exportHeading = StudioStyle.section("03", session?.context == "photocraft" ? L10n.text("应用") : L10n.text("导出"), size: 14)
         let confirmControl = StudioStyle.actionControl(confirmButton)
         var exportItems: [NSView] = [exportHeading]
-        if !isBatch && session?.context != "photocraft" {
-            exportFormat.selectedSegment = ReviewExportFormat.allCases.firstIndex {
-                $0.rawValue == AppPreferences.exportFormat
-            } ?? 0
-            exportFormat.target = self
-            exportFormat.action = #selector(changeExportFormat)
-            exportFormat.setAccessibilityLabel(L10n.text("修复图像导出格式"))
-            exportItems.append(stack([
-                text(L10n.text("导出格式"), size: 11, secondary: true),
-                StudioStyle.segmentedControl(exportFormat)
-            ], spacing: 7))
-        }
         exportItems += [message, retryControl]
-        if !isBatch { exportItems.append(stack([discardControl, confirmControl], spacing: 6)) }
+        if !isBatch { exportItems.append(stack([confirmControl, NSView()], spacing: 6)) }
         let exportControls = stack(exportItems, vertical: true, spacing: 9)
         self.exportControls = exportControls
         savedFilename.font = .systemFont(ofSize: 12, weight: .medium)
@@ -980,10 +1449,9 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         savedPath.lineBreakMode = .byTruncatingMiddle
         savedPath.isSelectable = true
         let revealControl = button(L10n.text("在访达显示"), action: #selector(revealSavedResult))
-        let savedActions = isBatch ? revealControl : stack([revealControl, StudioStyle.actionControl(savedReturn)], spacing: 6)
         let savedControls = stack([
             StudioStyle.section("03", L10n.text("保存完成"), size: 14), savedFilename, savedPath,
-            savedActions
+            revealControl
         ], vertical: true, spacing: 7)
         self.savedControls = savedControls
         savedControls.isHidden = true
@@ -1011,8 +1479,7 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
             exportSelectedButton.toolTip = L10n.surface("一起导出已勾选的照片。")
             let exportActions = stack([confirmControl, StudioStyle.actionControl(exportSelectedButton)], spacing: 6)
             exportActions.distribution = .fillEqually
-            let returnRow = stack([discardControl, NSView()])
-            footerItems += [exportSelection, exportActions, separator(), returnRow]
+            footerItems += [exportSelection, exportActions]
         }
         let footer = stack(footerItems, vertical: true, spacing: 9)
         footer.setContentHuggingPriority(.required, for: .vertical)
@@ -1039,16 +1506,12 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         message.maximumNumberOfLines = 3
         if isBatch {
             confirmButton.title = L10n.surface("导出当前")
-            discardButton.title = L10n.text("返回灯板")
         } else {
-            changeExportFormat()
+            confirmButton.title = session?.context == "photocraft" ? L10n.text("应用并导回") : L10n.text("导出…")
         }
         confirmButton.target = self
         confirmButton.action = #selector(confirm)
         confirmButton.keyEquivalent = "\r"
-        discardButton.target = self
-        discardButton.action = #selector(discard)
-        discardButton.keyEquivalent = "\u{1b}"
         let legend = text(L10n.text("滚动缩放 · 空格拖动平移 · 【／】调整画笔大小"), size: 11, secondary: true)
         legend.lineBreakMode = .byTruncatingTail
         legend.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -1226,9 +1689,11 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
             try loadPreview(session, rasters: rasters)
         } else {
             canvas.clearImages()
+            repairedURL = nil
             zoomLabel.stringValue = L10n.text("适应")
         }
         session = frame.session
+        setKeepRebate(frame.preservesRebate)
         reviewControlsScroll.contentView.scroll(to: .zero)
         redetectionNotice = nil
         hasDisplayedPreview = canvas.isDisplayReady
@@ -1265,8 +1730,7 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         lastManualResult = nil
         strokePointCount = strokes.reduce(0) { $0 + $1.points.count }
         if canvas.isDisplayReady { canvas.pendingStrokes = Array(strokes.dropFirst(appliedStrokeCount)) }
-        table.deselectAll(nil)
-        table.reloadData()
+        setProtectedRegions(rasters?.protectedRegions ?? [])
         setDetectionThresholds(session?.detectionThresholds ?? .standard)
         setPreviewPending(false)
         if frame.displaysExport, let output = frame.output {
@@ -1285,18 +1749,30 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         appliedStrokeCount = rasters == nil ? 0 : strokes.count
         updateManualResult(stats: stats)
         if canvas.isDisplayReady { canvas.pendingStrokes = Array(strokes.dropFirst(appliedStrokeCount)) }
-        table.deselectAll(nil)
-        table.reloadData()
+        setProtectedRegions(rasters?.protectedRegions ?? [])
         resumeEditingAfterExport()
         setDetectionThresholds(session.detectionThresholds)
         setPreviewPending(false)
     }
 
-    func updateCleanedImage(_ path: String, maskPath: String, stats: [String: Any]) throws {
-        try canvas.updateCleanedImage(url: URL(fileURLWithPath: path), maskURL: URL(fileURLWithPath: maskPath))
+    func updateCleanedImage(_ path: String, maskPath: String, stats: [String: Any], protectedRegions: Set<Int>) throws {
+        let cleaned = URL(fileURLWithPath: path)
+        try canvas.updateCleanedImage(url: cleaned, maskURL: URL(fileURLWithPath: maskPath))
+        repairedURL = cleaned
+        if protectedRegions != self.protectedRegions { setProtectedRegions(protectedRegions, preserveSelection: true) }
         appliedStrokeCount = strokes.count
         if canvas.isDisplayReady { canvas.pendingStrokes = [] }
         updateManualResult(stats: stats)
+    }
+
+    private func setProtectedRegions(_ values: Set<Int>, preserveSelection: Bool = false) {
+        let selected = preserveSelection ? canvas.selectedRegionID : nil
+        protectedRegions = values
+        canvas.protectedRegions = values
+        regions = session?.regions.filter { !values.contains($0.id) } ?? []
+        table.deselectAll(nil)
+        table.reloadData()
+        if let selected, !values.contains(selected) { selectRegion(selected, focus: false) }
     }
 
     private func updateManualResult(stats: [String: Any]) {
@@ -1342,7 +1818,7 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         setWorking(false)
     }
 
-    func windowShouldClose(_ sender: NSWindow) -> Bool { canReturn && !working && !redetecting && !choosingOutput }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { canNavigateBack }
 
     func windowWillClose(_ notification: Notification) {
         maskColorWell.deactivate()
@@ -1408,7 +1884,8 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
     }
 
     private func updateSelection() {
-        counts.stringValue = hasDisplayedPreview ? L10n.text("自动 \(regions.count - excludedRegions.count) 处  ·  手动 \(strokes.count) 笔") : L10n.text("等待检测结果")
+        let excluded = excludedRegions.lazy.filter { !self.protectedRegions.contains($0) }.count
+        counts.stringValue = hasDisplayedPreview ? L10n.text("自动 \(regions.count - excluded) 处  ·  手动 \(strokes.count) 笔") : L10n.text("等待检测结果")
         counts.toolTip = counts.stringValue
         counts.textColor = hasDisplayedPreview ? StudioStyle.amber : StudioStyle.secondaryText
         loadingView.setLoading(!hasDisplayedPreview)
@@ -1433,10 +1910,10 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         previousButton.isEnabled = canEdit
         nextButton.isEnabled = canEdit
         retryButton.isEnabled = canEdit
-        exportFormat.isEnabled = canEdit
-        let canNavigateBack = canReturn && !working && !redetecting && !choosingOutput
-        discardButton.isEnabled = canNavigateBack && (isBatch || !saved)
-        if !isBatch { savedReturn.isEnabled = canNavigateBack }
+        backButton.title = !isBatch && saved ? L10n.text("处理下一张")
+            : (isBatch ? L10n.text("返回灯板") : L10n.surface("返回来源"))
+        backButton.isEnabled = canNavigateBack
+        viewRepairButton.isEnabled = canView && settledRepairedURL != nil && canvas.isDisplayReady && onViewRepair != nil
         undoButton.isEnabled = canUndoEdit
         redoButton.isEnabled = canRedoEdit
         confirmButton.isEnabled = canEdit && hasExportablePreview && (!isBatch || canExportCurrent)
@@ -1582,9 +2059,6 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         if canvas.mode == .original && canvas.tool != .inspect { chooseTool(.inspect) }
     }
     @objc private func changeMarkers() { canvas.showRegions = markers.state == .on }
-    @objc private func changeExportFormat() {
-        confirmButton.title = session?.context == "photocraft" ? L10n.text("应用并导回") : L10n.text("保存 \(selectedExportFormat.label)…")
-    }
     @objc private func fit() { canvas.fitToWindow() }
     @objc private func actualSize() { canvas.zoom100() }
     @objc private func previous() { navigate(-1) }
@@ -1602,42 +2076,18 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
             return
         }
         if session.context == "photocraft" {
-            onConfirm?(nil, false)
+            onConfirm?(nil)
             return
         }
         guard let window else { return }
-        let panel = NSOpenPanel()
-        panel.title = L10n.text("选择保存位置")
-        panel.message = L10n.text("修复图像将保存在所选位置的结果文件夹中。")
-        panel.prompt = L10n.text("保存 \(selectedExportFormat.label)")
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
-        let includeMask = NSButton(checkboxWithTitle: L10n.text("同时保存修复蒙版"), target: nil, action: nil)
-        includeMask.state = AppPreferences.includeMask ? .on : .off
-        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 30))
-        includeMask.frame = NSRect(x: 10, y: 5, width: 260, height: 20)
-        accessory.addSubview(includeMask)
-        panel.accessoryView = accessory
-        panel.isAccessoryViewDisclosed = true
-        if let path = AppPreferences.exportFolder?.path ?? session.outputRoot {
-            var folder = URL(fileURLWithPath: path, isDirectory: true)
-            var isDirectory: ObjCBool = false
-            while !FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory) || !isDirectory.boolValue {
-                let parent = folder.deletingLastPathComponent()
-                guard parent != folder else { break }
-                folder = parent
-            }
-            panel.directoryURL = folder
-        }
+        let suggestedFolder = AppPreferences.exportFolder ?? session.outputRoot.map { URL(fileURLWithPath: $0, isDirectory: true) }
         choosingOutput = true
         updateSelection()
-        panel.beginSheetModal(for: window) { [weak self] response in
+        PhotoExportSheet.present(for: window, count: 1, suggestedFolder: suggestedFolder) { [weak self] selection in
             guard let self else { return }
             self.choosingOutput = false
             self.updateSelection()
-            if response == .OK, let folder = panel.url { self.onConfirm?(folder, includeMask.state == .on) }
+            if let selection { self.onConfirm?(selection) }
         }
     }
 
@@ -1645,10 +2095,13 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         guard exportSelectedButton.isEnabled else { return }
         onExportSelected?()
     }
-    @objc private func discard() { guard canReturn && !working && !redetecting && !choosingOutput else { return }; close() }
-    @objc private func nextPhoto() {
-        guard saved, canReturn, !working, !redetecting, !choosingOutput else { return }
-        close()
+    @objc private func viewRepair() {
+        guard viewRepairButton.isEnabled else { return }
+        onViewRepair?()
+    }
+    @objc private func returnFromReview() {
+        guard backButton.isEnabled else { return }
+        window?.performClose(nil)
     }
     @objc private func revealSavedResult() {
         if let outputFile { NSWorkspace.shared.activateFileViewerSelecting([outputFile]) }
@@ -1670,16 +2123,25 @@ private struct BatchFrame {
     var excludedRegions = Set<Int>()
     var strokes: [ReviewStroke] = []
     var editHistory = ReviewEditHistory()
+    var keepRebate: Bool?
     var output: URL?
     var exportedRasters: ReviewRasters?
+    var lightTablePreviewDirectory: URL?
     var exportedWithMask = false
     var revisingExport = false
     var detectionAdjusted = false
     var error: String?
 
-    var hasEdits: Bool { !excludedRegions.isEmpty || !strokes.isEmpty }
+    var preservesRebate: Bool { keepRebate ?? session?.rebateBakedIn ?? false }
+    var hasEdits: Bool { !excludedRegions.isEmpty || !strokes.isEmpty || preservesRebate != (session?.rebateBakedIn ?? false) }
     var displaysExport: Bool { output != nil && !revisingExport }
     var canExport: Bool { !displaysExport && session != nil }
+    var lightTableArtwork: URL? {
+        if displaysExport { return exportedRasters?.cleaned ?? output }
+        if let lightTablePreviewDirectory { return lightTablePreviewDirectory.appendingPathComponent("cleaned.tiff") }
+        guard let session, !hasEdits else { return nil }
+        return URL(fileURLWithPath: session.cleanedPath)
+    }
 }
 
 private final class BatchSession {
@@ -1687,6 +2149,7 @@ private final class BatchSession {
         let folder: URL
         let format: ReviewExportFormat
         let includeMask: Bool
+        var training: [String] = []
         var pending: [UUID]
         var saved = 0
         var failed = 0
@@ -1713,7 +2176,7 @@ private final class BatchSession {
 
     let workDirectory: URL
     let detectionArguments: [String]
-    let controller = BatchLightTableController()
+    let controller: BatchLightTableController
     var frames: [BatchFrame]
     var picked = Set<UUID>()
     var exportChecked = Set<UUID>()
@@ -1727,7 +2190,7 @@ private final class BatchSession {
     var jobReview: ReviewSession?
     var jobOutput: URL?
     var jobRasters: ReviewRasters?
-    var detectionProgress: Double?
+    var jobProgress: Double?
     var status = ""
     var choosingExport = false
     var redetecting = false
@@ -1735,6 +2198,7 @@ private final class BatchSession {
     init(urls: [URL], detectionArguments: [String]) throws {
         frames = urls.map { BatchFrame(url: $0) }
         self.detectionArguments = detectionArguments
+        controller = BatchLightTableController(singleFrame: urls.count == 1)
         workDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PURENeg-Batch-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: workDirectory, withIntermediateDirectories: false,
@@ -1778,21 +2242,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private weak var outputRow: NSStackView?
     private let mode = StudioSegments(labels: [L10n.text("独立处理"), L10n.text("从 PhotoCraft 载入"), L10n.text("从 Photoshop 载入")])
     private let fileRow = NSStackView()
+    private let pendingInputs = PendingInputsList()
     private let photoRow = NSStackView()
     private let sourceNote = NSTextField(wrappingLabelWithString: AppDelegate.fileSourceNote)
     private let connection = NSTextField(wrappingLabelWithString: AppDelegate.photoCraftHint)
     private var photoCraftConnection = AppDelegate.photoCraftHint
     private let connectButton = NSButton(title: L10n.text("启动 / 连接 PhotoCraft"), target: nil, action: nil)
     private let chooseButton = NSButton(title: L10n.text("选择图像…"), target: nil, action: nil)
+    private let clearInputsButton = NSButton(title: L10n.text("清空"), target: nil, action: nil)
+    private lazy var clearInputsControl = StudioStyle.actionControl(clearInputsButton)
     private let folderButton = NSButton(title: L10n.text("更改…"), target: nil, action: nil)
     private let polarity = NSPopUpButton(frame: .zero, pullsDown: false)
     private let sensitivity = NSSlider(value: 1, minValue: 0.5, maxValue: 2, target: nil, action: nil)
     private let sensitivityValue = NSTextField(labelWithString: "1.00")
     private let detectors = DetectionKind.allCases.map { kind in
-        (kind: kind, checkbox: NSButton(checkboxWithTitle: kind.label, target: nil, action: nil))
+        let title = kind == .patches ? L10n.text("斑块（试验）") : kind.label
+        return (kind: kind, checkbox: NSButton(checkboxWithTitle: title, target: nil, action: nil))
     }
     private let detectionHint = NSTextField(labelWithString: L10n.text("可单独或组合勾选。"))
-    private let startButton = PrimaryActionButton(title: L10n.text("检测并预览"), target: nil, action: nil)
+    private let startButton = PrimaryActionButton(title: L10n.text("直接开始除尘"), target: nil, action: nil)
+    private let openLightTableButton = PrimaryActionButton(title: L10n.text("打开观片台"), target: nil, action: nil)
+    private lazy var openLightTableControl = StudioStyle.actionControl(openLightTableButton)
     private let cancelButton = NSButton(title: L10n.text("取消"), target: nil, action: nil)
     private let revealButton = NSButton(title: L10n.text("显示结果"), target: nil, action: nil)
     private let progress = LaserProgressBar()
@@ -1826,6 +2296,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var activeEditsFile: URL?
     private var startupWindow: StartupWindow?
     private var batch: BatchSession?
+    private var repairedLightTable: BatchLightTableController?
     private var batchReviewEdited = false
     private var batchActivityMonitor: Any?
     private var batchIdleTimer: Timer?
@@ -1833,6 +2304,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var terminateAfterBackgroundDetection = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if AppPreferences.isTrainingBuild { NSApp.dockTile.badgeLabel = L10n.text("训练") }
         NSApp.applicationIconImage = StudioStyle.appIcon
         createMenu()
         buildWindow()
@@ -1879,7 +2351,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        guard let current = reviewController?.window ?? batch?.controller.window else { return true }
+        guard let current = repairedLightTable?.window ?? reviewController?.window ?? batch?.controller.window else { return true }
         if current.isMiniaturized { current.deminiaturize(nil) }
         current.makeKeyAndOrderFront(nil)
         return false
@@ -2046,15 +2518,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     @objc private func showAbout() {
-        let credits = NSMutableAttributedString(string: L10n.text("胶片扫描除尘与修整\n\n基于 Magnus Holmes 的 film-dust（MIT）。\n通过 PhotoCraft 本地控制接口建立修复图层与蒙版。\n第三方许可见应用 Resources 中的 vendor/film-dust。") + "\n\n")
-        credits.append(NSAttributedString(string: AppUpdates.projectURL.absoluteString,
-                                          attributes: [.link: AppUpdates.projectURL]))
-        NSApp.orderFrontStandardAboutPanel(options: [
-            .applicationName: appTitle,
-            .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
-            .applicationIcon: StudioStyle.appIcon,
-            .credits: credits
-        ])
+        SupportWindows.showAbout()
     }
 
     private func label(_ text: String, size: CGFloat = 13, weight: NSFont.Weight = .regular, secondary: Bool = false) -> NSTextField {
@@ -2087,12 +2551,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     private func buildWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 740, height: 694), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 740, height: 724), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.title = appTitle
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.appearance = NSAppearance(named: .darkAqua)
-        window.contentMinSize = NSSize(width: 740, height: 660)
+        window.contentMinSize = NSSize(width: 740, height: 670)
         window.center()
         window.delegate = self
         guard let root = window.contentView, let layout = window.contentLayoutGuide as? NSLayoutGuide else { return }
@@ -2125,6 +2589,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         fileRow.spacing = 12
         fileRow.addArrangedSubview(inputPath)
         fileRow.addArrangedSubview(StudioStyle.actionControl(chooseButton))
+        clearInputsButton.target = self
+        clearInputsButton.action = #selector(clearInputs)
+        clearInputsControl.isHidden = true
+        clearInputsButton.setAccessibilityLabel(L10n.text("清空已选择的照片"))
+        fileRow.addArrangedSubview(clearInputsControl)
+        pendingInputs.onChange = { [weak self] urls in self?.setInputs(urls) }
+        pendingInputs.isHidden = true
         connectButton.target = self
         connectButton.action = #selector(connect)
         connection.font = .systemFont(ofSize: 12)
@@ -2139,9 +2610,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         sourceNote.font = .systemFont(ofSize: 11)
         sourceNote.textColor = StudioStyle.secondaryText
         let sourceGlass = StudioStyle.segmentedControl(mode)
-        let sourceContent = vertical([StudioStyle.section("01", L10n.text("处理来源")), sourceGlass, fileRow, photoRow, sourceNote], spacing: 10)
+        let sourceContent = vertical([StudioStyle.section("01", L10n.text("处理来源")), sourceGlass, fileRow, pendingInputs, photoRow, sourceNote], spacing: 10)
         let sourceCard = card(sourceContent)
-        for view in [sourceGlass, fileRow, photoRow, sourceNote] { view.widthAnchor.constraint(equalTo: sourceContent.widthAnchor).isActive = true }
+        for view in [sourceGlass, fileRow, pendingInputs, photoRow, sourceNote] { view.widthAnchor.constraint(equalTo: sourceContent.widthAnchor).isActive = true }
 
         outputPath.stringValue = selectedOutput.path
         outputPath.lineBreakMode = .byTruncatingMiddle
@@ -2168,7 +2639,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         if #available(macOS 26.0, *) { sensitivity.tintProminence = .none }
         #endif
         for detector in detectors {
-            detector.checkbox.state = .on
+            detector.checkbox.state = detector.kind == .patches ? .off : .on
             detector.checkbox.target = self
             detector.checkbox.action = #selector(updateDetectionAvailability)
         }
@@ -2202,6 +2673,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         startButton.controlSize = .large
         startButton.keyEquivalent = "\r"
         startButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 145).isActive = true
+        openLightTableButton.target = self
+        openLightTableButton.action = #selector(openLightTable)
+        openLightTableButton.controlSize = .large
+        openLightTableButton.isEnabled = !selectedInputs.isEmpty
         cancelButton.target = self
         cancelButton.action = #selector(cancel)
         cancelButton.isEnabled = false
@@ -2210,7 +2685,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         revealButton.isEnabled = false
         let actions = horizontal([
             StudioStyle.actionControl(revealButton), NSView(), StudioStyle.actionControl(cancelButton),
-            StudioStyle.actionControl(startButton)
+            openLightTableControl, StudioStyle.actionControl(startButton)
         ], spacing: 10)
         let actionPanel = GlassPanel(material: .headerView, radius: 12)
         actionPanel.place(actions, vertical: 8)
@@ -2231,12 +2706,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     @objc private func modeChanged() {
         fileRow.isHidden = inputSource != .file
+        pendingInputs.isHidden = inputSource != .file || selectedInputs.isEmpty
         photoRow.isHidden = inputSource == .file
         outputRow?.isHidden = inputSource != .photoCraft
+        openLightTableControl.isHidden = inputSource != .file
+        openLightTableButton.isEnabled = process == nil && !importingPhotoshop && reviewController == nil
+            && batch == nil && !selectedInputs.isEmpty
         switch inputSource {
         case .file:
             sourceNote.stringValue = Self.fileSourceNote
-            startButton.title = selectedInputs.count > 1 ? L10n.text("打开观片台") : L10n.text("检测并预览")
+            startButton.title = L10n.text("直接开始除尘")
         case .photoCraft:
             connection.stringValue = photoCraftConnection
             connectButton.title = L10n.text("启动 / 连接 PhotoCraft")
@@ -2265,24 +2744,69 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     @objc private func selectInput() {
         guard process == nil, !importingPhotoshop, reviewController == nil, batch == nil else { return }
+        // [Claude 2026-11-09] Choosing again adds to the photos already chosen, so one batch can
+        // gather frames from several folders. A chosen folder adds the TIFF and JPEG files in it.
         let panel = NSOpenPanel()
-        panel.title = L10n.text("选择 TIFF 或 JPEG")
+        panel.title = selectedInputs.isEmpty ? L10n.text("选择 TIFF 或 JPEG") : L10n.text("添加 TIFF 或 JPEG")
+        panel.message = L10n.text("可多选文件或文件夹；再次选择会添加到已选的照片中。")
         panel.allowedContentTypes = [.tiff, .jpeg]
-        panel.canChooseDirectories = false
+        panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         panel.beginSheetModal(for: window) { [weak self] response in
-            guard response == .OK, let self, let first = panel.urls.first else { return }
-            var seen = Set<URL>()
-            self.selectedInputs = panel.urls.filter { seen.insert($0.standardizedFileURL).inserted }.sorted {
-                let order = $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent)
-                return order == .orderedSame ? $0.path < $1.path : order == .orderedAscending
-            }
-            self.inputPath.stringValue = self.selectedInputs.count == 1
-                ? first.path : L10n.text("已选择 \(self.selectedInputs.count) 张照片")
-            self.inputPath.toolTip = self.selectedInputs.map(\.path).joined(separator: "\n")
-            self.inputPath.textColor = .labelColor
-            self.modeChanged()
+            guard response == .OK, let self, !panel.urls.isEmpty else { return }
+            self.addInputs(panel.urls)
         }
+    }
+
+    private func addInputs(_ picked: [URL]) {
+        var chosen: [URL] = []
+        for url in picked {
+            if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                let items = (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.contentTypeKey],
+                                                                         options: [.skipsHiddenFiles])) ?? []
+                chosen += items.filter { item in
+                    guard let type = try? item.resourceValues(forKeys: [.contentTypeKey]).contentType else { return false }
+                    return type.conforms(to: .tiff) || type.conforms(to: .jpeg)
+                }
+            } else {
+                chosen.append(url)
+            }
+        }
+        setInputs(selectedInputs + chosen)
+    }
+
+    private func setInputs(_ urls: [URL]) {
+        var seen = Set<URL>()
+        selectedInputs = urls.filter { seen.insert($0.standardizedFileURL).inserted }.sorted {
+            let order = $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent)
+            return order == .orderedSame ? $0.path < $1.path : order == .orderedAscending
+        }
+        showSelectedInputs()
+        modeChanged()
+    }
+
+    private func showSelectedInputs() {
+        pendingInputs.replace(selectedInputs)
+        guard !selectedInputs.isEmpty else {
+            inputPath.stringValue = Self.chooseInputHint
+            inputPath.toolTip = nil
+            inputPath.textColor = StudioStyle.secondaryText
+            chooseButton.title = L10n.text("选择图像…")
+            clearInputsControl.isHidden = true
+            return
+        }
+        let folders = Set(selectedInputs.map { $0.deletingLastPathComponent().standardizedFileURL }).count
+        inputPath.stringValue = folders > 1 ? L10n.text("已选择 \(selectedInputs.count) 张照片（来自 \(folders) 个文件夹）")
+            : L10n.text("已选择 \(selectedInputs.count) 张照片")
+        inputPath.toolTip = nil
+        inputPath.textColor = .labelColor
+        chooseButton.title = L10n.text("添加图像…")
+        clearInputsControl.isHidden = false
+    }
+
+    @objc private func clearInputs() {
+        guard process == nil, !importingPhotoshop, reviewController == nil, batch == nil else { return }
+        setInputs([])
     }
 
     @objc private func selectOutput() {
@@ -2327,14 +2851,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     @objc private func start() {
         guard process == nil, !importingPhotoshop, batch == nil else { return }
         if let review = reviewController { review.present(); return }
-        let detect = selectedDetectors
-        guard !detect.isEmpty else { return }
-        var args = [
-            "--output", selectedOutput.path,
-            "--polarity", ["auto", "bright", "dark"][max(0, min(2, polarity.indexOfSelectedItem))],
-            "--sensitivity", String(format: "%.4f", locale: Locale(identifier: "en_US_POSIX"), sensitivity.doubleValue),
-            "--detect", detect.joined(separator: ",")
-        ]
+        guard !selectedDetectors.isEmpty else { return }
+        let args = detectionArguments()
         switch inputSource {
         case .file:
             guard let input = selectedInputs.first else {
@@ -2343,16 +2861,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 return
             }
             if selectedInputs.count > 1 {
-                beginBatch(arguments: args)
+                beginBatch(arguments: args, directlyToReview: true)
                 return
             }
-            args += ["--input", input.path]
-            launch(command: "prepare", arguments: args)
+            launch(command: "prepare", arguments: args + ["--input", input.path])
         case .photoCraft:
             launch(command: "prepare-photocraft", arguments: args)
         case .photoshop:
             preparePhotoshop(arguments: args)
         }
+    }
+
+    @objc private func openLightTable() {
+        guard process == nil, !importingPhotoshop, reviewController == nil, batch == nil,
+              inputSource == .file, !selectedInputs.isEmpty else { return }
+        beginBatch(arguments: detectionArguments())
+    }
+
+    private func detectionArguments() -> [String] {
+        ["--output", selectedOutput.path,
+         "--polarity", ["auto", "bright", "dark"][max(0, min(2, polarity.indexOfSelectedItem))],
+         "--sensitivity", String(format: "%.4f", locale: Locale(identifier: "en_US_POSIX"), sensitivity.doubleValue),
+         "--detect", selectedDetectors.joined(separator: ",")]
     }
 
     private func preparePhotoshop(arguments: [String]) {
@@ -2403,13 +2933,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         detail.stringValue = error.localizedDescription
     }
 
-    private func beginBatch(arguments: [String]) {
+    private func beginBatch(arguments: [String], directlyToReview: Bool = false) {
         do {
             let batch = try BatchSession(urls: selectedInputs, detectionArguments: arguments)
             self.batch = batch
             batch.controller.onSelect = { [weak self] in self?.toggleBatchPick($0) }
             batch.controller.onNext = { [weak self] in self?.beginBatchReview() }
             batch.controller.onReturn = { [weak self] in self?.leaveBatch() }
+            if directlyToReview {
+                beginBatchReview(from: window)
+                return
+            }
             refreshBatch()
             batch.controller.present(from: window)
             window.orderOut(nil)
@@ -2441,10 +2975,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 label = batch.includes(frame.id) ? L10n.text("待检测") : L10n.text("未选入本批")
             }
             return BatchLightTableItem(id: frame.id, url: frame.url, status: label,
-                                       selected: batch.picked.contains(frame.id))
+                                       selected: batch.picked.contains(frame.id), artworkURL: frame.lightTableArtwork)
         }
         guard let review = reviewController else {
-            batch.controller.update(items: items, status: batch.status, busy: batch.isBusy || process != nil)
+            let canDetect = !selectedDetectors.isEmpty
+            let status = canDetect ? batch.status : L10n.text("返回来源后，勾选至少一项即可开始检测。")
+            batch.controller.update(items: items, status: status, busy: batch.isBusy || process != nil, canAdvance: canDetect)
             return
         }
         guard let sidebar = review.batchSidebar else { return }
@@ -2462,8 +2998,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                                            canExport: canExportBatchFrame(frame, in: batch), canOpen: canSelect)
         }
         sidebar.update(items: rows, checked: batch.exportChecked, busy: busy)
-        let detectingID = batch.redetecting ? batch.current : (batch.detectionWorker == .yielding ? nil : batch.detectingID)
-        sidebar.setDetectionProgress(id: detectingID, fraction: batch.detectionProgress, follow: !backgroundJob)
+        let progressID = batch.redetecting ? batch.current : (batch.detectionWorker == .yielding ? nil : batch.job?.id)
+        sidebar.setProgress(id: progressID, fraction: batch.jobProgress, follow: !backgroundJob)
         let activity: String
         if backgroundJob, !batch.hasForegroundWork, let id = batch.detectingID, let index = batch.index(for: id) {
             let filename = batch.frames[index].url.lastPathComponent
@@ -2587,14 +3123,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let sidebar = BatchReviewSidebar()
         sidebar.onOpen = { [weak self] in self?.selectBatchFrame($0) }
         sidebar.onToggle = { [weak self] in self?.toggleBatchExport($0) }
+        sidebar.onToggleAll = { [weak self] in self?.setAllBatchExport($0) }
         sidebar.onDetect = { [weak self] in self?.detectBatch() }
         sidebar.onStop = { [weak self] in self?.stopBatchDetection() }
         return sidebar
     }
 
-    private func beginBatchReview() {
+    private func beginBatchReview(from source: NSWindow? = nil) {
         guard let batch, reviewController == nil, process == nil, !batch.isBusy,
-              let first = batch.scope.first else { return }
+              !selectedDetectors.isEmpty, let first = batch.scope.first else { return }
         do {
             let review = try ReviewWindowController(session: nil, batchSidebar: makeBatchSidebar())
             configureRedetection(for: review)
@@ -2613,6 +3150,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             review.onEditsChange = { [weak self, weak batch] in
                 guard let self, let batch, self.batch === batch, let id = batch.current,
                       let index = batch.index(for: id) else { return }
+                batch.frames[index].keepRebate = self.reviewController?.keepRebate
                 batch.frames[index].revisingExport = batch.frames[index].output != nil
                 batch.frames[index].error = nil
                 self.batchReviewEdited = true
@@ -2623,11 +3161,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             batch.status = ""
             observeBatchActivity()
             selectBatchFrame(first.id)
-            review.present(from: batch.controller.window)
-            batch.controller.window?.orderOut(nil)
+            let previousWindow = source ?? batch.controller.window
+            review.present(from: previousWindow)
+            previousWindow?.orderOut(nil)
         } catch {
-            batch.status = error.localizedDescription
-            refreshBatch()
+            if source != nil {
+                self.batch = nil
+                removeTemporary(batch.workDirectory)
+                fail(error.localizedDescription)
+            } else {
+                batch.status = error.localizedDescription
+                refreshBatch()
+            }
         }
     }
 
@@ -2679,6 +3224,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         refreshBatch()
     }
 
+    // [Claude 2026-11-09] Tick every photo that can be exported, or none.
+    private func setAllBatchExport(_ select: Bool) {
+        guard let batch, !batch.hasForegroundWork, !previewNeedsRefresh,
+              process == nil || batch.job?.isBackground == true else { return }
+        noteBatchActivity()
+        batch.exportChecked = select ? Set(batch.frames.filter { canExportBatchFrame($0, in: batch) }.map(\.id)) : []
+        refreshBatch()
+    }
+
     private func chooseBatchExport(_ requested: Set<UUID>) {
         guard let batch, !batch.hasForegroundWork, !previewNeedsRefresh,
               process == nil || batch.job?.isBackground == true,
@@ -2687,46 +3241,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         guard !ids.isEmpty else { return }
         noteBatchActivity()
         storeBatchEdits(batch)
-        let panel = NSOpenPanel()
-        panel.title = ids.count == 1 ? L10n.text("导出照片") : L10n.text("导出 \(ids.count) 张照片")
-        panel.message = L10n.text("请选择保存目录和导出格式。")
-        panel.prompt = L10n.text("导出")
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
         let suggestedFolder = AppPreferences.exportFolder ?? selectedOutput
-        panel.directoryURL = FileManager.default.fileExists(atPath: suggestedFolder.path)
-            ? suggestedFolder : suggestedFolder.deletingLastPathComponent()
-        let format = NSPopUpButton(frame: .zero, pullsDown: false)
-        format.addItems(withTitles: ReviewExportFormat.allCases.map(\.label))
-        format.selectItem(withTitle: AppPreferences.exportFormat.uppercased())
-        format.setAccessibilityLabel(L10n.text("批量导出格式"))
-        let formatRow = NSStackView(views: [NSTextField(labelWithString: L10n.text("导出格式")), format])
-        formatRow.spacing = 8
-        let mask = NSButton(checkboxWithTitle: L10n.text("附带修复蒙版"), target: nil, action: nil)
-        mask.state = AppPreferences.includeMask ? .on : .off
-        let options = NSStackView(views: [formatRow, mask])
-        options.orientation = .vertical
-        options.alignment = .leading
-        options.spacing = 8
-        options.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
-        options.frame.size = options.fittingSize
-        panel.accessoryView = options
-        panel.isAccessoryViewDisclosed = true
         batch.choosingExport = true
         refreshBatch()
-        panel.beginSheetModal(for: host) { [weak self, weak batch] response in
+        PhotoExportSheet.present(for: host, count: ids.count, suggestedFolder: suggestedFolder) { [weak self, weak batch] selection in
             guard let self, let batch, self.batch === batch else { return }
             self.noteBatchActivity()
             batch.choosingExport = false
-            guard response == .OK, let folder = panel.url else { self.refreshBatch(); return }
-            self.selectedOutput = folder
-            self.outputPath.stringValue = folder.path
-            self.outputPath.toolTip = folder.path
-            batch.export = BatchSession.Export(folder: folder,
-                                               format: ReviewExportFormat.allCases[format.indexOfSelectedItem],
-                                               includeMask: mask.state == .on, pending: ids)
+            guard let selection else { self.refreshBatch(); return }
+            self.selectedOutput = selection.folder
+            self.outputPath.stringValue = selection.folder.path
+            self.outputPath.toolTip = selection.folder.path
+            batch.export = BatchSession.Export(folder: selection.folder, format: selection.format,
+                                               includeMask: selection.includeMask, training: selection.options,
+                                               pending: ids)
             self.cancelBackgroundDetection(batch)
             self.startNextBatchJob()
         }
@@ -2762,7 +3290,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 activeEditsFile = edits
                 launch(command: "confirm", arguments: ["--review", session.path, "--edits", edits.path,
                        "--format", export.format.rawValue, "--output", export.folder.path,
-                       "--mask", export.includeMask ? "yes" : "no", "--revise-export"])
+                       "--mask", export.includeMask ? "yes" : "no", "--revise-export",
+                       "--keep-rebate", frame.preservesRebate ? "yes" : "no"] + export.training)
             } catch {
                 reportedError = error.localizedDescription
             }
@@ -2773,7 +3302,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             guard let index = batch.index(for: id) else { return }
             batch.job = .prepare(id, background: background)
             batch.detectionWorker = .running
-            batch.detectionProgress = nil
+            batch.jobProgress = nil
             batch.frames[index].error = nil
             let url = batch.frames[index].url
             if background {
@@ -2799,12 +3328,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let filename = batch.frames[index].url.lastPathComponent
         switch event["type"] as? String {
         case "progress":
-            guard batch.detectionWorker == .running else { return }
+            if case .prepare = job, batch.detectionWorker != .running { return }
             let fraction = (event["fraction"] as? Double).flatMap { $0.isFinite ? min(1, max(0, $0)) : nil }
-            if case .prepare = job, let fraction { batch.detectionProgress = fraction }
+            if let fraction { batch.jobProgress = fraction }
             if let message = event["message"] as? String {
                 let percent = fraction.map { " \(Int(($0 * 100).rounded()))%" } ?? ""
-                let status = "\(filename) · \(message)\(percent)"
+                let stage = L10n.text(String.LocalizationValue(stringLiteral: message))
+                let status = "\(filename) · \(stage)\(percent)"
                 if job.isBackground { batch.backgroundStatus = status }
                 else { batch.status = status }
             }
@@ -2841,7 +3371,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         batch.backgroundStatus = ""
         batch.jobReview = nil
         batch.jobOutput = nil
-        batch.detectionProgress = nil
+        batch.jobProgress = nil
         let cancelled = wasCancelled
         wasCancelled = false
         if !job.isBackground { noteBatchActivity() }
@@ -2899,6 +3429,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let frame = batch.frames[index]
         do {
             storeBatchEdits(batch)
+            stashBatchPreview(batch)
             try review.setBatchPhoto(frame, loadingThumbnail: batch.controller.cachedThumbnail(for: frame.url))
             resetReviewPreview()
             if frame.session != nil {
@@ -2938,20 +3469,66 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         batch.frames[index].excludedRegions = review.excludedRegions
         batch.frames[index].strokes = review.strokes
         batch.frames[index].editHistory = review.editHistory
+        batch.frames[index].keepRebate = review.keepRebate
         batchReviewEdited = false
     }
 
     private func returnToLightTable() {
-        guard let batch, reviewController != nil, !batch.hasForegroundWork else { return }
+        guard let batch, let review = reviewController, !review.updatingRepairForViewing, !batch.hasForegroundWork else { return }
         stopObservingBatchActivity()
         cancelBackgroundDetection(batch)
         storeBatchEdits(batch)
+        stashBatchPreview(batch)
         resetReviewPreview()
         reviewController = nil
         batch.current = nil
         batch.status = ""
         refreshBatch()
         batch.controller.present()
+    }
+
+    private func stashBatchPreview(_ batch: BatchSession) {
+        guard let id = batch.current, let index = batch.index(for: id), let review = reviewController else { return }
+        if batch.frames[index].displaysExport || review.settledRepairedURL == nil {
+            removeBatchLightTablePreview(batch, at: index)
+        } else if let directory = currentPreviewDirectory,
+                  review.settledRepairedURL?.resolvingSymlinksInPath().deletingLastPathComponent().path == directory.path {
+            // This preview was validated when the worker returned it. Transfer it to the frame so
+            // resetReviewPreview does not remove the image while the light table is using it.
+            removeBatchLightTablePreview(batch, at: index)
+            batch.frames[index].lightTablePreviewDirectory = directory
+            currentPreviewDirectory = nil
+        }
+    }
+
+    private func removeBatchLightTablePreview(_ batch: BatchSession, at index: Int) {
+        guard let directory = batch.frames[index].lightTablePreviewDirectory else { return }
+        batch.frames[index].lightTablePreviewDirectory = nil
+        removeTemporary(directory)
+    }
+
+    private func showRepairedLightTable(from review: ReviewWindowController) {
+        guard reviewController === review, repairedLightTable == nil, !previewNeedsRefresh,
+              let session = review.session, let repairedURL = review.settledRepairedURL else { return }
+        let table = BatchLightTableController(viewingRepair: true)
+        let item = BatchLightTableItem(id: UUID(), url: URL(fileURLWithPath: session.sourcePath),
+                                       status: L10n.text("修复后"), selected: false,
+                                       artworkURL: repairedURL, displayName: session.sourceName)
+        table.update(items: [item], status: "", busy: false)
+        table.onReturn = { [weak self, weak review, weak table] in
+            guard let self, let review, let table, self.repairedLightTable === table else { return }
+            self.repairedLightTable = nil
+            table.window?.orderOut(nil)
+            review.present()
+            if self.batch != nil { self.observeBatchActivity() }
+        }
+        repairedLightTable = table
+        if let batch {
+            stopObservingBatchActivity()
+            pauseBackgroundDetection(batch)
+        }
+        table.present(from: review.window)
+        review.window?.orderOut(nil)
     }
 
     private func confirmLeavingBatch() -> Bool {
@@ -2967,10 +3544,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         guard let batch, reviewController == nil, process == nil, !batch.isBusy,
               !batch.hasUnsavedReview || confirmLeavingBatch() else { return }
         self.batch = nil
-        selectedInputs = []
-        inputPath.stringValue = Self.chooseInputHint
-        inputPath.toolTip = nil
-        inputPath.textColor = StudioStyle.secondaryText
+        if batch.frames.count > 1 { selectedInputs = [] }
+        showSelectedInputs()
         status.stringValue = L10n.text("准备就绪")
         status.textColor = .labelColor
         detail.stringValue = Self.waitingDetail
@@ -2986,12 +3561,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let blocked = busy || importingPhotoshop || reviewController != nil || batch != nil
         mode.isEnabled = !blocked
         chooseButton.isEnabled = !blocked
+        clearInputsButton.isEnabled = !blocked
+        pendingInputs.editingEnabled = !blocked
         folderButton.isEnabled = !blocked
         connectButton.isEnabled = !blocked
         polarity.isEnabled = !blocked
         sensitivity.isEnabled = !blocked
         for detector in detectors { detector.checkbox.isEnabled = !blocked }
         startButton.isEnabled = !blocked && !selectedDetectors.isEmpty
+        openLightTableButton.isEnabled = !blocked && !selectedInputs.isEmpty
         cancelButton.isEnabled = busy && process != nil && taskKind != "confirm" && taskKind != "preview"
     }
 
@@ -3010,7 +3588,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         worker.executableURL = node
         worker.arguments = [cli.path, command] + arguments + (batch.map { ["--work-dir", $0.workDirectory.path] } ?? [])
         switch AppPreferences.cpuMode {
-        case "responsive": worker.qualityOfService = .userInitiated
+        case "responsive", "performance": worker.qualityOfService = .userInitiated
         case "efficient": worker.qualityOfService = .background
         default:
             if ["prepare", "prepare-photocraft", "preview", "redetect"].contains(command) {
@@ -3026,6 +3604,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         env["LANG"] = AppPreferences.language == "en" ? "en_US.UTF-8" : "zh_CN.UTF-8"
         env["PURENEG_LANGUAGE"] = AppPreferences.language
         env["PURENEG_CONSERVE_MEMORY"] = AppPreferences.conserveMemory ? "1" : "0"
+        let decodeWorkers = AppPreferences.tiffDecodeWorkers
+        env["PURENEG_TIFF_WORKERS"] = String(decodeWorkers)
+        env["PURENEG_OVERLAP_MODELS"] = AppPreferences.overlapsModelInference ? "1" : "0"
+        if decodeWorkers > 4 { env["UV_THREADPOOL_SIZE"] = String(decodeWorkers) }
         worker.environment = env
         worker.standardOutput = out
         worker.standardError = err
@@ -3138,8 +3720,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 let session = try ReviewSession(event: event)
                 let controller = try ReviewWindowController(session: session)
                 configureRedetection(for: controller)
-                controller.onConfirm = { [weak self] folder, includeMask in
-                    self?.confirmReview(folder: folder, includeMask: includeMask)
+                controller.onConfirm = { [weak self] selection in
+                    self?.confirmReview(selection: selection)
                 }
                 controller.onDiscard = { [weak self] in self?.discardReview() }
                 controller.onFinish = { [weak self] in self?.finishReview() }
@@ -3182,7 +3764,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 return
             }
             do {
-                try review.updateCleanedImage(path, maskPath: mask, stats: event["stats"] as? [String: Any] ?? [:])
+                try review.updateCleanedImage(path, maskPath: mask, stats: event["stats"] as? [String: Any] ?? [:],
+                                             protectedRegions: Set(event["protectedRegions"] as? [Int] ?? []))
                 if let old = currentPreviewDirectory, old != directory { removeTemporary(old) }
                 currentPreviewDirectory = directory
                 previewWasApplied = true
@@ -3327,12 +3910,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
 
     private func confirmedRasters(from event: [String: Any], session: ReviewSession) -> ReviewRasters? {
-        guard let paths = event["reviewPreview"] as? [String: String],
-              let cleaned = paths["cleanedPath"], let mask = paths["maskPath"],
+        guard let paths = event["reviewPreview"] as? [String: Any],
+              let cleaned = paths["cleanedPath"] as? String, let mask = paths["maskPath"] as? String,
               let directory = previewDirectory(cleaned: cleaned, mask: mask, review: session.path, prefix: "confirmed-")
         else { return nil }
         return ReviewRasters(cleaned: directory.appendingPathComponent("cleaned.tiff"),
-                             mask: directory.appendingPathComponent("dust-mask.tiff"))
+                             mask: directory.appendingPathComponent("dust-mask.tiff"),
+                             protectedRegions: Set(paths["protectedRegions"] as? [Int] ?? []))
     }
 
     private func previewDirectory(cleaned: String, mask: String, review: String, prefix: String = "preview-") -> URL? {
@@ -3360,11 +3944,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func configureRedetection(for review: ReviewWindowController) {
         review.onRedetect = { [weak self] in self?.requestRedetection($0) }
         review.onCancelRedetect = { [weak self] in self?.cancelRedetection() }
+        review.onViewRepair = { [weak self, weak review] in
+            guard let review else { return }
+            self?.showRepairedLightTable(from: review)
+        }
     }
 
     private func requestRedetection(_ thresholds: DetectionThresholds) {
         guard redetection == nil, !previewNeedsRefresh, let review = reviewController,
-              let session = review.session, thresholds != session.detectionThresholds else { return }
+              let session = review.session, session.rebateBakedIn || thresholds != session.detectionThresholds else { return }
         if let batch {
             guard canBrowseBatch(batch), batch.current != nil else { return }
         } else {
@@ -3376,7 +3964,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         if let batch {
             batch.redetecting = true
             batch.status = message
-            batch.detectionProgress = nil
+            batch.jobProgress = nil
             noteBatchActivity()
             cancelBackgroundDetection(batch)
             refreshBatch()
@@ -3395,7 +3983,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 "--review", request.session.path, "--edits", edits.path,
                 "--dust-sensitivity", String(thresholds.dust),
                 "--fiber-sensitivity", String(thresholds.fibers),
-                "--scratch-sensitivity", String(thresholds.scratches)
+                "--scratch-sensitivity", String(thresholds.scratches),
+                "--patch-sensitivity", String(thresholds.patches),
+                "--fiber-curl", String(thresholds.curl),
+                "--fiber-softness", String(thresholds.softness),
+                "--keep-rebate", review.keepRebate ? "yes" : "no"
             ])
             if process == nil {
                 activeEditsFile = nil
@@ -3427,7 +4019,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             reviewController?.setRedetecting(true, status: message, fraction: fraction)
             if let batch {
                 batch.status = message + percentage
-                batch.detectionProgress = fraction
+                batch.jobProgress = fraction
                 refreshBatch()
             }
         case "redetected":
@@ -3443,7 +4035,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         redetection = nil
         wasCancelled = false
         batch?.redetecting = false
-        batch?.detectionProgress = nil
+        batch?.jobProgress = nil
         let message: String
         if cancelled {
             message = L10n.text("已停止重新检测。")
@@ -3468,13 +4060,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                     throw CocoaError(.fileReadCorruptFile)
                 }
                 let rasters = directory.map {
-                    ReviewRasters(cleaned: $0.appendingPathComponent("cleaned.tiff"), mask: $0.appendingPathComponent("dust-mask.tiff"))
+                    ReviewRasters(cleaned: $0.appendingPathComponent("cleaned.tiff"), mask: $0.appendingPathComponent("dust-mask.tiff"),
+                                  protectedRegions: Set(preview?["protectedRegions"] as? [Int] ?? []))
                 }
                 try review.replaceDetection(session, excludedRegions: Set(excluded), rasters: rasters,
                                             stats: preview?["stats"] as? [String: Any] ?? [:])
                 removeCurrentPreview()
                 currentPreviewDirectory = directory
                 if let batch, let id = request.frameID, batch.current == id, let index = batch.index(for: id) {
+                    removeBatchLightTablePreview(batch, at: index)
                     batch.frames[index].session = session
                     batch.frames[index].revisingExport = batch.frames[index].output != nil
                     batch.frames[index].detectionAdjusted = true
@@ -3544,7 +4138,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             activePreviewReviewPath = session.path
             activeEditsFile = edits
             let revision = session.context == "file" ? ["--revise-export"] : []
-            launch(command: "preview", arguments: ["--review", session.path, "--edits", edits.path] + revision)
+            launch(command: "preview", arguments: ["--review", session.path, "--edits", edits.path,
+                   "--keep-rebate", review.keepRebate ? "yes" : "no"] + revision)
             if process == nil {
                 activePreviewReviewPath = nil
                 activeEditsFile = nil
@@ -3557,7 +4152,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
     }
 
-    private func confirmReview(folder: URL?, includeMask: Bool) {
+    private func confirmReview(selection: PhotoExportSheet.Selection?) {
         guard process == nil, let review = reviewController, let session = review.session, !previewNeedsRefresh else { return }
         do {
             let edits = try editsFile(review)
@@ -3565,8 +4160,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             previewDebounce = nil
             review.setWorking(true)
             activeEditsFile = edits
-            var arguments = ["--review", session.path, "--edits", edits.path] + review.confirmationFormatArguments
-            if let folder { arguments += ["--output", folder.path, "--mask", includeMask ? "yes" : "no"] }
+            var arguments = ["--review", session.path, "--edits", edits.path,
+                             "--keep-rebate", review.keepRebate ? "yes" : "no"]
+            if let selection {
+                arguments += ["--format", selection.format.rawValue, "--revise-export",
+                              "--output", selection.folder.path, "--mask", selection.includeMask ? "yes" : "no"] + selection.options
+            }
             launch(command: "confirm", arguments: arguments)
             if process == nil {
                 activeEditsFile = nil
@@ -3583,6 +4182,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         reviewController = nil
         removeCurrentPreview()
         selectedInputs = []
+        showSelectedInputs()
         modeChanged()
         inputPath.stringValue = Self.chooseInputHint
         inputPath.toolTip = nil

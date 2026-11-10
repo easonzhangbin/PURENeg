@@ -276,6 +276,31 @@ const MAX_SEED_CAP = 512;
 // pixel. On grainy or coloured ground a fibre falls apart into pieces too small for the
 // hand-written ridge detector; the model still sees it whole. These seeds go through the
 // same tracer and the same scene tests (surround, width, frame) as the others.
+const CURLED_LIMIT = 2.6;      // track length / span allowed where the learned map is sure
+const CURLED_PROB = 96;        // map value the surest quarter of a track must average (probability 0.38);
+                               // a track from a learned seed (a sure piece of >= 20 px) qualifies anyway
+
+// Whether the learned map takes a track for a defect: each point reads the highest value
+// within a pixel of it (a track and the map's band need not sit exactly on one another), and
+// the surest quarter of the track has to average CURLED_PROB. The map is often
+// sure of one part of a curled fibre and doubtful of the faint rest.
+function learnedAlong(prob, W, H, points) {
+  if (!prob || prob.length !== W * H) return false;
+  const values = [];
+  for (const q of points) {
+    const cx = Math.round(q.x), cy = Math.round(q.y);
+    let best = 0;
+    for (let y = cy - 1; y <= cy + 1; y++) for (let x = cx - 1; x <= cx + 1; x++) {
+      if (x >= 0 && y >= 0 && x < W && y < H && prob[y * W + x] > best) best = prob[y * W + x];
+    }
+    values.push(best);
+  }
+  if (!values.length) return false;
+  values.sort((a, b) => b - a);
+  const top = values.slice(0, Math.max(1, Math.ceil(values.length / 4)));
+  return top.reduce((a, b) => a + b, 0) / top.length >= CURLED_PROB;
+}
+
 function learnedSeeds(prob, W, H, signs, frame) {
   const cand = new Uint8Array(W * H);
   for (let i = 0; i < W * H; i++) if (prob[i] >= LEARNED_MIN) cand[i] = 1;
@@ -539,7 +564,11 @@ function footprint(points, w, h, x0, y0, W, mask) {
 }
 
 async function enhanceFibers({ original, repaired, mask, W, H, C, marks, polarity = 'auto', sensitivity = 1,
-  frame = null, imageSeeds = true, probability = null, tick = async () => {} }) {
+  frame = null, imageSeeds = true, probability = null, curl = 1, softness = 1, tick = async () => {} }) {
+  // [Claude 2026-11-09] User controls, 0.5-2 (1 = the tested defaults). curl: how curled and how
+  // short a track may be; softness: how wide (soft) a line may be, here and in the direct repair.
+  curl = Number.isFinite(curl) ? Math.min(2, Math.max(0.5, curl)) : 1;
+  softness = Number.isFinite(softness) ? Math.min(2, Math.max(0.5, softness)) : 1;
   const minimumSeed = 12 / sensitivity;
   // A 50MP scan offers far more qualifying seeds than the old flat 128; the cap is a
   // cost limit, not a quality gate, so it follows the scan's size. Tracing across
@@ -594,7 +623,12 @@ async function enhanceFibers({ original, repaired, mask, W, H, C, marks, polarit
     const points = [...backward.slice().reverse(), start, ...forward];
     const first = points[0], last = points[points.length - 1];
     const dx = last.x - first.x, dy = last.y - first.y, length = Math.hypot(dx, dy);
-    if (points.length < 14 || length < 44 || points.length * STEP > 1.65 * length) continue;
+    // [Claude 2026-11-09] A track much longer than its span is usually picture (a curl of
+    // hair, a fold's edge), so it is let go. A fibre the learned map is sure of may curl far
+    // more - a "C" or a hook - and keeps a looser limit.
+    if (points.length < Math.max(7, Math.round(14 / curl)) || length < 44 / curl) continue;
+    const curlLimit = seed.learned || learnedAlong(probability, W, H, points) ? CURLED_LIMIT : 1.65;
+    if (points.length * STEP > (1 + (curlLimit - 1) * curl) * length) continue;
     const bend = Math.max(...points.map(q => Math.abs(dy * (q.x - first.x) - dx * (q.y - first.y)))) / (length * length);
     if (bend < 0.03 || !points.some(q => q.x < seed.x0 - 5 || q.x > seed.x1 + 5
       || q.y < seed.y0 - 5 || q.y > seed.y1 + 5)) continue;
@@ -607,7 +641,7 @@ async function enhanceFibers({ original, repaired, mask, W, H, C, marks, polarit
     if (seed.ridgeSeed) {
       const around = surround(source, W, H, C, points);
       if (!around || around.busy > SURROUND_MAX || around.balance > BALANCE_MAX || around.spread > SPREAD_MAX
-        || crossWidth(source, W, H, C, points) > (seed.learned ? LEARNED_WIDTH : 1) * FWHM_AT_REFERENCE * Math.max(W, H) / REFERENCE_SIDE) continue;
+        || crossWidth(source, W, H, C, points) > softness * (seed.learned ? LEARNED_WIDTH : 1) * FWHM_AT_REFERENCE * Math.max(W, H) / REFERENCE_SIDE) continue;
     }
 
     const tail = [...turnAcross(win, backward, sign, minimumRise), ...turnAcross(win, forward, sign, minimumRise)];
@@ -661,7 +695,133 @@ async function enhanceFibers({ original, repaired, mask, W, H, C, marks, polarit
   }
   if (found.length === before) break;
   }
+  if (probability && probability.length === W * H) {
+    const direct = await repairLearned({ original, repaired, mask, W, H, C, probability, signs, frame, sensitivity, softness, tick });
+    found.push(...direct.marks);
+    pixels += direct.pixels;
+  }
   return { marks: found, pixels };
+}
+
+// [Claude 2026-11-09] Direct repair of what the learned map is sure of. The tracer needs a
+// line brighter than its surround all the way along; a fibre crossing from a dark background
+// onto skin, or lying beside a highlight, or wider than the tracer allows, is lost there
+// although the map marks it plainly. A piece the map is sure of (DIRECT_MIN, which follows
+// the fibre sensitivity) and that is large enough is healed as the map draws it, widened by
+// DIRECT_GROW px for the soft edge. Measured on four held-out frames: 0.86 / 60 px finds 96
+// of the 179 areas users had to paint in, for 42 repairs nobody wanted (about 10 a frame).
+const DIRECT_MIN = 220;          // probability 0.86 at sensitivity 100 %
+const DIRECT_MIN_PIXELS = 60;
+const DIRECT_MAX_PIXELS = 40_000; // a larger "piece" is picture the map got wrong, not a fibre
+const DIRECT_GROW = 2;
+const DIRECT_GROW_DROP = 124;    // grown down to the threshold minus this (220 -> 96, probability 0.38)
+const DIRECT_CORE_PIXELS = 60;   // sure pixels a piece must contain (its width is measured on them)
+const DIRECT_WIDTH = 10;         // px, mean width a piece may have (times the softness). The map's band is a
+                                 // few px wide whatever the scan size; on four held-out frames the pieces users
+                                 // kept had a median width of 7-9 px, the unwanted ones 4-6 px.
+
+async function repairLearned({ original, repaired, mask, W, H, C, probability, signs, frame, sensitivity = 1, softness = 1, tick }) {
+  const threshold = Math.max(160, Math.min(245, Math.round(DIRECT_MIN - 40 * (sensitivity - 1))));
+  // [Claude 2026-11-09] Grown from the sure core along what the map still takes for a defect
+  // (DIRECT_GROW_PROB), the way an edge is followed from its strong part: a fibre the map is
+  // sure of on one stretch and doubtful of on the faint rest is repaired whole. A piece with no
+  // sure core is left alone.
+  const low = Math.max(48, threshold - DIRECT_GROW_DROP);
+  const cand = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) if (probability[i] >= low) cand[i] = 1;
+  const { lab, n } = labelRegions(cand, W, H, 8);
+  if (!n) return { marks: [], pixels: 0 };
+  const size = new Int32Array(n + 1), done = new Int32Array(n + 1), core = new Int32Array(n + 1);
+  const bx0 = new Int32Array(n + 1).fill(W), by0 = new Int32Array(n + 1).fill(H), bx1 = new Int32Array(n + 1), by1 = new Int32Array(n + 1);
+  for (let i = 0; i < W * H; i++) {
+    const id = lab[i];
+    if (!id) continue;
+    size[id]++;
+    if (probability[i] >= threshold) core[id]++;
+    if (mask[i]) done[id]++;
+    const x = i % W, y = (i / W) | 0;
+    if (x < bx0[id]) bx0[id] = x; if (x > bx1[id]) bx1[id] = x;
+    if (y < by0[id]) by0[id] = y; if (y > by1[id]) by1[id] = y;
+  }
+  const bright = !signs.length || signs.includes(1), dark = signs.includes(-1);
+  const marks = [];
+  let pixels = 0;
+  for (let id = 1; id <= n; id++) {
+    if (core[id] < DIRECT_CORE_PIXELS || size[id] < DIRECT_MIN_PIXELS || size[id] > DIRECT_MAX_PIXELS || done[id] * 2 >= size[id]) continue;
+    await tick();
+    const margin = DIRECT_GROW + 6;
+    const x0 = Math.max(0, bx0[id] - margin), y0 = Math.max(0, by0[id] - margin);
+    const w = Math.min(W, bx1[id] + margin + 1) - x0, h = Math.min(H, by1[id] + margin + 1) - y0;
+    if (w * h > MAX_REPAIR_PIXELS) continue;
+    // The piece, grown, inside the patch; and its brightness against a ring around it.
+    const add = new Uint8Array(w * h);
+    let inside = 0, insideN = 0, ring = 0, ringN = 0, protectedPx = 0;
+    const luma = i => C === 1 ? original[i] : 0.2126 * original[i * C] + 0.7152 * original[i * C + 1] + 0.0722 * original[i * C + 2];
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const g = (y0 + y) * W + x0 + x;
+      if (lab[g] !== id) continue;
+      inside += luma(g); insideN++;
+      if (frame && frame.protects(g)) protectedPx++;
+      for (let dy = -DIRECT_GROW; dy <= DIRECT_GROW; dy++) for (let dx = -DIRECT_GROW; dx <= DIRECT_GROW; dx++) {
+        const yy = y + dy, xx = x + dx;
+        if (yy >= 0 && xx >= 0 && yy < h && xx < w) add[yy * w + xx] = 1;
+      }
+    }
+    if (protectedPx * 2 > insideN) continue;
+    // A fibre is thin: the width of the piece's sure core (peeled a layer at a time until
+    // nothing is left: 2 x layers - 1) may be at most DIRECT_WIDTH px times the softness.
+    let layer = new Uint8Array(w * h), cells = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const g = (y0 + y) * W + x0 + x;
+      if (lab[g] === id && probability[g] >= threshold) { layer[y * w + x] = 1; cells++; }   // the sure core
+    }
+    let layers = 0;
+    const widest = Math.ceil((softness * DIRECT_WIDTH + 1) / 2);
+    while (cells && layers <= widest) {
+      const next = new Uint8Array(w * h);
+      cells = 0;
+      for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+        const i = y * w + x;
+        if (layer[i] && layer[i - 1] && layer[i + 1] && layer[i - w] && layer[i + w]) { next[i] = 1; cells++; }
+      }
+      layer = next; layers++;
+    }
+    if (2 * layers - 1 > softness * DIRECT_WIDTH) continue;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      if (add[y * w + x]) continue;
+      const near = x >= 2 && y >= 2 && x < w - 2 && y < h - 2;
+      if (!near) continue;
+      let touch = false;
+      for (let d = -3; d <= 3 && !touch; d++) touch = (add[(y + d) * w + x] || add[y * w + x + d]) === 1;
+      if (touch) { ring += luma((y0 + y) * W + x0 + x); ringN++; }
+    }
+    if (!insideN || !ringN) continue;
+    const brighter = inside / insideN > ring / ringN;
+    // Only the polarity the engine found dust in (see enhanceFibers).
+    if ((brighter && !bright) || (!brighter && !dark)) continue;
+    const previous = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) previous.set(mask.subarray((y0 + y) * W + x0, (y0 + y) * W + x0 + w), y * w);
+    const healed = patch(repaired, W, C, x0, y0, w, h);
+    await heal(healed, w, h, C, add, null, null, tick, previous);
+    let changed = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const local = y * w + x, global = (y0 + y) * W + x0 + x;
+      if (!add[local]) continue;
+      let differs = false;
+      for (let c = 0; c < C; c++) differs ||= healed[local * C + c] !== original[global * C + c];
+      if (!differs) continue;
+      repaired.set(healed.subarray(local * C, (local + 1) * C), global * C);
+      mask[global] = 1;
+      changed++;
+    }
+    if (!changed) continue;
+    pixels += changed;
+    marks.push({ id: -4, kind: 'hair/fibre', verdict: 'defect', origin: 'learned',
+      why: 'a piece the learned dust/fibre map is sure of, repaired as the map draws it',
+      polarity: brighter ? 'bright' : 'dark', x0: bx0[id], x1: bx1[id], y0: by0[id], y1: by1[id],
+      cx: Math.round((bx0[id] + bx1[id]) / 2), cy: Math.round((by0[id] + by1[id]) / 2), area: changed });
+  }
+  return { marks, pixels };
 }
 
 module.exports = { enhanceFibers };

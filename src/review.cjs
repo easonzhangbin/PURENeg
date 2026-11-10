@@ -8,8 +8,9 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { setImmediate: yieldNow } = require('node:timers/promises');
 const { processFile, optionsChecked, cancelled, requireWorkSpace } = require('./processor.cjs');
-const { decodeTiff, encodeTiff } = require('./tiff.cjs');
+const { decodeTiff, decodeTiffForWork, encodeTiff } = require('./tiff.cjs');
 const { checkedStrokes, applyStrokes } = require('./brush.cjs');
+const { buildFrameProtection, protectionFromGeometry } = require('./frame-guard.cjs');
 const { runImageCodec } = require('./image-codec.cjs');
 const { workRootOverride, defaultWorkRoot, legacyWorkRoot } = require('./workspace.cjs');
 const version = require('./version.cjs');
@@ -18,7 +19,7 @@ const SCHEMA = 'photocraft-film-dust-review';
 const MAX_RUNS = 2_000_000;
 const MAX_REGIONS = 20_000;
 const RUN_MAGIC = Buffer.from('FDRUNS01');
-const DETECTION_KINDS = ['dust', 'scratches', 'fibers'];
+const DETECTION_KINDS = ['dust', 'scratches', 'fibers', 'patches'];
 const fail = message => { throw new Error(message); };
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const inside = (root, filename) => {
@@ -133,10 +134,12 @@ function publicReview(record, job, settings = record.detectionSettings) {
   const full = key => path.join(job, record.assets[key].path);
   const baseline = settings?.sensitivity ?? 1;
   const thresholds = { dust: settings?.dustSensitivity ?? baseline, fibers: settings?.fiberSensitivity ?? baseline,
-    scratches: settings?.scratchSensitivity ?? 1 };
+    scratches: settings?.scratchSensitivity ?? 1, patches: settings?.patchSensitivity ?? 1,
+    curl: settings?.fiberCurl ?? 1, softness: settings?.fiberSoftness ?? 1,
+    keepRebate: settings?.keepRebate ? 1 : 0 };
   return { id: record.id, sourceName: record.sourceName, sourcePath: full('source'), cleanedPath: full('cleaned'), maskPath: full('mask'),
     width: record.width, height: record.height, depth: record.depth, regions: record.regions, runsPath: full('runs'),
-    context: record.context, stats: record.stats, outputRoot: record.outputRoot, thresholds };
+    context: record.context, stats: record.stats, outputRoot: record.outputRoot, thresholds, rebateBakedIn: thresholds.keepRebate === 1 };
 }
 
 async function prepareReview({ inputPath, sourceName, outputRoot, context = 'file', host = null, cacheRoot,
@@ -215,7 +218,9 @@ async function prepareReview({ inputPath, sourceName, outputRoot, context = 'fil
       }
     }
     const assets = {};
-    for (const [name, filename] of Object.entries({ source: sourcePath, cleaned: candidate.paths.cleaned, mask: candidate.paths.mask, report: candidate.paths.report, runs: runsPath })) {
+    const assetFiles = { source: sourcePath, cleaned: candidate.paths.cleaned, mask: candidate.paths.mask, report: candidate.paths.report, runs: runsPath };
+    if (captured?.digests.fibreMap && candidate.paths.fibreMap) assetFiles.fibreMap = candidate.paths.fibreMap;
+    for (const [name, filename] of Object.entries(assetFiles)) {
       const digest = name === 'runs' ? { size: runs.length, sha256: sha256(runs) } : captured?.digests[name];
       assets[name] = await makeAsset(job, filename, digest);
       cancelled(options.signal);
@@ -226,7 +231,8 @@ async function prepareReview({ inputPath, sourceName, outputRoot, context = 'fil
     const record = { schema: SCHEMA, version: 1, id, status: 'ready', createdAt: new Date().toISOString(),
       context, host, outputRoot: path.resolve(outputRoot), sourceName: displayName,
       width: mask.width, height: mask.height, depth: imageInfo.depth, channels: imageInfo.channels,
-      regions: attributed, regionKindsVersion: 1, stats: candidate.stats, detectionSettings, assets };
+      regions: attributed, regionKindsVersion: 1, stats: candidate.stats, detectionSettings, assets,
+      ...(captured && { rebateGeometry: captured.rebateGeometry }) };
     const reviewPath = path.join(job, 'review.json');
     await saveRecord(reviewPath, record, key);
     return { reviewPath, review: publicReview(record, job) };
@@ -339,6 +345,7 @@ function runCount(runs, record) {
 function detectionKind(mark) {
   if (mark?.verdict !== 'defect') return undefined;
   if (mark.kind === 'scratch') return 'scratches';
+  if (mark.kind === 'patch') return 'patches';
   if (mark.kind === 'hair/fibre' || mark.fibre === 'patch' || mark.fibreDisc === true) return 'fibers';
   if (['dust', 'speck', 'soft'].includes(mark.kind)) return 'dust';
   return undefined;
@@ -427,10 +434,12 @@ async function remapExclusions(previous, next, ids, signal) {
   return mapped.sort((a, b) => a - b);
 }
 
-async function redetectReview(reviewPath, edits = {}, { dustSensitivity, fiberSensitivity, scratchSensitivity, ...options } = {}) {
-  const targets = [dustSensitivity, fiberSensitivity, scratchSensitivity];
+async function redetectReview(reviewPath, edits = {}, { dustSensitivity, fiberSensitivity, scratchSensitivity,
+  patchSensitivity = 1, fiberCurl = 1, fiberSoftness = 1, keepRebate = false, ...options } = {}) {
+  if (typeof keepRebate !== 'boolean') fail('保留片边选项无效。');
+  const targets = [dustSensitivity, fiberSensitivity, scratchSensitivity, patchSensitivity, fiberCurl, fiberSoftness];
   if (targets.some(value => !Number.isFinite(value) || value < 0.5 || value > 2)) {
-    fail('重新检测需要三个 0.5 到 2 之间的灵敏度。');
+    fail('重新检测的灵敏度必须在 0.5 到 2 之间。');
   }
   const previous = await readReview(reviewPath, { cacheRoot: options.cacheRoot, redetect: true });
   const { excludedRegions, strokes } = checkedEdits(previous.record, edits);
@@ -440,6 +449,9 @@ async function redetectReview(reviewPath, edits = {}, { dustSensitivity, fiberSe
     ...(dustSensitivity === sensitivity ? {} : { dustSensitivity }),
     ...(fiberSensitivity === sensitivity ? {} : { fiberSensitivity }),
     ...(scratchSensitivity === 1 ? {} : { scratchSensitivity }),
+    ...(patchSensitivity === 1 ? {} : { patchSensitivity }),
+    ...(fiberCurl === 1 ? {} : { fiberCurl }),
+    ...(fiberSoftness === 1 ? {} : { fiberSoftness }),
   };
   const { sourceName, outputRoot, context, host, assets } = previous.record;
   const inputPath = await reviewAssetPath(previous, 'source');
@@ -449,8 +461,8 @@ async function redetectReview(reviewPath, edits = {}, { dustSensitivity, fiberSe
     cancelled(options.signal);
     const next = await readReview(result.reviewPath, { cacheRoot: previous.root });
     const exclusions = await remapExclusions(previous, next, excludedRegions, options.signal);
-    const preview = exclusions.length || strokes.length ? await renderReviewPreview(result.reviewPath,
-      { excludedRegions: exclusions, strokes }, { cacheRoot: previous.root, signal: options.signal }) : undefined;
+    const preview = exclusions.length || strokes.length || keepRebate ? await renderReviewPreview(result.reviewPath,
+      { excludedRegions: exclusions, strokes }, { cacheRoot: previous.root, signal: options.signal, keepRebate }) : undefined;
     cancelled(options.signal);
     return { ...result, excludedRegions: exclusions, preview, unmatchedExclusions: excludedRegions.length - exclusions.length };
   } catch (error) {
@@ -461,8 +473,10 @@ async function redetectReview(reviewPath, edits = {}, { dustSensitivity, fiberSe
 
 async function recompose(loaded, edits, options = {}) {
   const { record } = loaded;
+  if (options.keepRebate !== undefined && typeof options.keepRebate !== 'boolean') fail('保留片边选项无效。');
+  if (options.keepRebate === false && record.detectionSettings?.keepRebate) fail('旧检测结果已应用片边保护。请重新检测一次后再切换。');
   const { excludedRegions, strokes } = checkedEdits(record, edits), excluded = new Set(excludedRegions);
-  const source = decodeTiff(await verifiedAsset(loaded, 'source'));
+  const source = await decodeTiffForWork(await verifiedAsset(loaded, 'source'), options);
   const candidate = decodeTiff(await verifiedAsset(loaded, 'cleaned'));
   const originalMask = decodeTiff(await verifiedAsset(loaded, 'mask'));
   const runs = await verifiedAsset(loaded, 'runs');
@@ -470,18 +484,27 @@ async function recompose(loaded, edits, options = {}) {
     if (image.width !== record.width || image.height !== record.height || image.channels !== record.channels || image.depth !== record.depth) fail('审核图像尺寸或位深已改变。');
   }
   const count = runCount(runs, record);
+  // Fit old caches on demand; new reviews already have the frame geometry.
+  const rebate = options.keepRebate ? (Object.hasOwn(record, 'rebateGeometry') ?
+    protectionFromGeometry(record.rebateGeometry, record.width, record.height) :
+    buildFrameProtection(source.data, record.width, record.height, source.channels, { relaxed: true })) : null;
+  const insideRebateBoundary = rebate ? new Uint8Array(record.regions.length + 1) : null;
   // The signed candidate already contains original pixels outside the
   // detected mask. Patch its private decode in place to avoid another
   // full-resolution allocation for each brush preview.
   const data = candidate.data, mask = originalMask.data;
-  let changedPixels = 0, acceptedPixels = 0;
+  let changedPixels = 0, acceptedPixels = 0, rebatePixels = 0;
   for (let r = 0; r < count; r++) {
     const at = 24 + r * 16, id = runs.readUInt32LE(at), y = runs.readUInt32LE(at + 4), x0 = runs.readUInt32LE(at + 8), x1 = runs.readUInt32LE(at + 12);
     if (id < 1 || id > record.regions.length || y >= record.height || x0 >= x1 || x1 > record.width) fail('审核点位坐标无效。');
-    const keep = !excluded.has(id);
+    const keepRegion = !excluded.has(id);
     for (let x = x0; x < x1; x++) {
       const pixel = y * record.width + x;
       if (!mask[pixel]) fail('审核点位不在灰尘蒙版中。');
+      const protectedPixel = rebate?.protects(pixel);
+      if (protectedPixel) rebatePixels++;
+      else if (insideRebateBoundary) insideRebateBoundary[id] = 1;
+      const keep = keepRegion && !protectedPixel;
       mask[pixel] = keep ? 65535 : 0;
       if (keep) acceptedPixels++;
       let changed = false;
@@ -497,8 +520,10 @@ async function recompose(loaded, edits, options = {}) {
   const { changedDelta, addedPixels, restoredPixels } = strokes.length ?
     await applyStrokes(source, data, mask, strokes, options.signal) : { changedDelta: 0, addedPixels: 0, restoredPixels: 0 };
   cancelled(options.signal);
+  const protectedRegions = insideRebateBoundary ? record.regions.filter(region => !insideRebateBoundary[region.id]).map(region => region.id) : [];
+  const retainedRegions = record.regions.length - excluded.size - protectedRegions.filter(id => !excluded.has(id)).length;
   return { cleaned: { ...source, data }, mask: { ...originalMask, data: mask }, excludedRegions,
-    retainedRegions: record.regions.length - excluded.size, changedPixels: changedPixels + changedDelta,
+    retainedRegions, protectedRegions, rebate, rebatePixels, changedPixels: changedPixels + changedDelta,
     acceptedPixels: acceptedPixels + addedPixels - restoredPixels, manualStrokes: strokes.length, addedPixels, restoredPixels };
 }
 
@@ -514,7 +539,8 @@ async function writeStage(loaded, composed, prefix, options) {
     const originalReport = JSON.parse((await verifiedAsset(loaded, 'report')).toString('utf8'));
     const stats = { ...loaded.record.stats, changed_pixels: composed.changedPixels, healed_pixels: composed.acceptedPixels,
       review_regions: loaded.record.regions.length, excluded_regions: composed.excludedRegions.length, retained_regions: composed.retainedRegions,
-      manual_strokes: composed.manualStrokes, added_pixels: composed.addedPixels, restored_pixels: composed.restoredPixels };
+      manual_strokes: composed.manualStrokes, added_pixels: composed.addedPixels, restored_pixels: composed.restoredPixels,
+      rebate_protected_pixels: composed.rebatePixels };
     const confirmed = prefix.startsWith('confirmed');
     await fs.writeFile(paths.report, JSON.stringify({ ...originalReport, version, stats,
       review: { id: loaded.record.id, excludedRegions: composed.excludedRegions, retainedRegions: composed.retainedRegions, confirmed,
@@ -529,7 +555,123 @@ async function renderReviewPreview(reviewPath, edits = {}, options = {}) {
   const composed = await recompose(loaded, edits, options);
   const result = await writeStage(loaded, composed, 'preview-', options);
   return { cleanedPath: result.paths.cleaned, maskPath: result.paths.mask, excludedRegions: composed.excludedRegions,
-    retainedRegions: composed.retainedRegions, changed: result.changed, stats: result.stats };
+    retainedRegions: composed.retainedRegions, protectedRegions: composed.protectedRegions, changed: result.changed, stats: result.stats };
+}
+
+// [Claude 2026-11-08] Training pack: everything a FibreNet retrain needs from one exported
+// photo, written beside it as "<name>-PN-training/". The layers say exactly what the
+// detector proposed, what the user took back, and what the user painted in or erased, so
+// a retrain no longer guesses them from a before/after difference or needs the app's cache.
+const TRAINING_LABELS = ['clean', 'test', 'category', 'note'];
+function checkedTrainingLabels(labels) {
+  if (labels === undefined || labels === null) return {};
+  if (typeof labels !== 'object' || Array.isArray(labels) || Object.keys(labels).some(k => !TRAINING_LABELS.includes(k))) fail('训练标签格式无效。');
+  const out = {};
+  for (const k of ['clean', 'test']) if (labels[k] !== undefined) {
+    if (typeof labels[k] !== 'boolean') fail('训练标签格式无效。');
+    out[k] = labels[k];
+  }
+  for (const k of ['category', 'note']) if (labels[k] !== undefined) {
+    if (typeof labels[k] !== 'string' || labels[k].length > 200) fail('训练标签格式无效。');
+    out[k] = labels[k];
+  }
+  return out;
+}
+
+async function writeTrainingPack(loaded, composed, folder, labels, options, progress) {
+  const { signal } = options;
+  const { record } = loaded, W = record.width, H = record.height, N = W * H;
+  const auto = decodeTiff(await verifiedAsset(loaded, 'mask'));
+  const runs = await verifiedAsset(loaded, 'runs');
+  const sourceBytes = await verifiedAsset(loaded, 'source'), source = await decodeTiffForWork(sourceBytes, options);
+  const prob = record.assets.fibreMap ? await verifiedAsset(loaded, 'fibreMap') : null;
+  const excluded = new Set(composed.excludedRegions);
+  const finalMask = composed.mask.data;
+  const layer = () => new Uint16Array(N);
+  const undone = layer(), added = layer(), erased = layer(), autoLayer = layer();
+  const owner = new Uint32Array(N);
+  const count = runCount(runs, record);
+  for (let r = 0; r < count; r++) {
+    const at = 24 + r * 16, id = runs.readUInt32LE(at), y = runs.readUInt32LE(at + 4);
+    for (let x = runs.readUInt32LE(at + 8), x1 = runs.readUInt32LE(at + 12); x < x1; x++) owner[y * W + x] = id;
+    if (r % 4096 === 0) { cancelled(signal); await yieldNow(); }
+  }
+  const protectedRegions = new Set(composed.protectedRegions);
+  const regions = new Map(record.regions.map(r => [r.id, { ...r, kept: !excluded.has(r.id) && !protectedRegions.has(r.id), probMax: 0, probSum: 0, n: 0 }]));
+  let changedOutside = 0, finalPixels = 0;
+  const C = source.channels;
+  for (let p = 0; p < N; p++) {
+    // A frame protection choice is not a manual negative example.
+    const isAuto = auto.data[p] > 0 && (!composed.rebate?.protects(p) || excluded.has(owner[p])), isFinal = finalMask[p] > 0;
+    if (isAuto) autoLayer[p] = 65535;
+    if (isFinal) finalPixels++;
+    if (isAuto && !isFinal) (excluded.has(owner[p]) ? undone : erased)[p] = 65535;
+    if (!isAuto && isFinal) added[p] = 65535;
+    if (!isFinal) {
+      for (let c = 0; c < C; c++) if (composed.cleaned.data[p * C + c] !== source.data[p * C + c]) { changedOutside++; break; }
+    }
+    if (prob && owner[p]) {
+      const g = regions.get(owner[p]);
+      if (g) { const v = prob[p]; g.probSum += v; g.n++; if (v > g.probMax) g.probMax = v; }
+    }
+    if (p % 4_000_000 === 0) { cancelled(signal); await yieldNow(); }
+  }
+  const sum = a => { let n = 0; for (let i = 0; i < a.length; i++) if (a[i]) n++; return n; };
+  const grey = data => encodeTiff({ width: W, height: H, channels: 1, depth: 16, data });
+  // The layers are mostly empty: gzip turns each 100 MB 16-bit mask into well under 1 MB.
+  progress(0.88, '正在压缩训练数据包');
+  const gz = bytes => require('node:zlib').gzipSync(bytes, { level: 6 });
+  const files = {
+    'source.tiff': sourceBytes, 'mask-auto.tiff.gz': gz(grey(autoLayer)), 'mask-undone.tiff.gz': gz(grey(undone)),
+    'mask-added.tiff.gz': gz(grey(added)), 'mask-erased.tiff.gz': gz(grey(erased)), 'mask-final.tiff.gz': gz(grey(finalMask)),
+  };
+  if (prob) files['fibre-map.u8.gz'] = gz(prob);
+  for (const [name, bytes] of Object.entries(files)) {
+    await fs.writeFile(path.join(folder, name), bytes, { flag: 'wx' });
+    cancelled(signal); await yieldNow();
+  }
+  const report = JSON.parse((await verifiedAsset(loaded, 'report')).toString('utf8'));
+  const marks = (report.marks ?? []).filter(m => m?.verdict === 'defect').map(m => ({
+    kind: m.kind, x0: m.x0, y0: m.y0, x1: m.x1, y1: m.y1, area: m.area, learned: m.learned === true || undefined, fibre: m.fibre }));
+  const pack = {
+    schema: 'pureneg-training-pack', version: 1, app: version, createdAt: new Date().toISOString(),
+    sourceName: record.sourceName, width: W, height: H, depth: record.depth, channels: record.channels,
+    sourceSha256: record.assets.source.sha256, detectionSettings: record.detectionSettings ?? null,
+    labels, timings: report.stats?.timings ?? null,
+    checks: { sameSizeAsExport: composed.cleaned.width === W && composed.cleaned.height === H,
+      changedOutsideMask: changedOutside, usable: changedOutside === 0 },
+    pixels: { auto: sum(autoLayer), undone: sum(undone), erased: sum(erased), added: sum(added), final: finalPixels },
+    strokes: composed.manualStrokes,
+    fibreMap: prob ? { file: 'fibre-map.u8.gz', format: 'gzip of uint8, row-major, width x height, 0-255 = probability' } : null,
+    regions: [...regions.values()].map(({ probSum, n, probMax, ...g }) => ({ ...g,
+      ...(prob && n ? { probMean: Math.round(probSum / n), probMax } : {}) })),
+    marks,
+    layers: { 'mask-auto.tiff.gz': '软件自动识别要修的地方', 'mask-undone.tiff.gz': '用户撤销的自动修复（不是缺陷）',
+      'mask-erased.tiff.gz': '用户用橡皮擦去的自动修复', 'mask-added.tiff.gz': '用户用画笔补修的（模型漏掉的）',
+      'mask-final.tiff.gz': '最终修复范围（16 位灰度 TIFF，gzip 压缩）', 'source.tiff': '原始扫描（未修）' },
+  };
+  await fs.writeFile(path.join(folder, 'pack.json'), JSON.stringify(pack, null, 2) + '\n', { flag: 'wx' });
+  return { folder, usable: pack.checks.usable };
+}
+
+function checkedExportSettings(settings, format) {
+  if (settings === undefined || settings === null) return [];
+  if (typeof settings !== 'object' || Array.isArray(settings)) fail('导出设置格式无效。');
+  const allowed = { space: ['keep', 'srgb', 'p3', 'adobergb'], depth: ['keep', '8', '16'], compression: ['none', 'lzw'] };
+  const out = [];
+  for (const [key, value] of Object.entries(settings)) {
+    if (key === 'quality') {
+      if (!Number.isFinite(value) || value < 0.5 || value > 1) fail('JPEG 质量必须在 0.5 到 1 之间。');
+      if (format === 'jpeg' && value !== 0.95) out.push('quality=' + value);
+      continue;
+    }
+    if (!allowed[key] || !allowed[key].includes(String(value))) fail('导出设置格式无效。');
+    if (key === 'depth' && (format === 'jpeg' || value === 'keep')) continue;
+    if (key === 'compression' && (format !== 'tiff' || value === 'none')) continue;
+    if (key === 'space' && value === 'keep') continue;
+    out.push(key + '=' + value);
+  }
+  return out;
 }
 
 async function confirmReview(reviewPath, edits = {}, options = {}) {
@@ -543,10 +685,17 @@ async function confirmReview(reviewPath, edits = {}, options = {}) {
   }
   if (options.includeMask !== undefined &&
       (loaded.record.context !== 'file' || typeof options.includeMask !== 'boolean')) fail('仅文件审核可以选择是否导出蒙版。');
+  if (options.trainingPack !== undefined && (typeof options.trainingPack !== 'boolean' || options.includeMask === undefined)) fail('仅应用导出可以附带训练数据包。');
+  const trainingLabels = checkedTrainingLabels(options.trainingLabels);
+  // [Claude 2026-11-09] Export settings (app exports): colour space, bit depth, TIFF compression,
+  // JPEG quality. All "keep" (the default) writes the photo exactly as before.
+  const exportSettings = checkedExportSettings(options.exportSettings, format);
+  const progress = (fraction, message) => options.onProgress?.({ fraction, message });
+  let trainingPack;
   let lock;
   try { lock = await fs.open(lockPath, 'wx', 0o600); }
   catch (error) { if (error.code === 'EEXIST') fail('此预览正在确认，请勿重复应用。'); throw error; }
-  let published = null, stage = null, previous = null;
+  let ownedOutputDir = null, ownedTrainingFolder = null, stage = null, previous = null;
   const written = [];
   try {
     // Another process could have completed confirmation between initial read
@@ -555,24 +704,28 @@ async function confirmReview(reviewPath, edits = {}, options = {}) {
     const composed = await recompose(current, edits, options);
     await saveRecord(current.reviewPath, { ...current.record, status: 'confirming' }, current.key);
     previous = current;
+    progress(0.28, '正在生成导出图像');
     stage = await writeStage(current, composed, 'confirmed-', { ...options, format });
     // An explicit mask choice is the standalone app's photo export.
     // Without that choice, keep the established CLI/PhotoCraft sidecars.
     const exportPaths = options.includeMask === undefined ? { ...stage.paths } : { cleaned: stage.paths.cleaned };
     if (options.includeMask === true) exportPaths.mask = stage.paths.mask;
-    if (format !== 'tiff') {
-      exportPaths.cleaned = path.join(stage.outputDir, format === 'jpeg' ? 'cleaned.jpg' : 'cleaned.png');
-      await runImageCodec(['export', stage.paths.cleaned, exportPaths.cleaned, format], options.signal);
+    if (format !== 'tiff' || exportSettings.length) {
+      exportPaths.cleaned = path.join(stage.outputDir, format === 'jpeg' ? 'cleaned.jpg' : format === 'png' ? 'cleaned.png' : 'exported.tiff');
+      progress(0.55, '正在转换导出格式或色彩');
+      await runImageCodec(['export', stage.paths.cleaned, exportPaths.cleaned, format, ...exportSettings], options.signal);
     }
+    progress(0.67, '正在写入照片文件');
     const destination = options.outputRoot === undefined ? current.record.outputRoot : path.resolve(options.outputRoot);
     await fs.mkdir(destination, { recursive: true });
     const paths = {};
     if (options.includeMask === undefined) {
       // CLI and PhotoCraft: a folder of their own with the established sidecar names.
-      published = await fs.mkdtemp(path.join(destination, 'PURENeg-reviewed-'));
+      ownedOutputDir = await fs.mkdtemp(path.join(destination, 'PURENeg-reviewed-'));
       for (const [name, filename] of Object.entries(exportPaths)) {
-        paths[name] = path.join(published, path.basename(filename));
-        await fs.copyFile(filename, paths[name], require('node:fs').constants.COPYFILE_EXCL);
+        cancelled(options.signal);
+        paths[name] = path.join(ownedOutputDir, path.basename(filename));
+        await fs.copyFile(filename, paths[name], fsConstants.COPYFILE_EXCL);
       }
     } else {
       // [Claude 2026-11-08] The app's photo export goes straight into the chosen folder,
@@ -583,31 +736,60 @@ async function confirmReview(reviewPath, edits = {}, options = {}) {
       const ext = path.extname(exportPaths.cleaned);
       const names = n => {
         const base = stem + '-PN' + (n > 1 ? '-' + n : '');
-        return { cleaned: base + ext, mask: base + '-mask.tiff' };
+        return { cleaned: base + ext, mask: base + '-mask.tiff', trainingPack: base + '-training' };
       };
+      const requested = Object.keys(exportPaths);
+      if (options.trainingPack) requested.push('trainingPack');
       let n = 1;
       for (;; n++) {
-        const taken = await Promise.all(Object.keys(exportPaths).map(name =>
-          fs.access(path.join(destination, names(n)[name])).then(() => true, () => false)));
+        const candidates = names(n);
+        const taken = await Promise.all(requested.map(name =>
+          fs.lstat(path.join(destination, candidates[name])).then(() => true, error => {
+            if (error.code === 'ENOENT') return false;
+            throw error;
+          })));
         if (!taken.some(Boolean)) break;
         if (n > 9999) fail('导出文件名已被占用。');
       }
-      published = destination;
+      const chosen = names(n);
       for (const [name, filename] of Object.entries(exportPaths)) {
-        paths[name] = path.join(destination, names(n)[name]);
-        await fs.copyFile(filename, paths[name], require('node:fs').constants.COPYFILE_EXCL);
+        cancelled(options.signal);
+        paths[name] = path.join(destination, chosen[name]);
+        await fs.copyFile(filename, paths[name], fsConstants.COPYFILE_EXCL);
         written.push(paths[name]);
       }
+      if (options.trainingPack) {
+        // Never costs the user the photo itself: a pack that cannot be written is
+        // reported, and the exported photo stays.
+        cancelled(options.signal);
+        const folder = path.join(destination, chosen.trainingPack);
+        try {
+          await fs.mkdir(folder);
+          ownedTrainingFolder = folder;
+          progress(0.78, '正在生成训练数据包');
+          trainingPack = await writeTrainingPack(current, composed, folder, trainingLabels, options, progress);
+          paths.trainingPack = folder;
+        } catch (error) {
+          if (error?.name === 'AbortError') throw error;
+          if (ownedTrainingFolder) {
+            await fs.rm(ownedTrainingFolder, { recursive: true, force: true }).catch(() => {});
+            ownedTrainingFolder = null;
+          }
+          trainingPack = { error: error.message };
+        }
+      }
     }
+    progress(0.94, '正在完成导出');
     cancelled(options.signal);
-    const result = { outputDir: published, paths, format, stats: stage.stats, changed: stage.changed,
-      excludedRegions: composed.excludedRegions, retainedRegions: composed.retainedRegions,
+    const result = { outputDir: ownedOutputDir ?? destination, paths, format, stats: stage.stats, changed: stage.changed, trainingPack,
+      excludedRegions: composed.excludedRegions, retainedRegions: composed.retainedRegions, protectedRegions: composed.protectedRegions,
       context: current.record.context, host: current.record.host, stagedPaths: stage.paths };
     await saveRecord(current.reviewPath, { ...current.record, status: 'confirmed', confirmedAt: new Date().toISOString(), result }, current.key);
     return result;
   } catch (error) {
-    if (written.length) for (const file of written) await fs.rm(file, { force: true }).catch(() => {});
-    else if (published) await fs.rm(published, { recursive: true, force: true }).catch(() => {});
+    for (const file of written) await fs.rm(file, { force: true }).catch(() => {});
+    if (ownedOutputDir) await fs.rm(ownedOutputDir, { recursive: true, force: true }).catch(() => {});
+    if (ownedTrainingFolder) await fs.rm(ownedTrainingFolder, { recursive: true, force: true }).catch(() => {});
     if (stage) await fs.rm(stage.outputDir, { recursive: true, force: true }).catch(() => {});
     // Restore the state read under the lock, including any earlier export.
     if (previous) await saveRecord(previous.reviewPath, previous.record, previous.key).catch(() => {});

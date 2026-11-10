@@ -8,6 +8,37 @@ const crypto = require('node:crypto');
 const { processScan, processFile, composeMasked, optionsChecked, checkImage } = require('../src/processor.cjs');
 const { parseArgs } = require('../src/cli.cjs');
 
+test('experimental blotches restore high-confidence bright debris and leave an equivalent eye highlight alone', async () => {
+  const { repairPatches } = require('../src/patches.cjs');
+  const W = 192, H = 144, C = 3;
+  const original = new Uint16Array(W * H * C).fill(36_000);
+  const probability = new Uint8Array(W * H);
+  const candidates = [];
+  for (const x0 of [36, 126]) {
+    const y0 = 58;
+    for (let y = y0; y < y0 + 18; y++) for (let x = x0; x < x0 + 12; x++) {
+      const i = y * W + x;
+      probability[i] = 246;
+      original.fill(62_000, i * C, (i + 1) * C);
+    }
+    candidates.push({ x0, x1: x0 + 11, y0, y1: y0 + 17, cx: x0 + 6, cy: y0 + 9,
+      kind: 'dust', verdict: 'keep-photo', polarity: 'bright', z: 16, area: 216 });
+  }
+  const repaired = original.slice(), mask = new Uint8Array(W * H);
+  const { marks } = await repairPatches({ original, repaired, mask, W, H, C, candidates, probability,
+    eyes: [{ x: 132, y: 67, r: 12 }], sensitivity: 1, tick: async () => {} });
+  assert.deepEqual(marks.map(mark => [mark.kind, mark.cx]), [['patch', 42]]);
+  const debris = 67 * W + 42, catchlight = 67 * W + 132;
+  assert.equal(mask[debris], 1);
+  assert.equal(mask[catchlight], 0);
+  assert.ok(repaired[debris * C] < original[debris * C]);
+  for (let i = 0; i < mask.length; i++) if (!mask[i]) {
+    assert.equal(repaired[i * C], original[i * C]);
+  }
+  assert.ok(!optionsChecked({}).detect.includes('patches'));
+  assert.deepEqual(optionsChecked({ detect: 'patches' }).detect, ['patches']);
+});
+
 function fixture(width = 384, height = 320, depth = 16) {
   let seed = 19;
   const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
@@ -133,10 +164,24 @@ test('TIFF file workflow preserves source and creates independent result/mask/re
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pureneg-file-test-'));
   try {
     const input = path.join(dir, '扫描件.tiff');
-    const inputBytes = encodeTiff(fixture(192, 160, 8));
+    const inputBytes = encodeTiff(fixture(192, 160, 8), { compression: 'deflate', rowsPerStrip: 5 });
     await fs.writeFile(input, inputBytes);
     const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
-    const result = await processFile(input, path.join(dir, 'output'), { polarity: 'bright' });
+    const eyes = Promise.withResolvers();
+    const landmarks = [{ x: 50, y: 50, r: 9 }];
+    const progress = [];
+    const result = await processFile(input, path.join(dir, 'output'), {
+      polarity: 'bright', eyes: eyes.promise, fibreMap: null,
+      onProgress: (event) => {
+        progress.push(event);
+        if (event.fraction === 0.03) eyes.resolve(landmarks);
+      },
+    });
+    assert.deepEqual(progress.slice(0, 3), [
+      { fraction: 0.01, message: '读取 TIFF 扫描件' },
+      { fraction: 0.03, message: '正在定位眼部高光' },
+      { fraction: 0.05, message: '读取完成，开始分析扫描件' },
+    ]);
     assert.equal(digest(await fs.readFile(input)), digest(inputBytes));
     const cleaned = decodeTiff(await fs.readFile(result.paths.cleaned));
     const mask = decodeTiff(await fs.readFile(result.paths.mask));
@@ -146,6 +191,16 @@ test('TIFF file workflow preserves source and creates independent result/mask/re
     const report = JSON.parse(await fs.readFile(result.paths.report, 'utf8'));
     assert.equal(report.upstream.revision, 'fcf68d6c6a77e4373db28f878c7f80f7b8934f3f');
     assert.notEqual(result.paths.cleaned, input);
+
+    const concurrentEyes = Promise.withResolvers();
+    const concurrent = await processFile(input, path.join(dir, 'concurrent'), {
+      polarity: 'bright', tiffWorkers: 4, overlapModels: true, eyes: concurrentEyes.promise, fibreMap: null,
+      onProgress: event => { if (event.fraction === 0.05) concurrentEyes.resolve(landmarks); },
+    });
+    assert.equal(concurrent.stats.eyes_found, 1);
+    for (const key of ['cleaned', 'mask']) {
+      assert.deepEqual(await fs.readFile(concurrent.paths[key]), await fs.readFile(result.paths[key]));
+    }
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });
 

@@ -159,7 +159,8 @@ private func rotateJPEG(_ image: CGImage, orientation: Int) throws -> CGImage {
     return result
 }
 
-private func writeImage(_ image: CGImage, to output: URL, type: UTType, resolution: [String: Double]) throws {
+private func writeImage(_ image: CGImage, to output: URL, type: UTType, resolution: [String: Double],
+                        quality: Double = 0.95, lzw: Bool = false) throws {
     let temporary = output.deletingLastPathComponent().appendingPathComponent(".image-codec-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: temporary) }
     guard let destination = CGImageDestinationCreateWithURL(temporary as CFURL, type.identifier as CFString, 1, nil) else {
@@ -171,7 +172,8 @@ private func writeImage(_ image: CGImage, to output: URL, type: UTType, resoluti
             properties[key as String] = dpi
         }
     }
-    if type == .jpeg { properties[kCGImageDestinationLossyCompressionQuality as String] = 0.95 }
+    if type == .jpeg { properties[kCGImageDestinationLossyCompressionQuality as String] = quality }
+    if type == .tiff && lzw { properties[kCGImagePropertyTIFFDictionary as String] = [kCGImagePropertyTIFFCompression as String: 5] }
     CGImageDestinationAddImage(destination, image, properties as CFDictionary)
     guard CGImageDestinationFinalize(destination),
           let source = CGImageSourceCreateWithURL(temporary as CFURL, nil),
@@ -184,12 +186,35 @@ private func writeImage(_ image: CGImage, to output: URL, type: UTType, resoluti
     try FileManager.default.moveItem(at: temporary, to: output)
 }
 
+/// [Claude 2026-11-09] The image in another colour space and/or bit depth, converted by
+/// ColorSync (relative colorimetric, as CGContext draws). "keep" and an unchanged depth return
+/// the image untouched, so a plain export stays bit-exact.
+private func converted(_ image: CGImage, space: String, depth: Int) throws -> CGImage {
+    let names: [String: CFString] = ["srgb": CGColorSpace.sRGB, "p3": CGColorSpace.displayP3, "adobergb": CGColorSpace.adobeRGB1998]
+    guard space == "keep" || names[space] != nil, depth == 8 || depth == 16 else { throw CodecError("导出色彩空间或位深无效。") }
+    if space == "keep" && depth == image.bitsPerComponent { return image }
+    let target = space == "keep" ? (image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!) : CGColorSpace(name: names[space]!)!
+    guard target.model == .rgb || target.model == .monochrome else { throw CodecError("仅支持 RGB 和灰度图像。") }
+    let gray = target.model == .monochrome
+    let info: UInt32 = gray ? CGImageAlphaInfo.none.rawValue : CGImageAlphaInfo.noneSkipLast.rawValue
+    let order: UInt32 = depth == 16 ? CGBitmapInfo.byteOrder16Little.rawValue : 0
+    guard let context = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: depth, bytesPerRow: 0,
+                                  space: target, bitmapInfo: info | order) else { throw CodecError("无法转换色彩空间。") }
+    context.interpolationQuality = .none
+    context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    guard let result = context.makeImage() else { throw CodecError("无法转换色彩空间。") }
+    return result
+}
+
 /// [Claude 2026-11-08] The eyes of the faces in a scan, as JSON [{"x", "y", "r"}] in pixels
 /// from the top-left. The engine leaves repairs there alone: a catchlight is a small round
 /// bright speck on a dark ground, which is exactly what a dust speck looks like by itself.
 private func findEyes(in image: CGImage, to output: URL) throws {
+    // Vision is much slower on 16-bit TIFF rasters. Convert only its input,
+    // keeping the original dimensions so landmark coordinates stay aligned.
+    let visionImage = try converted(image, space: "keep", depth: 8)
     let request = VNDetectFaceLandmarksRequest()
-    try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+    try VNImageRequestHandler(cgImage: visionImage, options: [:]).perform([request])
     let size = CGSize(width: image.width, height: image.height)
     var eyes: [[String: Double]] = []
     for face in request.results ?? [] {
@@ -278,16 +303,30 @@ private struct ImageCodec {
             case ("import-jpeg", 3):
                 let source = try ImageFile(input, type: .jpeg)
                 try writeImage(source.normalizedJPEG(), to: output, type: .tiff, resolution: source.resolution)
-            case ("export", 4):
+            case ("export", 4...):
+                // [Claude 2026-11-09] Optional settings after the format, as key=value:
+                // space=keep|srgb|p3|adobergb, depth=keep|8|16, compression=none|lzw (TIFF),
+                // quality=0.5...1 (JPEG). Without them the image is written as it is.
                 let type: UTType
                 switch args[3] {
                 case "jpeg": type = .jpeg
                 case "png": type = .png
+                case "tiff": type = .tiff
                 default: throw usage
+                }
+                var options: [String: String] = [:]
+                for item in args.dropFirst(4) {
+                    let parts = item.split(separator: "=", maxSplits: 1).map(String.init)
+                    guard parts.count == 2 else { throw usage }
+                    options[parts[0]] = parts[1]
                 }
                 let source = try ImageFile(input, type: .tiff)
                 guard source.orientation == 1 else { throw CodecError("导出用 TIFF 的方向必须已规范化。") }
-                try writeImage(source.image, to: output, type: type, resolution: source.resolution)
+                let depth = options["depth"].flatMap(Int.init) ?? (type == .jpeg ? 8 : source.image.bitsPerComponent)
+                let image = try converted(source.image, space: options["space"] ?? "keep", depth: depth)
+                let quality = options["quality"].flatMap(Double.init).map { min(1, max(0.5, $0)) } ?? 0.95
+                try writeImage(image, to: output, type: type, resolution: source.resolution,
+                               quality: quality, lzw: options["compression"] == "lzw")
             case ("eyes", 3):
                 try findEyes(in: ImageFile(input, type: .tiff).image, to: output)
             case ("fibremap", 3):
@@ -300,5 +339,5 @@ private struct ImageCodec {
         }
     }
 
-    private static let usage = CodecError("用法：image-codec import-jpeg 输入.jpg 输出.tiff 或 image-codec export 输入.tiff 输出文件 jpeg|png")
+    private static let usage = CodecError("用法：image-codec import-jpeg 输入.jpg 输出.tiff 或 image-codec export 输入.tiff 输出文件 tiff|jpeg|png [space=keep|srgb|p3|adobergb] [depth=keep|8|16] [compression=none|lzw] [quality=0.5-1]")
 }

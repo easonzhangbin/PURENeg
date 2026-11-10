@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST_DIR="${DIST_DIR:-$PROJECT_DIR/dist/release-0.4.8}"
+DIST_DIR="${DIST_DIR:-$PROJECT_DIR/dist/release-0.4.9}"
 FINAL_APP_DIR="$DIST_DIR/PURE Neg.app"
 BUILD_DIR="$PROJECT_DIR/.build/macos"
 ICON_SOURCE="$PROJECT_DIR/assets/PURENeg.png"
@@ -15,6 +15,7 @@ SPARKLE_DIR="${SPARKLE_DIR:-}"
 PURENEG_APPCAST_URL="${PURENEG_APPCAST_URL:-}"
 PURENEG_UPDATE_PUBLIC_KEY="${PURENEG_UPDATE_PUBLIC_KEY:-}"
 PURENEG_UPDATE_TEST="${PURENEG_UPDATE_TEST:-0}"
+PURENEG_TONE_CALIBRATION="${PURENEG_TONE_CALIBRATION:-0}"
 LAUNCHER="$PROJECT_DIR/scripts/打开 PURE Neg.command"
 package_mode=
 case "${APP_ONLY:-0}:${PACKAGE_BETA:-0}:${PACKAGE_RELEASE:-0}" in
@@ -23,6 +24,10 @@ case "${APP_ONLY:-0}:${PACKAGE_BETA:-0}:${PACKAGE_RELEASE:-0}" in
   0:0:1) package_mode=release ;;
   *) echo "Choose at most one of APP_ONLY, PACKAGE_BETA and PACKAGE_RELEASE." >&2; exit 1 ;;
 esac
+if [[ "$PURENEG_TONE_CALIBRATION" != 0 && ( "$PURENEG_TONE_CALIBRATION" != 1 || "${APP_ONLY:-0}" != 1 ) ]]; then
+  echo "PURENEG_TONE_CALIBRATION=1 is only supported with APP_ONLY=1." >&2
+  exit 1
+fi
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This script builds the macOS desktop app and must run on macOS." >&2
@@ -69,7 +74,10 @@ if [[ -z "$NODE_LICENSE" || ! -f "$NODE_LICENSE" ]]; then
   exit 1
 fi
 
-app_frameworks=(-framework AppKit -framework UniformTypeIdentifiers)
+app_swift_options=(-framework AppKit -framework UniformTypeIdentifiers)
+if [[ "$PURENEG_TONE_CALIBRATION" == 1 ]]; then
+  app_swift_options+=(-D PURENEG_TONE_CALIBRATION)
+fi
 if [[ -n "$SPARKLE_DIR$PURENEG_APPCAST_URL$PURENEG_UPDATE_PUBLIC_KEY" || "$PURENEG_UPDATE_TEST" != 0 ]]; then
   if [[ ! -f "$SPARKLE_DIR/Sparkle.framework/Sparkle" || ! -f "$SPARKLE_DIR/LICENSE" ||
         -z "$PURENEG_APPCAST_URL" || ! "$PURENEG_UPDATE_PUBLIC_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
@@ -100,7 +108,7 @@ if [[ -n "$SPARKLE_DIR$PURENEG_APPCAST_URL$PURENEG_UPDATE_PUBLIC_KEY" || "$PUREN
     echo "Use a stable Sparkle 2 release at version 2.9.0 or later." >&2
     exit 1
   fi
-  app_frameworks+=(-F "$SPARKLE_DIR" -framework Sparkle -Xlinker -rpath -Xlinker '@loader_path/../Frameworks')
+  app_swift_options+=(-F "$SPARKLE_DIR" -framework Sparkle -Xlinker -rpath -Xlinker '@loader_path/../Frameworks')
 fi
 
 mkdir -p "$BUILD_DIR" "$DIST_DIR"
@@ -119,10 +127,11 @@ if [[ ( "$ARCH" == "arm64" && "$NODE_ARCH" != "arm64" ) || ( "$ARCH" == "x86_64"
 fi
 
 swiftc -parse-as-library -swift-version 5 -O -target "$ARCH-apple-macos14.0" \
-  "${app_frameworks[@]}" \
+  "${app_swift_options[@]}" \
   "$PROJECT_DIR/macos/PURENeg.swift" "$PROJECT_DIR/macos/PreviewCanvas.swift" \
   "$PROJECT_DIR/macos/ReviewLoadingView.swift" \
   "$PROJECT_DIR/macos/BatchLightTable.swift" "$PROJECT_DIR/macos/BatchReviewSidebar.swift" \
+  "$PROJECT_DIR/macos/FilmLoupe.swift" \
   "$PROJECT_DIR/macos/PhotoshopImport.swift" "$PROJECT_DIR/macos/SupportWindows.swift" \
   "$PROJECT_DIR/macos/SettingsWindow.swift" "$PROJECT_DIR/macos/Localization.swift" \
   "$PROJECT_DIR/macos/AppUpdates.swift" -o "$BUILD_DIR/PURENeg"
@@ -142,6 +151,7 @@ cp -X "$NODE_LICENSE" "$APP_DIR/Contents/Resources/runtime/LICENSE"
 mkdir -p "$APP_DIR/Contents/Resources/ThirdPartyLicenses"
 cp -X "$PROJECT_DIR/licenses/torchvision-LICENSE" "$APP_DIR/Contents/Resources/ThirdPartyLicenses/"
 chmod 755 "$APP_DIR/Contents/MacOS/PURENeg" "$APP_DIR/Contents/Resources/runtime/node" "$APP_DIR/Contents/Resources/runtime/image-codec"
+cp -X "$PROJECT_DIR/package.json" "$APP_DIR/Contents/Resources/package.json"
 ditto --norsrc --noextattr --noqtn "$PROJECT_DIR/src" "$APP_DIR/Contents/Resources/src"
 ditto --norsrc --noextattr --noqtn "$PROJECT_DIR/vendor" "$APP_DIR/Contents/Resources/vendor"
 ditto --norsrc --noextattr --noqtn "$PROJECT_DIR/macos/Resources/en.lproj" "$APP_DIR/Contents/Resources/en.lproj"
@@ -163,8 +173,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>PURE Neg</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.4.8</string>
-  <key>CFBundleVersion</key><string>21</string>
+  <key>CFBundleShortVersionString</key><string>0.4.9</string>
+  <key>CFBundleVersion</key><string>33</string>
   <key>CFBundleIconFile</key><string>PURENeg</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSAppleEventsUsageDescription</key><string>PURE Neg 需要读取 Photoshop 当前文档的可见图像，用于在本机生成除尘预览。</string>
@@ -176,6 +186,10 @@ PLIST
 
 if [[ "${APP_ONLY:-0}" == "1" ]]; then
   /usr/bin/plutil -replace CFBundleIdentifier -string local.filmdust.photocraft.review.validation "$APP_DIR/Contents/Info.plist"
+fi
+# [Claude 2026-11-08] Training build: the training-pack export is on by default.
+if [[ "${PURENEG_TRAINING_BUILD:-0}" == "1" ]]; then
+  /usr/bin/plutil -insert PURENegTrainingBuild -bool YES "$APP_DIR/Contents/Info.plist"
 fi
 if [[ -n "$SPARKLE_DIR" ]]; then
   sparkle_framework="$APP_DIR/Contents/Frameworks/Sparkle.framework"

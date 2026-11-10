@@ -58,12 +58,13 @@ test('accepted detector marks label matching mask components, including mixed co
     { kind: 'scratch', verdict: 'defect', x0: 0, y0: 0, x1: 4, y1: 4, area: 16 },
     { kind: 'speck', verdict: 'defect', x0: 0, y0: 4, x1: 0, y1: 4, area: 1 },
     { kind: 'soft', fibreDisc: true, verdict: 'defect', x0: 2, y0: 2, x1: 2, y1: 2, area: 1 },
+    { kind: 'patch', verdict: 'defect', x0: 2, y0: 2, x1: 2, y1: 2, area: 1 },
     { kind: 'dust', verdict: 'keep-photo', x0: 2, y0: 2, x1: 2, y1: 2, area: 1 },
     { kind: 'hair/fibre', verdict: 'defect', x0: 0, y0: 0, x1: 0, y1: 0, area: 50 },
   ];
   await fs.writeFile(reportPath, JSON.stringify(report));
   const { review, reviewPath } = await prepareReview(fixture);
-  assert.deepEqual(review.regions.map(region => region.kinds), [['dust', 'scratches'], ['fibers']]);
+  assert.deepEqual(review.regions.map(region => region.kinds), [['dust', 'scratches'], ['fibers', 'patches']]);
   assert.equal(path.dirname(review.runsPath), path.dirname(reviewPath));
   assert.equal((await fs.readFile(review.runsPath)).subarray(0, 8).toString(), 'FDRUNS01');
   assert.deepEqual((await inspectReview(reviewPath, { cacheRoot: fixture.cacheRoot })).review.regions, review.regions);
@@ -119,6 +120,55 @@ test('preview exclusion restores exact component pixels despite overlapping regi
   const second = await renderReviewPreview(item.reviewPath, { excludedRegions: [] }, { cacheRoot: item.cacheRoot });
   assert.notEqual(second.cleanedPath, result.cleanedPath, 'ImageIO cannot see a file being overwritten');
   await assert.rejects(fs.access(item.outputRoot), { code: 'ENOENT' });
+});
+
+test('film rebate protection recomposes the saved detection without changing edits or the cached candidate', async t => {
+  const fixture = await caseFiles(t);
+  const width = 400, height = 320;
+  const data = new Uint16Array(width * height).fill(36000);
+  for (let y = 0; y < height; y++) {
+    data.fill(4000, y * width, y * width + 38);
+    data.fill(4000, y * width + 362, (y + 1) * width);
+  }
+  const edge = 55 * width + 12, inside = 80 * width + 43, outside = 80 * width + 32;
+  const ignored = 100 * width + 100, manual = 140 * width + 120;
+  data[manual] = 65000;
+  const mask = new Uint16Array(data.length);
+  mask[edge] = mask[ignored] = 65535;
+  mask.fill(65535, outside, inside + 1);
+  const image = { width, height, channels: 1, colorChannels: 1, depth: 16, data };
+  const paths = fixture.preparedResult.paths;
+  await fs.writeFile(fixture.inputPath, encodeTiff(image));
+  await fs.writeFile(paths.cleaned, encodeTiff({ ...image, data: data.map((value, i) => mask[i] ? 20000 : value) }));
+  await fs.writeFile(paths.mask, encodeTiff({ ...image, depth: 8, data: mask }));
+  await fs.writeFile(paths.report, JSON.stringify({ image: { width, height, depth: 16, channels: 1 } }));
+  const { reviewPath, review } = await prepareReview(fixture);
+  assert.deepEqual(review.regions.map(region => region.id), [1, 2, 3]);
+  const record = await fs.readFile(reviewPath);
+  const edits = { excludedRegions: [3], strokes: [{ kind: 'add', radius: 2, points: [[120, 140]] }] };
+  const options = { cacheRoot: fixture.cacheRoot };
+  const off = await renderReviewPreview(reviewPath, edits, { ...options, keepRebate: false });
+  const on = await renderReviewPreview(reviewPath, edits, { ...options, keepRebate: true });
+  const offAgain = await renderReviewPreview(reviewPath, edits, { ...options, keepRebate: false });
+  const maskOff = await fs.readFile(off.maskPath), maskOn = await fs.readFile(on.maskPath);
+  const kept = decodeTiff(maskOn).data;
+  assert.equal(decodeTiff(maskOff).data[edge], 65535);
+  assert.equal(kept[edge], 0);
+  assert.equal(kept[outside], 0);
+  assert.equal(kept[inside], 65535);
+  assert.equal(kept[ignored], 0);
+  assert.equal(kept[manual], 65535);
+  assert.deepEqual(on.protectedRegions, [1]);
+  assert.deepEqual(on.excludedRegions, [3]);
+  assert.equal(on.retainedRegions, 1);
+  assert.deepEqual(await fs.readFile(offAgain.maskPath), maskOff);
+  assert.deepEqual(await fs.readFile(reviewPath), record);
+
+  const saved = await confirmReview(reviewPath, edits, { ...options, keepRebate: true, includeMask: true, trainingPack: true });
+  assert.deepEqual(await fs.readFile(saved.paths.mask), maskOn);
+  assert.deepEqual(await fs.readFile(saved.paths.cleaned), await fs.readFile(on.cleanedPath));
+  const erased = require('node:zlib').gunzipSync(await fs.readFile(path.join(saved.paths.trainingPack, 'mask-erased.tiff.gz')));
+  assert.equal(decodeTiff(erased).data[edge], 0);
 });
 
 test('confirmation publishes only accepted pixels and prevents duplicate confirmation', async t => {
@@ -196,7 +246,7 @@ test('redetection from a confirmed file remaps changed region IDs and previews r
   const baseline = await prepareReview(parameters);
   assert.equal(baseline.review.regions.length, 1);
   assert.deepEqual(baseline.review.regions[0].kinds, ['scratches']);
-  assert.deepEqual(baseline.review.thresholds, { dust: 1.4, fibers: 1.4, scratches: 1 });
+  assert.deepEqual(baseline.review.thresholds, { dust: 1.4, fibers: 1.4, scratches: 1, patches: 1, curl: 1, softness: 1, keepRebate: 0 });
   const mask = decodeTiff(await fs.readFile(baseline.review.maskPath));
   mask.data[10 * width + 10] = 65535; // A preceding component that the new scan will remove.
   const oldMask = path.join(dir, 'old-mask.tiff');
@@ -233,11 +283,11 @@ test('redetection from a confirmed file remaps changed region IDs and previews r
   await fs.writeFile(editsPath, JSON.stringify(edits));
   const { stdout } = await promisify(execFile)(process.execPath, [path.resolve(__dirname, '../src/cli.cjs'), 'redetect',
     '--review', old.reviewPath, '--work-dir', path.dirname(cacheRoot), '--edits', editsPath,
-    '--dust-sensitivity', '1.8', '--fiber-sensitivity', '1.4', '--scratch-sensitivity', '1']);
+    '--dust-sensitivity', '1.8', '--fiber-sensitivity', '1.4', '--scratch-sensitivity', '1', '--patch-sensitivity', '1.2']);
   const result = stdout.trim().split('\n').map(line => JSON.parse(line)).at(-1);
   assert.equal(result.type, 'redetected');
   assert.notEqual(result.reviewPath, old.reviewPath);
-  assert.deepEqual(result.review.thresholds, { dust: 1.8, fibers: 1.4, scratches: 1 });
+  assert.deepEqual(result.review.thresholds, { dust: 1.8, fibers: 1.4, scratches: 1, patches: 1.2, curl: 1, softness: 1, keepRebate: 0 });
   assert.deepEqual(result.review.regions[0].kinds, ['scratches']);
   assert.deepEqual(result.review.stats.detection_types, ['scratches']);
   assert.equal(result.review.sourceName, parameters.sourceName);
@@ -344,12 +394,141 @@ test('app exports share one folder and never overwrite: a taken name gets a numb
   const names = [];
   for (let i = 0; i < 2; i++) {
     const item = await prepared(t);
-    const result = await confirmReview(item.reviewPath, {}, { cacheRoot: item.cacheRoot, outputRoot: chosen, includeMask: true });
+    const progress = [];
+    const result = await confirmReview(item.reviewPath, {}, { cacheRoot: item.cacheRoot, outputRoot: chosen, includeMask: true,
+      onProgress: event => progress.push(event.fraction) });
+    assert.deepEqual(progress, [0.28, 0.67, 0.94]);
     assert.equal(result.outputDir, chosen);
     names.push(path.basename(result.paths.cleaned), path.basename(result.paths.mask));
   }
   assert.deepEqual(names, ['source-PN.tiff', 'source-PN-mask.tiff', 'source-PN-2.tiff', 'source-PN-2-mask.tiff']);
   assert.deepEqual((await fs.readdir(chosen)).sort(), [...names].sort());
+});
+
+async function batchExportFixture(t, options = {}) {
+  const first = await prepared(t);
+  const destination = first.outputRoot;
+  await fs.mkdir(destination);
+  const original = path.join(destination, 'original.tiff');
+  await fs.copyFile(first.inputPath, original);
+  const earlier = await confirmReview(first.reviewPath, {}, { cacheRoot: first.cacheRoot, includeMask: false, ...options });
+  const originals = [original, earlier.paths.cleaned];
+  if (earlier.paths.mask) originals.push(earlier.paths.mask);
+  if (earlier.paths.trainingPack) {
+    originals.push(path.join(earlier.paths.trainingPack, 'pack.json'), path.join(earlier.paths.trainingPack, 'source.tiff'));
+  }
+  const before = await Promise.all(originals.map(file => fs.readFile(file)));
+  const entries = (await fs.readdir(destination)).sort();
+  const second = await prepared(t);
+  return { destination, earlier, originals, before, entries, second,
+    confirmSecond: overrides => confirmReview(second.reviewPath, {}, {
+      cacheRoot: second.cacheRoot, outputRoot: destination, includeMask: false, ...options, ...overrides,
+    }) };
+}
+
+test('a first photo copy failure preserves the chosen folder and earlier batch exports', async t => {
+  const batch = await batchExportFixture(t);
+  const copyFile = fs.copyFile;
+  const failedPath = path.join(batch.destination, 'source-PN-2.tiff');
+  const copy = t.mock.method(fs, 'copyFile', async (source, destination, flags) => {
+    if (destination === failedPath) throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+    await copyFile(source, destination, flags);
+  });
+
+  await assert.rejects(batch.confirmSecond(), { code: 'ENOSPC' });
+  assert.deepEqual((await fs.readdir(batch.destination)).sort(), batch.entries);
+  assert.deepEqual(await Promise.all(batch.originals.map(file => fs.readFile(file))), batch.before);
+  copy.mock.restore();
+  assert.equal((await batch.confirmSecond()).paths.cleaned, failedPath);
+});
+
+test('cancelling while copying a photo rolls back only that frame, including its mask', async t => {
+  const batch = await batchExportFixture(t, { includeMask: true });
+  const controller = new AbortController();
+  const copyFile = fs.copyFile;
+  t.mock.method(fs, 'copyFile', async (source, destination, flags) => {
+    await copyFile(source, destination, flags);
+    if (destination === path.join(batch.destination, 'source-PN-2-mask.tiff')) controller.abort();
+  });
+
+  await assert.rejects(batch.confirmSecond({ signal: controller.signal }), { name: 'AbortError' });
+  assert.deepEqual((await fs.readdir(batch.destination)).sort(), batch.entries);
+  assert.deepEqual(await Promise.all(batch.originals.map(file => fs.readFile(file))), batch.before);
+});
+
+test('an existing training pack reserves its name even when its exported photo has moved', async t => {
+  const batch = await batchExportFixture(t, { trainingPack: true });
+  const moved = path.join(batch.second.dir, 'previously-exported.tiff');
+  await fs.rename(batch.earlier.paths.cleaned, moved);
+
+  const result = await batch.confirmSecond();
+  assert.equal(result.paths.cleaned, path.join(batch.destination, 'source-PN-2.tiff'));
+  assert.equal(result.paths.trainingPack, path.join(batch.destination, 'source-PN-2-training'));
+  await fs.access(path.join(result.paths.trainingPack, 'pack.json'));
+  const originals = batch.originals.map(file => file === batch.earlier.paths.cleaned ? moved : file);
+  assert.deepEqual(await Promise.all(originals.map(file => fs.readFile(file))), batch.before);
+});
+
+test('a training pack created by another writer after the name check is preserved', async t => {
+  const batch = await batchExportFixture(t, { trainingPack: true });
+  const competingPack = path.join(batch.destination, 'source-PN-2-training');
+  const marker = path.join(competingPack, 'pack.json');
+  const mkdir = fs.mkdir;
+  t.mock.method(fs, 'mkdir', async (folder, options) => {
+    if (folder === competingPack) {
+      await mkdir(folder);
+      await fs.writeFile(marker, 'another writer');
+    }
+    return mkdir(folder, options);
+  });
+
+  const result = await batch.confirmSecond();
+  assert.match(result.trainingPack.error, /EEXIST/);
+  assert.equal(Object.hasOwn(result.paths, 'trainingPack'), false);
+  await fs.access(result.paths.cleaned);
+  assert.equal(await fs.readFile(marker, 'utf8'), 'another writer');
+  assert.deepEqual(await Promise.all(batch.originals.map(file => fs.readFile(file))), batch.before);
+});
+
+test('cancelling a training pack write preserves completed frames and removes only the current output', async t => {
+  const batch = await batchExportFixture(t, { trainingPack: true, includeMask: true });
+  const controller = new AbortController();
+  const writeFile = fs.writeFile;
+  const currentPack = path.join(batch.destination, 'source-PN-2-training');
+  t.mock.method(fs, 'writeFile', async (filename, data, options) => {
+    await writeFile(filename, data, options);
+    if (filename === path.join(currentPack, 'source.tiff')) controller.abort();
+  });
+
+  await assert.rejects(batch.confirmSecond({ signal: controller.signal }), { name: 'AbortError' });
+  assert.deepEqual((await fs.readdir(batch.destination)).sort(), batch.entries);
+  assert.deepEqual(await Promise.all(batch.originals.map(file => fs.readFile(file))), batch.before);
+  assert.equal((await batch.confirmSecond()).paths.trainingPack, currentPack);
+});
+
+test('a training pack records what was proposed, taken back and kept, beside the photo', async t => {
+  const item = await prepared(t);
+  const progress = [];
+  const result = await confirmReview(item.reviewPath, { excludedRegions: [1] }, { cacheRoot: item.cacheRoot, includeMask: false,
+    trainingPack: true, trainingLabels: { clean: true, test: false, category: '纤维团' }, onProgress: event => progress.push(event.fraction) });
+  assert.deepEqual(progress, [0.28, 0.67, 0.78, 0.88, 0.94]);
+  assert.deepEqual((await fs.readdir(result.outputDir)).sort(), ['source-PN-training', 'source-PN.tiff']);
+  const folder = result.paths.trainingPack;
+  const files = (await fs.readdir(folder)).sort();
+  for (const name of ['mask-added.tiff.gz', 'mask-auto.tiff.gz', 'mask-erased.tiff.gz', 'mask-final.tiff.gz', 'mask-undone.tiff.gz', 'pack.json', 'source.tiff'])
+    assert.ok(files.includes(name), name);
+  const pack = JSON.parse(await fs.readFile(path.join(folder, 'pack.json'), 'utf8'));
+  assert.equal(pack.schema, 'pureneg-training-pack');
+  assert.deepEqual(pack.labels, { clean: true, test: false, category: '纤维团' });
+  assert.equal(pack.checks.usable, true);
+  assert.equal(pack.regions.find(r => r.id === 1).kept, false);
+  assert.equal(pack.regions.find(r => r.id === 2).kept, true);
+  assert.ok(pack.pixels.undone > 0 && pack.pixels.final > 0 && pack.pixels.added === 0);
+  const undone = decodeTiff(require('node:zlib').gunzipSync(await fs.readFile(path.join(folder, 'mask-undone.tiff.gz'))));
+  assert.equal(undone.width, item.source.width);
+  assert.deepEqual(decodeTiff(await fs.readFile(path.join(folder, 'source.tiff'))).data, item.source.data);
+  const other = await prepared(t);
+  await assert.rejects(confirmReview(other.reviewPath, {}, { cacheRoot: other.cacheRoot, trainingPack: true }), /训练数据包/);
 });
 
 test('unknown or non-integer region ids fail without consuming review', async t => {
@@ -458,4 +637,12 @@ test('review display name is explicit, bounded and free of control characters', 
   const fixture = await caseFiles(t);
   const pending = await prepareReview({ ...fixture, sourceName: '../\n真实扫描件.tiff' });
   assert.equal(pending.review.sourceName, '真实扫描件.tiff');
+});
+
+test('export settings are checked, and the defaults leave a TIFF export untouched', async t => {
+  const item = await prepared(t);
+  await assert.rejects(confirmReview(item.reviewPath, {}, { cacheRoot: item.cacheRoot, includeMask: false, exportSettings: { space: 'cmyk' } }), /导出设置/);
+  const result = await confirmReview(item.reviewPath, {}, { cacheRoot: item.cacheRoot, includeMask: false,
+    exportSettings: { space: 'keep', depth: 'keep', compression: 'none', quality: 0.95 } });
+  assert.equal(path.basename(result.paths.cleaned), 'source-PN.tiff');
 });

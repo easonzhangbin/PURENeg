@@ -7,6 +7,17 @@ struct BatchLightTableItem {
     let url: URL
     let status: String
     let selected: Bool
+    let artworkURL: URL
+    let displayName: String
+
+    init(id: UUID, url: URL, status: String, selected: Bool, artworkURL: URL? = nil, displayName: String? = nil) {
+        self.id = id
+        self.url = url
+        self.status = status
+        self.selected = selected
+        self.artworkURL = artworkURL ?? url
+        self.displayName = displayName ?? url.lastPathComponent
+    }
 }
 
 private func neutral(_ white: CGFloat, _ alpha: CGFloat = 1) -> NSColor {
@@ -317,32 +328,30 @@ private class LampLitSurface: NSView {
 }
 
 private final class DiffuserEmission: NSView {
-    enum Mode: Equatable { case off, standard, high(CGFloat) }
+    enum Mode: Equatable, Sendable { case off, standard, high(CGFloat) }
+
+    static var switchOffDuration: CFTimeInterval {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.1 : 0.35
+    }
 
     private static let offImage = standardImage(lit: false)
     private static let litImage = standardImage(lit: true)
     private let emitter = CALayer()
     private let aperture = CAShapeLayer()
     private var renderedMode: Mode?
+    private var renderedFilmMode: Mode?
     private var headroomTimer: Timer?
     var modeChanged: ((Mode) -> Void)?
+    var filmModeChanged: ((Mode) -> Void)?
     var isEnabled = false {
         didSet {
             if oldValue != isEnabled { switchFeedback(on: isEnabled) }
             updateForDisplay()
         }
     }
-    /// [Claude 2026-11-08] A dark veil over the lamp, animated when it is switched: a
-    /// fluorescent tube's starter flickers a few times before it holds, and switching off
-    /// lets the light die away quickly. Clear when the lamp is steady.
-    private let veil = CALayer()
-
     init() {
         super.init(frame: .zero)
         aperture.fillColor = NSColor.white.cgColor
-        veil.backgroundColor = NSColor.black.cgColor
-        veil.opacity = 0
-        emitter.addSublayer(veil)
         emitter.mask = aperture
         layer = emitter
         wantsLayer = true
@@ -359,7 +368,6 @@ private final class DiffuserEmission: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         aperture.frame = bounds
-        veil.frame = bounds
         aperture.path = CGPath(roundedRect: aperture.bounds, cornerWidth: 5, cornerHeight: 5, transform: nil)
         CATransaction.commit()
     }
@@ -399,32 +407,18 @@ private final class DiffuserEmission: NSView {
         updateForDisplay()
     }
 
-    func headroomMayHaveChanged() { updateForDisplay() }
+    func headroomMayHaveChanged() {
+        if window?.isVisible == true { updateForDisplay() }
+    }
 
     private func switchFeedback(on: Bool) {
         SwitchClick.play()
-        veil.removeAllAnimations()
-        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let animation = CAKeyframeAnimation(keyPath: "opacity")
-        if on && !reduceMotion {
-            // Starter flicker: dark, two short flashes, a weak glow that wavers, then full.
-            animation.values = [0.9, 0.9, 0.35, 0.9, 0.9, 0.15, 0.85, 0.85, 0.4, 0.5, 0.25, 0.32, 0.0]
-            animation.keyTimes = [0, 0.10, 0.14, 0.20, 0.33, 0.38, 0.44, 0.52, 0.58, 0.66, 0.74, 0.82, 1]
-            animation.duration = 1.0
-        } else if on {
-            animation.values = [0.9, 0.0]
-            animation.duration = 0.35
-        } else {
-            // Off: the light dies away over a moment instead of cutting out.
-            let fade = CATransition()
-            fade.type = .fade
-            fade.duration = reduceMotion ? 0.1 : 0.35
-            emitter.add(fade, forKey: "switch")
-            return
-        }
-        animation.isRemovedOnCompletion = true
-        veil.opacity = 0
-        veil.add(animation, forKey: "switch")
+        emitter.removeAnimation(forKey: "switch")
+        guard !on else { return }
+        let fade = CATransition()
+        fade.type = .fade
+        fade.duration = Self.switchOffDuration
+        emitter.add(fade, forKey: "switch")
     }
 
     private func updateForDisplay() {
@@ -433,7 +427,10 @@ private final class DiffuserEmission: NSView {
            let peak = Self.peak(potential: screen.maximumPotentialExtendedDynamicRangeColorComponentValue) {
             mode = .high(peak)
         }
-        guard mode != renderedMode else { return }
+        if mode == renderedMode {
+            updateFilmMode(for: mode)
+            return
+        }
         var image = isEnabled ? Self.litImage : Self.offImage
         if #available(macOS 26.0, *), case .high(let peak) = mode {
             if let highImage = Self.image(peak: peak) {
@@ -455,7 +452,28 @@ private final class DiffuserEmission: NSView {
         }
         renderedMode = mode
         modeChanged?(mode)
+        updateFilmMode(for: mode)
         CATransaction.commit()
+    }
+
+    private func updateFilmMode(for lamp: Mode) {
+        let film: Mode
+        if case .high = lamp, let screen = window?.screen {
+            film = Self.filmMode(available: screen.maximumExtendedDynamicRangeColorComponentValue)
+        } else {
+            film = lamp
+        }
+        guard film != renderedFilmMode else { return }
+        renderedFilmMode = film
+        filmModeChanged?(film)
+    }
+
+    static func filmMode(available: CGFloat) -> Mode {
+        // The light table has its own sustained brightness. Photo highlights can use
+        // the full current display headroom, rounded down to avoid exceeding it.
+        guard available.isFinite, available > 1 else { return .standard }
+        let rounded = (available * 100).rounded(.down) / 100
+        return rounded > 1 ? .high(rounded) : .standard
     }
 
     /// [Claude 2026-11-08] The lamp runs at the brightest the panel holds over a large area.
@@ -524,6 +542,48 @@ private final class DiffuserEmission: NSView {
         return CGImage(headroom: Float(peak), width: width, height: height, bitsPerComponent: 16,
                        bitsPerPixel: 64, bytesPerRow: width * 8, space: colorSpace, bitmapInfo: format,
                        provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+    }
+}
+
+/// One shutter above the lamp and every film surface keeps their ignition pulses in phase.
+private final class LampIgnitionShade: NSView {
+    private let veil = CALayer()
+
+    init() {
+        super.init(frame: .zero)
+        veil.backgroundColor = NSColor.black.cgColor
+        veil.cornerRadius = 5
+        veil.opacity = 0
+        layer = veil
+        wantsLayer = true
+        setAccessibilityElement(false)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func setPowered(_ powered: Bool) {
+        let opacity = veil.presentation()?.opacity ?? veil.opacity
+        veil.removeAnimation(forKey: "switch")
+        if powered {
+            let flicker = CAKeyframeAnimation(keyPath: "opacity")
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                flicker.values = [0.9, 0.0]
+                flicker.duration = 0.35
+            } else {
+                flicker.values = [0.9, 0.9, 0.35, 0.9, 0.9, 0.15, 0.85, 0.85, 0.4, 0.5, 0.25, 0.32, 0.0]
+                flicker.keyTimes = [0, 0.10, 0.14, 0.20, 0.33, 0.38, 0.44, 0.52, 0.58, 0.66, 0.74, 0.82, 1]
+                flicker.duration = 1.0
+            }
+            veil.add(flicker, forKey: "switch")
+        } else if opacity > 0 {
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = opacity
+            fade.toValue = 0
+            fade.duration = DiffuserEmission.switchOffDuration
+            veil.add(fade, forKey: "switch")
+        }
     }
 }
 
@@ -773,15 +833,57 @@ private final class CandidateTray: LampLitSurface {
     }
 }
 
+private enum FilmOrientationAction: Int {
+    case rotateLeft, rotateRight, flipHorizontal, flipVertical
+
+    var turn: Int {
+        switch self {
+        case .rotateLeft: return -1
+        case .rotateRight: return 1
+        default: return 0
+        }
+    }
+}
+
+private struct FilmOrientation {
+    private(set) var quarterTurns = 0
+    private(set) var scaleX: CGFloat = 1
+    private(set) var scaleY: CGFloat = 1
+    var swapsAxes: Bool { quarterTurns % 2 != 0 }
+
+    mutating func apply(_ action: FilmOrientationAction) {
+        switch action {
+        case .rotateLeft, .rotateRight:
+            quarterTurns = (quarterTurns + action.turn + 4) % 4
+        case .flipHorizontal:
+            if swapsAxes { scaleY *= -1 } else { scaleX *= -1 }
+        case .flipVertical:
+            if swapsAxes { scaleX *= -1 } else { scaleY *= -1 }
+        }
+    }
+
+    var sourceToDisplay: CGAffineTransform {
+        CGAffineTransform(translationX: -0.5, y: -0.5)
+            .concatenating(CGAffineTransform(scaleX: scaleX, y: scaleY))
+            .concatenating(CGAffineTransform(rotationAngle: CGFloat(quarterTurns) * .pi / 2))
+            .concatenating(CGAffineTransform(translationX: 0.5, y: 0.5))
+    }
+}
+
 private final class LightTable: NSView {
+    private let singleFrame: Bool
+    private let viewingRepair: Bool
     private let lowerRailHeight: CGFloat = 50
     private let emission = DiffuserEmission()
+    private let ignitionShade = LampIgnitionShade()
     private let power = DiffuserSwitch(enabled: false)
+    private let loupe: FilmLoupe?
     private let scroll = NSScrollView()
     private let document = LightTableDocument()
     private let tray = CandidateTray()
     private let flightOverlay = FilmFlightOverlay()
     private let empty = NSTextField(labelWithString: L10n.surface("尚未载入照片"))
+    private var singleCard: FrameButton?
     private var pages: [ArchivalSleeve] = []
     private var orderedIDs: [UUID] = []
     private var cells: [UUID: FrameButton] = [:]
@@ -789,6 +891,8 @@ private final class LightTable: NSView {
     private var flights: [UUID: FrameButton] = [:]
     private var visibleCells: [FrameButton] = []
     private var backlight = DiffuserEmission.Mode.off
+    private var filmBacklight = DiffuserEmission.Mode.off
+    private var filmLightAdjustment = FilmLightAdjustment.defaultValue
     private var placingPages = false
     private var updatingFrames = false
     private let thumbnails = NSCache<NSURL, NSImage>()
@@ -801,15 +905,45 @@ private final class LightTable: NSView {
     }()
     private var pending: Set<URL> = []
     private var unreadable: Set<URL> = []
+    private var repairAnimationID: UUID?
+    private var pendingRepairOrientations: [FilmOrientationAction] = []
     var onSelect: ((UUID) -> Void)?
+    var onRepairedGeometryChange: (() -> Void)?
+    var onLampPowerChange: ((Bool) -> Void)?
+    var onFilmHeadroomChange: (() -> Void)?
 
-    init() {
+    var filmHeadroom: Float {
+        if case .high(let peak) = filmBacklight { return Float(peak) }
+        return 1
+    }
+
+    init(singleFrame: Bool, viewingRepair: Bool = false) {
+        self.singleFrame = singleFrame
+        self.viewingRepair = viewingRepair
+        loupe = viewingRepair ? FilmLoupe() : nil
         super.init(frame: .zero)
         wantsLayer = true
         addSubview(emission)
         addSubview(scroll)
         addSubview(flightOverlay)
+        addSubview(ignitionShade)
         addSubview(power)
+        if let loupe {
+            addSubview(loupe, positioned: .below, relativeTo: ignitionShade)
+            loupe.sourceToBoard = { [weak self] in
+                guard let self,
+                      let topLeft = repairedDisplayPoint(for: .zero, in: self),
+                      let topRight = repairedDisplayPoint(for: CGPoint(x: 1, y: 0), in: self),
+                      let bottomLeft = repairedDisplayPoint(for: CGPoint(x: 0, y: 1), in: self) else { return nil }
+                return CGAffineTransform(a: topRight.x - topLeft.x, b: topRight.y - topLeft.y,
+                                         c: bottomLeft.x - topLeft.x, d: bottomLeft.y - topLeft.y,
+                                         tx: topLeft.x, ty: topLeft.y)
+            }
+            loupe.thumbnail = { [weak self] in
+                self?.singleCard?.loupeRaster
+            }
+            onRepairedGeometryChange = { [weak loupe] in loupe?.geometryChanged() }
+        }
         scroll.documentView = document
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
@@ -836,7 +970,23 @@ private final class LightTable: NSView {
             tray.backlight = mode
             for page in pages { page.backlight = mode }
         }
-        power.changed = { [weak emission] enabled in emission?.isEnabled = enabled }
+        emission.filmModeChanged = { [weak self] mode in
+            guard let self else { return }
+            filmBacklight = mode
+            for cell in visibleCells { cell.setBacklight(mode) }
+            for flight in flights.values { flight.setBacklight(mode) }
+            updateLoupeLighting()
+            onFilmHeadroomChange?()
+        }
+        power.changed = { [weak self] enabled in
+            guard let self else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            emission.isEnabled = enabled
+            ignitionShade.setPowered(enabled)
+            CATransaction.commit()
+            onLampPowerChange?(enabled)
+        }
     }
 
     required init?(coder: NSCoder) { nil }
@@ -845,7 +995,34 @@ private final class LightTable: NSView {
         for cell in visibleCells { cell.setHovered(false, animated: false) }
     }
 
+    func setFilmLightAdjustment(_ adjustment: FilmLightAdjustment) {
+        guard filmLightAdjustment != adjustment else { return }
+        filmLightAdjustment = adjustment
+        for cell in visibleCells { cell.setFilmLightAdjustment(adjustment) }
+        for flight in flights.values { flight.setFilmLightAdjustment(adjustment) }
+        updateLoupeLighting()
+    }
+
+    private func updateLoupeLighting() {
+        guard let loupe else { return }
+        let mode = filmBacklight
+        let adjustment = filmLightAdjustment
+        let isHDR: Bool
+        if case .high = mode { isHDR = true } else { isHDR = false }
+        if mode == .off {
+            loupe.setLighting(isHDR: false, renderer: nil)
+        } else {
+            loupe.setLighting(isHDR: isHDR) { source in
+                IlluminatedThumbnail.image(source, mode: mode, adjustment: adjustment, maximumDimension: 1280)
+            }
+        }
+    }
+
     func update(_ items: [BatchLightTableItem], isEnabled: Bool) {
+        if singleFrame {
+            updateSingleFrame(items.first)
+            return
+        }
         let ids = items.map(\.id)
         let rearranged = ids != orderedIDs
         let candidates = items.filter(\.selected).map(\.id)
@@ -922,6 +1099,70 @@ private final class LightTable: NSView {
         }
     }
 
+    private func updateSingleFrame(_ item: BatchLightTableItem?) {
+        loupe?.setArtwork(item?.artworkURL)
+        if let item, let card = singleCard, card.id == item.id {
+            card.update(item, number: 1)
+        } else {
+            repairAnimationID = nil
+            pendingRepairOrientations.removeAll()
+            singleCard?.removeFromSuperview()
+            singleCard = item.map { item in
+                let card = FrameButton(item: item, number: 1, selectable: false, viewingRepair: viewingRepair) {}
+                card.setFilmLightAdjustment(filmLightAdjustment)
+                card.setBacklight(filmBacklight)
+                document.addSubview(card)
+                return card
+            }
+        }
+        empty.isHidden = singleCard != nil
+        needsLayout = true
+        requestVisibleThumbnails()
+    }
+
+    private var settledRepairCard: FrameButton? {
+        guard viewingRepair, repairAnimationID == nil, let card = singleCard, !card.photoRect.isEmpty else { return nil }
+        return card
+    }
+
+    func repairedDisplayPoint(for sourcePoint: CGPoint, in view: NSView) -> CGPoint? {
+        guard let card = settledRepairCard, (0...1).contains(sourcePoint.x), (0...1).contains(sourcePoint.y) else { return nil }
+        let rect = card.photoRect
+        let display = sourcePoint.applying(card.orientation.sourceToDisplay)
+        return card.convert(CGPoint(x: rect.minX + rect.width * display.x,
+                                    y: card.isFlipped ? rect.minY + rect.height * display.y : rect.maxY - rect.height * display.y), to: view)
+    }
+
+    func changeRepairOrientation(_ action: FilmOrientationAction) {
+        if repairAnimationID != nil {
+            pendingRepairOrientations.append(action)
+            return
+        }
+        layoutSubtreeIfNeeded()
+        guard let card = settledRepairCard else { return }
+        let previous = card.orientation
+        let previousRect = card.convert(card.photoRect, to: self)
+        let animated = window?.isVisible == true && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let id = UUID()
+        if animated {
+            repairAnimationID = id
+            onRepairedGeometryChange?()
+        }
+        card.orientation.apply(action)
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+        if animated {
+            card.animateOrientation(from: previous, previousRect: previousRect, in: self, turn: action.turn) { [weak self] in
+                guard let self, repairAnimationID == id else { return }
+                repairAnimationID = nil
+                if pendingRepairOrientations.isEmpty { onRepairedGeometryChange?() }
+                else { changeRepairOrientation(pendingRepairOrientations.removeFirst()) }
+            }
+        } else {
+            onRepairedGeometryChange?()
+        }
+    }
+
     private func animate(_ card: FrameButton, from origin: NSPoint, item: BatchLightTableItem, number: Int) {
         let destination = card.center(in: flightOverlay)
         guard let size = archiveSlots[card.id]?.cardSize, size.width > 0, size.height > 0,
@@ -967,24 +1208,38 @@ private final class LightTable: NSView {
 
     private func requestVisibleThumbnails() {
         guard !placingPages, !updatingFrames else { return }
-        let viewport = scroll.contentView.bounds
-        let preload = viewport.insetBy(dx: 0, dy: -min(110, viewport.height * 0.25))
-        let visiblePages = pages.filter { $0.frame.intersects(preload) }
-        let sleeveCells = visiblePages.flatMap(\.frames).filter { tray.slot(for: $0.id) == nil }
-        let candidateCells = tray.visibleIDs(in: preload).compactMap { cells[$0] }
-        let newCells = sleeveCells + candidateCells
+        let newCells: [FrameButton]
+        if singleFrame {
+            newCells = [singleCard].compactMap { $0 }
+        } else {
+            let viewport = scroll.contentView.bounds
+            let preload = viewport.insetBy(dx: 0, dy: -min(110, viewport.height * 0.25))
+            let visiblePages = pages.filter { $0.frame.intersects(preload) }
+            let sleeveCells = visiblePages.flatMap(\.frames).filter { tray.slot(for: $0.id) == nil }
+            let candidateCells = tray.visibleIDs(in: preload).compactMap { cells[$0] }
+            newCells = sleeveCells + candidateCells
+        }
         let ids = Set(newCells.map(\.id))
         for cell in visibleCells where !ids.contains(cell.id) { cell.setThumbnail(nil) }
         visibleCells = newCells
+        for cell in visibleCells {
+            cell.setFilmLightAdjustment(filmLightAdjustment)
+            cell.setBacklight(filmBacklight)
+        }
         for cell in visibleCells where cell.thumbnail == nil {
-            let url = cell.url
+            let url = cell.artworkURL
             if let image = thumbnails.object(forKey: url as NSURL) {
                 cell.setThumbnail(image)
+                if singleFrame {
+                    needsLayout = true
+                    loupe?.refreshRaster()
+                }
             } else if unreadable.contains(url) {
                 cell.setUnavailable()
             } else if pending.count < 2, pending.insert(url).inserted {
+                let maxPixelSize = singleFrame ? 1600 : 360
                 thumbnailQueue.addOperation { [weak self] in
-                    let thumbnail = autoreleasepool { Self.thumbnail(at: url) }
+                    let thumbnail = autoreleasepool { Self.thumbnail(at: url, maxPixelSize: maxPixelSize) }
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
                         pending.remove(url)
@@ -1003,13 +1258,13 @@ private final class LightTable: NSView {
         }
     }
 
-    private static func thumbnail(at url: URL) -> CGImage? {
+    private static func thumbnail(at url: URL, maxPixelSize: Int) -> CGImage? {
         let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 360,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
             kCGImageSourceShouldCacheImmediately: true
         ]
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
@@ -1027,13 +1282,33 @@ private final class LightTable: NSView {
         defer {
             placingPages = false
             requestVisibleThumbnails()
+            if viewingRepair { onRepairedGeometryChange?() }
         }
         let aperture = bed.insetBy(dx: 2, dy: 2)
         emission.setApertureFrame(aperture)
         flightOverlay.frame = aperture
+        ignitionShade.frame = aperture
         scroll.frame = aperture
-        var previousOffset = scroll.contentView.bounds.origin
         let viewport = scroll.contentSize
+        if singleFrame {
+            document.frame = NSRect(origin: .zero, size: viewport)
+            if let card = singleCard {
+                card.frame = card.singleFrameRect(in: viewport)
+                card.needsLayout = true
+            }
+        } else {
+            arrangeArchive(in: viewport)
+        }
+        empty.frame = NSRect(x: 0, y: (viewport.height - 20) / 2, width: viewport.width, height: 20)
+        let switchSize = NSSize(width: 78, height: 35)
+        power.frame = NSRect(x: bed.maxX - switchSize.width,
+                             y: bed.minY - (lowerRailHeight + switchSize.height) / 2,
+                             width: switchSize.width, height: switchSize.height)
+        loupe?.placeDock(in: aperture)
+    }
+
+    private func arrangeArchive(in viewport: NSSize) {
+        var previousOffset = scroll.contentView.bounds.origin
         let pageWidth = viewport.width * 0.78
         let side = (viewport.width - pageWidth) / 2
         let stripHeight = max(74, (viewport.height * 0.76 - 57) / 2)
@@ -1061,16 +1336,11 @@ private final class LightTable: NSView {
         if pages.count == 1, let page = pages.first {
             page.frame.origin.y = max(archiveTop, (contentHeight - page.frame.height + tray.frame.maxY) / 2)
         }
-        empty.frame = NSRect(x: 0, y: (viewport.height - 20) / 2, width: viewport.width, height: 20)
         let restored = NSPoint(x: 0, y: min(max(0, previousOffset.y), max(0, contentHeight - viewport.height)))
         if scroll.contentView.bounds.origin != restored {
             scroll.contentView.scroll(to: restored)
             scroll.reflectScrolledClipView(scroll.contentView)
         }
-        let switchSize = NSSize(width: 78, height: 35)
-        power.frame = NSRect(x: bed.maxX - switchSize.width,
-                             y: bed.minY - (lowerRailHeight + switchSize.height) / 2,
-                             width: switchSize.width, height: switchSize.height)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1083,7 +1353,7 @@ private final class LightTable: NSView {
         let chamfer = rounded(caseRect.insetBy(dx: 3, dy: 3), 13)
         shade(chamfer, from: neutral(0.185), to: neutral(0.105))
         drawBezelFinish(chamfer)
-        stroke(chamfer, neutral(1, 0.17), width: 0.8)
+        stroke(chamfer, neutral(1, 0.12), width: 0.8)
 
         fill(rounded(bed.insetBy(dx: -2, dy: -2), 9), neutral(0.045))
         let gasket = rounded(bed, 7)
@@ -1100,22 +1370,7 @@ private final class LightTable: NSView {
         bezel.append(shell)
         bezel.append(rounded(bed.insetBy(dx: -2, dy: -2), 9))
         bezel.windingRule = .evenOdd
-        NSGraphicsContext.saveGraphicsState()
-        bezel.addClip()
-        NSGradient(colors: [neutral(1, 0.09), neutral(1, 0.018), neutral(0, 0.15)])?
-            .draw(in: bezel.bounds, angle: 145)
-        let grain = NSBezierPath()
-        let box = bezel.bounds
-        for index in 1..<Int(box.height) {
-            let y = box.minY + CGFloat(index) + (index.isMultiple(of: 2) ? 0.25 : 0)
-            let offset = CGFloat((index * 17) % 101)
-            for start in stride(from: box.minX + offset - 100, to: box.maxX, by: 147) {
-                grain.move(to: NSPoint(x: start, y: y))
-                grain.line(to: NSPoint(x: start + CGFloat(22 + (index * 31) % 80), y: y))
-            }
-        }
-        stroke(grain, neutral(1, 0.055), width: 0.34)
-        NSGraphicsContext.restoreGraphicsState()
+        Frost.texture(bezel, seed: 137, grainDepth: 0.23, mottleDepth: 0.025)
     }
 
     private func drawRulers(along bed: NSRect) {
@@ -1155,7 +1410,6 @@ private final class ArchivalSleeve: LampLitSurface {
     override var lampDensity: Float { 0.85 }
 
     override func backlightDidChange() {
-        for frame in frames { frame.setBacklight(backlight) }
         for slot in slots { slot.setBacklight(backlight) }
     }
 
@@ -1369,42 +1623,155 @@ private final class FilmStripSlot: NSView {
     }
 }
 
+struct FilmLightAdjustment: Equatable, Sendable {
+    // Approved on the light table at 3 EV of display headroom.
+    static let defaultValue = FilmLightAdjustment(brightness: 47, shadows: -50, gamma: -31, exposure: 221)
+    static let exposureLimit = 800
+
+    let brightness: Int
+    let shadows: Int
+    let gamma: Int
+    let exposure: Int
+
+    init(brightness: Int, shadows: Int, gamma: Int = 0, exposure: Int = 0) {
+        self.brightness = max(0, min(100, brightness))
+        self.shadows = max(-50, min(50, shadows))
+        self.gamma = max(-100, min(100, gamma))
+        self.exposure = max(-Self.exposureLimit, min(Self.exposureLimit, exposure))
+    }
+
+    fileprivate var gammaValue: Float { pow(2, Float(gamma) / 100) }
+    fileprivate var exposureEV: Float { Float(exposure) / 100 }
+
+    fileprivate func highlightHeadroom(available: Float) -> Float {
+        pow(available, Float(brightness) / 100)
+    }
+}
+
 private final class IlluminatedThumbnail: NSView {
     private let surface = CALayer()
-    private var cache: (mode: DiffuserEmission.Mode, image: CGImage)?
+    private let poseLayer: CALayer?
+    private let originalLayer: CALayer?
+    private var cache: (mode: DiffuserEmission.Mode, adjustment: FilmLightAdjustment, image: CGImage)?
+    private var offFade: UUID?
 
-    init() {
+    init(viewingRepair: Bool = false) {
+        poseLayer = viewingRepair ? CALayer() : nil
+        originalLayer = viewingRepair ? CALayer() : nil
         super.init(frame: .zero)
-        layer = surface
+        if let poseLayer, let originalLayer {
+            let host = CALayer()
+            host.addSublayer(poseLayer)
+            poseLayer.addSublayer(originalLayer)
+            poseLayer.addSublayer(surface)
+            surface.isHidden = true
+            layer = host
+        } else {
+            layer = surface
+            isHidden = true
+        }
         wantsLayer = true
-        isHidden = true
     }
 
     required init?(coder: NSCoder) { nil }
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
+    var presentedImage: CGImage? {
+        guard !surface.isHidden, surface.opacity > 0, surface.contents != nil else { return nil }
+        return cache?.image
+    }
+
     func clearCache() { cache = nil }
+
+    func setOriginal(_ thumbnail: NSImage?) {
+        guard let originalLayer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        originalLayer.contents = thumbnail?.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        CATransaction.commit()
+    }
+
+    func position(_ orientation: FilmOrientation, in rect: NSRect) {
+        guard let poseLayer, let originalLayer else { return }
+        let size = orientation.swapsAxes ? CGSize(width: rect.height, height: rect.width) : rect.size
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        poseLayer.bounds = CGRect(origin: .zero, size: size)
+        poseLayer.position = CGPoint(x: rect.midX, y: rect.midY)
+        poseLayer.transform = Self.transform(angle: -CGFloat(orientation.quarterTurns) * .pi / 2,
+                                              x: orientation.scaleX, y: orientation.scaleY)
+        originalLayer.frame = poseLayer.bounds
+        surface.frame = poseLayer.bounds
+        CATransaction.commit()
+    }
+
+    func animateOrientation(from previous: FilmOrientation, to orientation: FilmOrientation,
+                            previousRect: NSRect, turn: Int, completion: @escaping () -> Void) {
+        guard let poseLayer, poseLayer.bounds.width > 0 else { completion(); return }
+        let startAngle = -CGFloat(previous.quarterTurns) * .pi / 2
+        let angleChange = -CGFloat(turn) * .pi / 2
+        let previousWidth = previous.swapsAxes ? previousRect.height : previousRect.width
+        let startScale = previousWidth / poseLayer.bounds.width
+        let duration = turn == 0 ? 0.23 : 0.26
+        let transform = CAKeyframeAnimation(keyPath: "transform")
+        transform.duration = duration
+        transform.values = (0...16).map { step in
+            let t = CGFloat(step) / 16
+            let sizeScale = startScale + (1 - startScale) * t
+            let flipScale = cos(.pi * t)
+            let x = previous.scaleX == orientation.scaleX ? previous.scaleX : previous.scaleX * flipScale
+            let y = previous.scaleY == orientation.scaleY ? previous.scaleY : previous.scaleY * flipScale
+            return NSValue(caTransform3D: Self.transform(angle: startAngle + angleChange * t,
+                                                        x: x * sizeScale, y: y * sizeScale))
+        }
+        let move = CABasicAnimation(keyPath: "position")
+        move.duration = duration
+        move.fromValue = NSValue(point: NSPoint(x: previousRect.midX, y: previousRect.midY))
+        move.toValue = NSValue(point: poseLayer.position)
+        let animation = CAAnimationGroup()
+        animation.animations = [transform, move]
+        animation.duration = duration
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        CATransaction.begin()
+        CATransaction.setCompletionBlock(completion)
+        poseLayer.add(animation, forKey: "film-orientation")
+        CATransaction.commit()
+    }
+
+    private static func transform(angle: CGFloat, x: CGFloat, y: CGFloat) -> CATransform3D {
+        CATransform3DScale(CATransform3DMakeRotation(angle, 0, 0, 1), x, y, 1)
+    }
 
     func copyPresentation(from source: IlluminatedThumbnail) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         surface.contents = source.surface.contents
+        surface.opacity = source.surface.opacity
         if #available(macOS 26.0, *) { surface.preferredDynamicRange = source.surface.preferredDynamicRange }
-        isHidden = source.isHidden
+        isHidden = source.isHidden || source.surface.opacity == 0
         CATransaction.commit()
     }
 
-    func present(_ mode: DiffuserEmission.Mode, thumbnail: NSImage?) {
+    func present(_ mode: DiffuserEmission.Mode, thumbnail: NSImage?, adjustment: FilmLightAdjustment = .defaultValue) {
+        if mode == .off, thumbnail != nil, !isHidden, !surface.isHidden, surface.opacity > 0, window?.isVisible == true {
+            fadeToUnlit()
+            return
+        }
         var image: CGImage?
         if mode != .off {
-            if cache?.mode != mode, let thumbnail, let illuminated = Self.image(thumbnail, mode: mode) {
-                cache = (mode, illuminated)
+            if cache?.mode == mode, cache?.adjustment == adjustment {
+                image = cache?.image
+            } else if let thumbnail, let illuminated = Self.image(thumbnail, mode: mode, adjustment: adjustment) {
+                cache = (mode, adjustment, illuminated)
+                image = illuminated
             }
-            if cache?.mode == mode { image = cache?.image }
         }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        offFade = nil
+        surface.removeAnimation(forKey: "lamp-off")
+        surface.opacity = 1
         surface.contents = image
         if #available(macOS 26.0, *) {
             if image != nil, case .high = mode {
@@ -1413,18 +1780,46 @@ private final class IlluminatedThumbnail: NSView {
                 surface.preferredDynamicRange = .standard
             }
         }
-        isHidden = image == nil
+        if poseLayer == nil { isHidden = image == nil }
+        else { surface.isHidden = image == nil }
         CATransaction.commit()
     }
 
-    /// Share of the lamp passed by clear film base (tune here if frames look too bright).
-    static let filmBaseTransmission: Float = 0.8
+    private func fadeToUnlit() {
+        let id = UUID()
+        offFade = id
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = surface.presentation()?.opacity ?? surface.opacity
+        fade.toValue = 0
+        fade.duration = DiffuserEmission.switchOffDuration
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock { [weak self] in
+            guard let self, offFade == id else { return }
+            present(.off, thumbnail: nil)
+        }
+        surface.opacity = 0
+        surface.add(fade, forKey: "lamp-off")
+        CATransaction.commit()
+    }
 
-    static func image(_ thumbnail: NSImage, mode: DiffuserEmission.Mode) -> CGImage? {
-        guard let source = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil),
-              let colorSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB) else { return nil }
-        let width = source.width
-        let height = source.height
+    private nonisolated static func representableHeadroom(_ value: Float) -> Float {
+        let half = Float16(value)
+        return Float(Float(half) > value ? half.nextDown : half)
+    }
+
+    static func image(_ thumbnail: NSImage, mode: DiffuserEmission.Mode, adjustment: FilmLightAdjustment) -> CGImage? {
+        guard let source = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        return image(source, mode: mode, adjustment: adjustment)
+    }
+
+    nonisolated static func image(_ source: CGImage, mode: DiffuserEmission.Mode, adjustment: FilmLightAdjustment,
+                                  maximumDimension: Int? = nil) -> CGImage? {
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3) else { return nil }
+        let largest = max(source.width, source.height)
+        let ratio = maximumDimension.map { Double(min(largest, max(1, $0))) / Double(largest) } ?? 1
+        let width = max(1, Int((Double(source.width) * ratio).rounded()))
+        let height = max(1, Int((Double(source.height) * ratio).rounded()))
         var linear = [Float](repeating: 0, count: width * height * 4)
         let floatFormat = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue).union(.floatComponents)
         let didDraw = linear.withUnsafeMutableBytes { pixels in
@@ -1437,32 +1832,57 @@ private final class IlluminatedThumbnail: NSView {
         }
         guard didDraw else { return nil }
 
-        let headroom: Float
-        let gain: Float
-        let ceiling: Float
-        if case .high(let peak) = mode {
-            // [Claude 2026-11-07] A frame on a light box is the lamp seen through the film:
-            // clear base passes about 80 % of it, so the highlights sit just under the
-            // diffuser instead of at a fixed SDR multiple far below it.
-            headroom = Float(peak)
-            gain = Self.filmBaseTransmission * headroom
-            ceiling = gain
-        } else {
-            headroom = 1
-            gain = 1.44
-            ceiling = 0.98
-        }
-        let shoulder = max(0, gain / ceiling - 1)
+        // Keep a narrow shoulder above SDR white for channels outside the display gamut.
+        let available: Float
+        if case .high(let peak) = mode { available = Float(peak) }
+        else { available = 1 }
+        let headroom = representableHeadroom(adjustment.highlightHeadroom(available: available))
+        let shadowEnd: Float = 0.20
+        let highlightStart: Float = 0.60
+        let midrange = highlightStart - shadowEnd
+        let upperRange = 1 - highlightStart
+        let white = headroom - 0.02
+        let whiteGain = white - 1
+        let whiteSlope = 1 + 2 * whiteGain / upperRange
+        let shoulder = headroom - white
+        let shadowGain = 0.78 * Float(adjustment.shadows) / 50
+        let gammaExponent = 1 / adjustment.gammaValue
+        let exposureGain = pow(2, adjustment.exposureEV)
+        let exposureShoulder = max(0, exposureGain - 1) / representableHeadroom(available)
         var pixels = [Float16](repeating: 0, count: linear.count)
         var imagePeak: Float = 1
         for offset in stride(from: 0, to: linear.count, by: 4) {
             let alpha = linear[offset + 3]
+            guard alpha > 0 else { continue }
             let highest = max(0, linear[offset], linear[offset + 1], linear[offset + 2])
-            // All three linear channels share a scale to preserve the film's colors.
-            let scale = alpha > 0 ? gain / (1 + shoulder * highest / alpha) : 0
-            pixels[offset] = Float16(linear[offset] * scale)
-            pixels[offset + 1] = Float16(linear[offset + 1] * scale)
-            pixels[offset + 2] = Float16(linear[offset + 2] * scale)
+            let signal = highest / alpha
+            // One scale keeps the three linear channels in proportion.
+            let scale: Float
+            if signal <= shadowEnd {
+                let weight = 1 - signal / shadowEnd
+                scale = 1 + shadowGain * weight * weight
+            } else if signal < highlightStart {
+                if adjustment.gamma == 0 {
+                    scale = 1
+                } else {
+                    let t = (signal - shadowEnd) / midrange
+                    // Fade the gamma correction into both boundaries with matching slopes.
+                    let weight = 4 * t * (1 - t)
+                    scale = 1 + midrange * weight * (pow(t, gammaExponent) - t) / signal
+                }
+            } else if signal <= 1 {
+                let t = (signal - highlightStart) / upperRange
+                scale = 1 + whiteGain * t * t / signal
+            } else {
+                // Match the slope at reference white, then approach the cap without a hard clip.
+                let delta = (signal - 1) * whiteSlope
+                scale = (white + shoulder * (delta / (shoulder + delta))) / signal
+            }
+            // Apply global gain after the local adjustments. Positive gain rolls into display white.
+            let exposedScale = scale * exposureGain / (1 + exposureShoulder * signal * scale)
+            pixels[offset] = Float16(linear[offset] * exposedScale)
+            pixels[offset + 1] = Float16(linear[offset + 1] * exposedScale)
+            pixels[offset + 2] = Float16(linear[offset + 2] * exposedScale)
             pixels[offset + 3] = Float16(alpha)
             imagePeak = max(imagePeak, Float(pixels[offset]), Float(pixels[offset + 1]), Float(pixels[offset + 2]))
         }
@@ -1470,8 +1890,7 @@ private final class IlluminatedThumbnail: NSView {
         guard let provider = CGDataProvider(data: data as CFData) else { return nil }
         let format = floatFormat.union(.byteOrder16Little)
         if #available(macOS 26.0, *), case .high = mode {
-            // Tag the frame with the lamp's headroom so both are tone mapped alike.
-            return CGImage(headroom: max(imagePeak, headroom), width: width, height: height, bitsPerComponent: 16,
+            return CGImage(headroom: imagePeak, width: width, height: height, bitsPerComponent: 16,
                            bitsPerPixel: 64, bytesPerRow: width * 8, space: colorSpace, bitmapInfo: format,
                            provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
         }
@@ -1482,36 +1901,51 @@ private final class IlluminatedThumbnail: NSView {
 }
 
 private final class FrameButton: NSButton {
-    private let illuminated = IlluminatedThumbnail()
+    private let illuminated: IlluminatedThumbnail
+    private let viewingRepair: Bool
+    var orientation = FilmOrientation()
     private var hoverArea: NSTrackingArea?
     private var isHovered = false
     private var hoverLayoutSize = NSSize.zero
     let id: UUID
-    private(set) var url: URL
+    private(set) var artworkURL: URL
     private(set) var thumbnail: NSImage?
+    var loupeRaster: CGImage? {
+        if backlight != .off, let litImage = illuminated.presentedImage { return litImage }
+        return thumbnail?.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    }
+    private var displayName = ""
     private var number = ""
     private var status = ""
     private var selected = false
     private var unavailable = false
     private var backlight = DiffuserEmission.Mode.off
+    private var filmLightAdjustment = FilmLightAdjustment.defaultValue
+    private let selectable: Bool
     private let handler: () -> Void
 
-    init(item: BatchLightTableItem, number: Int, action: @escaping () -> Void) {
+    init(item: BatchLightTableItem, number: Int, selectable: Bool = true, viewingRepair: Bool = false,
+         action: @escaping () -> Void) {
         id = item.id
-        url = item.url
+        artworkURL = item.artworkURL
+        self.selectable = selectable
+        self.viewingRepair = viewingRepair
+        illuminated = IlluminatedThumbnail(viewingRepair: viewingRepair)
         handler = action
         super.init(frame: .zero)
         target = self
         self.action = #selector(run)
         isBordered = false
         focusRingType = .exterior
-        setAccessibilityRole(.checkBox)
+        setAccessibilityRole(selectable ? .checkBox : .image)
         wantsLayer = true
         addSubview(illuminated)
-        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
-                                      owner: self, userInfo: nil)
-        addTrackingArea(tracking)
-        hoverArea = tracking
+        if selectable {
+            let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                          owner: self, userInfo: nil)
+            addTrackingArea(tracking)
+            hoverArea = tracking
+        }
         update(item, number: number)
     }
 
@@ -1519,13 +1953,17 @@ private final class FrameButton: NSButton {
 
     @objc private func run() { handler() }
 
+    override var acceptsFirstResponder: Bool { selectable && super.acceptsFirstResponder }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { selectable ? super.hitTest(point) : nil }
+
     override func accessibilityPerformPress() -> Bool {
-        guard isEnabled else { return false }
+        guard selectable, isEnabled else { return false }
         performClick(nil)
         return true
     }
 
-    override func accessibilityValue() -> Any? { selected ? 1 : 0 }
+    override func accessibilityValue() -> Any? { selectable ? (selected ? 1 : 0) : nil }
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
@@ -1539,7 +1977,7 @@ private final class FrameButton: NSButton {
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        if isEnabled, !visibleRect.isEmpty { addCursorRect(visibleRect, cursor: .pointingHand) }
+        if selectable, isEnabled, !visibleRect.isEmpty { addCursorRect(visibleRect, cursor: .pointingHand) }
     }
 
     override func viewDidMoveToWindow() {
@@ -1577,20 +2015,27 @@ private final class FrameButton: NSButton {
 
     func update(_ item: BatchLightTableItem, number: Int) {
         let position = String(format: "%02d", number)
-        guard url != item.url || self.number != position || status != item.status || selected != item.selected else { return }
-        if url != item.url {
-            url = item.url
+        let picked = selectable && item.selected
+        guard artworkURL != item.artworkURL || displayName != item.displayName ||
+              self.number != position || status != item.status || selected != picked else { return }
+        if artworkURL != item.artworkURL {
+            artworkURL = item.artworkURL
             unavailable = false
             setThumbnail(nil)
         }
+        displayName = item.displayName
         self.number = position
         status = item.status
-        let selectionChanged = selected != item.selected
-        selected = item.selected
-        let filename = item.url.lastPathComponent
-        setAccessibilityLabel(L10n.surface("第 \(position) 帧，\(filename)，\(item.status)"))
-        let action = selected ? L10n.surface("点击放回原位") : L10n.surface("点击移入候选区")
-        toolTip = "\(action) · \(filename)"
+        let selectionChanged = selected != picked
+        selected = picked
+        let filename = item.displayName
+        if selectable {
+            setAccessibilityLabel(L10n.surface("第 \(position) 帧，\(filename)，\(item.status)"))
+            let action = selected ? L10n.surface("点击放回原位") : L10n.surface("点击移入候选区")
+            toolTip = "\(action) · \(filename)"
+        } else {
+            setAccessibilityLabel(filename)
+        }
         needsDisplay = true
         if selectionChanged, window != nil {
             NSAccessibility.post(element: self, notification: .valueChanged)
@@ -1602,6 +2047,7 @@ private final class FrameButton: NSButton {
         thumbnail = image
         unavailable = false
         illuminated.clearCache()
+        illuminated.setOriginal(image)
         updatePhoto()
         needsDisplay = true
     }
@@ -1609,6 +2055,8 @@ private final class FrameButton: NSButton {
     func copyArtwork(from source: FrameButton) {
         thumbnail = source.thumbnail
         unavailable = source.unavailable
+        backlight = source.backlight
+        filmLightAdjustment = source.filmLightAdjustment
         illuminated.copyPresentation(from: source.illuminated)
         needsDisplay = true
     }
@@ -1625,18 +2073,42 @@ private final class FrameButton: NSButton {
         if thumbnail != nil { updatePhoto() }
     }
 
+    func setFilmLightAdjustment(_ adjustment: FilmLightAdjustment) {
+        guard adjustment != filmLightAdjustment else { return }
+        filmLightAdjustment = adjustment
+        if backlight != .off, thumbnail != nil {
+            illuminated.present(backlight, thumbnail: thumbnail, adjustment: adjustment)
+        }
+    }
+
     private func updatePhoto() {
-        illuminated.frame = photoRect
-        illuminated.present(backlight, thumbnail: thumbnail)
+        positionPhoto()
+        illuminated.present(backlight, thumbnail: thumbnail, adjustment: filmLightAdjustment)
+    }
+
+    private func positionPhoto() {
+        if viewingRepair {
+            illuminated.frame = cardCanvas
+            illuminated.position(orientation, in: illuminated.convert(photoRect, from: self))
+        } else {
+            illuminated.frame = photoRect
+        }
+    }
+
+    func animateOrientation(from previous: FilmOrientation, previousRect: NSRect, in view: NSView,
+                            turn: Int, completion: @escaping () -> Void) {
+        illuminated.animateOrientation(from: previous, to: orientation,
+                                       previousRect: illuminated.convert(previousRect, from: view),
+                                       turn: turn, completion: completion)
     }
 
     override func layout() {
         super.layout()
-        if hoverLayoutSize != frame.size {
+        if selectable, hoverLayoutSize != frame.size {
             hoverLayoutSize = frame.size
             updateCardScale(animated: false)
         }
-        illuminated.frame = photoRect
+        positionPhoto()
     }
 
     private var cardCanvas: NSRect { NSRect(origin: .zero, size: frame.size) }
@@ -1645,26 +2117,46 @@ private final class FrameButton: NSButton {
         convert(NSPoint(x: bounds.midX, y: bounds.midY), to: view)
     }
 
-    private var photoRect: NSRect {
+    func singleFrameRect(in viewport: NSSize) -> NSRect {
+        let margin = NSSize(width: 8, height: 19)
+        let available = NSSize(width: viewport.width * 0.80 - margin.width,
+                               height: viewport.height * 0.88 - margin.height)
+        guard available.width > 0, available.height > 0 else { return .zero }
+        let imageSize = displaySize(thumbnail?.size ?? NSSize(width: 3, height: 2))
+        let scale = min(available.width / imageSize.width, available.height / imageSize.height)
+        let size = NSSize(width: imageSize.width * scale + margin.width, height: imageSize.height * scale + margin.height)
+        return NSRect(x: (viewport.width - size.width) / 2, y: (viewport.height - size.height) / 2,
+                      width: size.width, height: size.height)
+    }
+
+    private func displaySize(_ size: NSSize) -> NSSize {
+        orientation.swapsAxes ? NSSize(width: size.height, height: size.width) : size
+    }
+
+    var photoRect: NSRect {
         let card = cardCanvas.insetBy(dx: 1, dy: 0.5)
         let available = card.insetBy(dx: 3, dy: 0)
         let maxHeight = available.height - 18
         guard let image = thumbnail, image.size.width > 0, image.size.height > 0,
               available.width > 0, maxHeight > 0 else { return .zero }
-        let scale = min(available.width / image.size.width, maxHeight / image.size.height)
-        let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+        let imageSize = displaySize(image.size)
+        let scale = min(available.width / imageSize.width, maxHeight / imageSize.height)
+        let size = NSSize(width: imageSize.width * scale, height: imageSize.height * scale)
         return NSRect(x: card.midX - size.width / 2, y: card.minY + 1 + (maxHeight - size.height) / 2,
                       width: size.width, height: size.height)
     }
 
     override func draw(_ dirtyRect: NSRect) {
         let card = cardCanvas.insetBy(dx: 1, dy: 0.5)
-        let shape = rounded(card, 2)
-        fill(shape, neutral(0.065))
         let area = photoRect
+        let drawsBacking = !viewingRepair || area.isEmpty
+        let shape = rounded(card, 2)
+        if drawsBacking { fill(shape, neutral(0.065)) }
         if let image = thumbnail, !area.isEmpty {
-            image.draw(in: area, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true,
-                       hints: [.interpolation: NSImageInterpolation.high])
+            if !viewingRepair {
+                image.draw(in: area, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true,
+                           hints: [.interpolation: NSImageInterpolation.high])
+            }
         } else {
             let placeholder = unavailable ? L10n.surface("无法预览") : L10n.surface("载入缩略图…")
             let style: [NSAttributedString.Key: Any] = [
@@ -1675,13 +2167,14 @@ private final class FrameButton: NSButton {
             text.draw(at: NSPoint(x: card.midX - size.width / 2, y: card.midY - size.height),
                       withAttributes: style)
         }
+        let captionColor = drawsBacking ? StudioStyle.secondaryText : neutral(0.22)
         let numberStyle: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold),
-                                                          .foregroundColor: selected ? StudioStyle.amber : StudioStyle.secondaryText]
+                                                          .foregroundColor: selected ? StudioStyle.amber : captionColor]
         let statusParagraph = NSMutableParagraphStyle()
         statusParagraph.alignment = .right
         statusParagraph.lineBreakMode = .byTruncatingTail
         let statusStyle: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9), .foregroundColor: StudioStyle.secondaryText,
+            .font: NSFont.systemFont(ofSize: 9), .foregroundColor: captionColor,
             .paragraphStyle: statusParagraph
         ]
         let labelY = card.maxY - 13
@@ -1690,27 +2183,64 @@ private final class FrameButton: NSButton {
         let statusX = card.minX + numberWidth + 13
         let statusRect = NSRect(x: statusX, y: labelY, width: max(0, card.maxX - statusX - 6), height: 12)
         (status as NSString).draw(in: statusRect, withAttributes: statusStyle)
-        let border = selected ? StudioStyle.amber : neutral(1, isHovered ? 0.48 : 0.12)
-        stroke(shape, border, width: selected || isHovered ? 1.5 : 0.5)
+        if drawsBacking {
+            let border = selected ? StudioStyle.amber : neutral(1, isHovered ? 0.48 : 0.12)
+            stroke(shape, border, width: selected || isHovered ? 1.5 : 0.5)
+        }
     }
 }
+
+#if PURENEG_TONE_CALIBRATION
+private final class ExposureSlider: NSSlider {
+    override func keyDown(with event: NSEvent) {
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        guard isEnabled, modifiers == .option, event.specialKey == .leftArrow || event.specialKey == .rightArrow else {
+            super.keyDown(with: event)
+            return
+        }
+        let delta = event.specialKey == .leftArrow ? -1 : 1
+        integerValue = max(Int(minValue), min(Int(maxValue), integerValue + delta))
+        _ = sendAction(action, to: target)
+    }
+}
+#endif
 
 final class BatchLightTableController: NSWindowController, NSWindowDelegate {
     var onSelect: ((UUID) -> Void)?
     var onNext: (() -> Void)?
     var onReturn: (() -> Void)?
 
-    private let board = LightTable()
+    private let singleFrame: Bool
+    private let viewingRepair: Bool
+    private let board: LightTable
+    #if PURENEG_TONE_CALIBRATION
+    private static let filmLightPreference = "settings.lightTableCalibration"
+    private let filmExposure = ExposureSlider(value: 0, minValue: -Double(FilmLightAdjustment.exposureLimit),
+                                              maxValue: Double(FilmLightAdjustment.exposureLimit), target: nil, action: nil)
+    private let filmBrightness = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
+    private let filmShadows = NSSlider(value: 0, minValue: -50, maxValue: 50, target: nil, action: nil)
+    private let filmGamma = NSSlider(value: 0, minValue: -100, maxValue: 100, target: nil, action: nil)
+    private let filmExposureValue = NSTextField(labelWithString: "")
+    private let filmBrightnessValue = NSTextField(labelWithString: "")
+    private let filmShadowsValue = NSTextField(labelWithString: "")
+    private let filmGammaValue = NSTextField(labelWithString: "")
+    private lazy var confirmFilmLight = NSButton(title: L10n.surface("确认"), target: self, action: #selector(saveFilmLightAdjustment))
+    private var filmLightPreviewQueued = false
+    #endif
     private let count = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
-    private lazy var next = PrimaryActionButton(title: L10n.surface("下一步"), target: self, action: #selector(advance))
+    private lazy var next = PrimaryActionButton(title: singleFrame ? L10n.text("检测并预览") : L10n.surface("下一步"),
+                                                target: self, action: #selector(advance))
 
-    init() {
+    init(singleFrame: Bool = false, viewingRepair: Bool = false) {
+        self.singleFrame = singleFrame || viewingRepair
+        self.viewingRepair = viewingRepair
+        board = LightTable(singleFrame: singleFrame || viewingRepair, viewingRepair: viewingRepair)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1110, height: 718),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
         super.init(window: window)
-        window.title = "PURE Neg · " + L10n.surface("全卷处理")
+        window.title = "PURE Neg · " + headingTitle
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.appearance = NSAppearance(named: .darkAqua)
@@ -1720,6 +2250,14 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
         build(window)
         window.center()
         board.onSelect = { [weak self] id in self?.onSelect?(id) }
+        #if PURENEG_TONE_CALIBRATION
+        board.onLampPowerChange = { [weak self] powered in self?.setFilmLightControlsEnabled(powered) }
+        board.onFilmHeadroomChange = { [weak self] in
+            guard let self else { return }
+            setFilmLightControlsEnabled(filmShadows.isEnabled)
+        }
+        restoreFilmLightAdjustment()
+        #endif
         update(items: [], status: "", busy: false)
     }
 
@@ -1727,22 +2265,31 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
 
     func cachedThumbnail(for url: URL) -> CGImage? { board.cachedThumbnail(for: url) }
 
-    func update(items: [BatchLightTableItem], status: String, busy: Bool) {
+    func update(items: [BatchLightTableItem], status: String, busy: Bool, canAdvance: Bool = true) {
         board.update(items, isEnabled: !busy)
         let pickedCount = items.filter(\.selected).count
-        count.stringValue = pickedCount > 0
-            ? L10n.surface("已选 \(pickedCount) / \(items.count) 帧")
-            : L10n.surface("共 \(items.count) 帧")
-        let scope = pickedCount > 0
-            ? L10n.surface("下一步处理所选 \(pickedCount) 帧。")
-            : L10n.surface("下一步处理全部 \(items.count) 帧。")
+        let scope: String
+        if singleFrame {
+            count.stringValue = ""
+            scope = items.first?.displayName ?? ""
+        } else {
+            count.stringValue = pickedCount > 0
+                ? L10n.surface("已选 \(pickedCount) / \(items.count) 帧")
+                : L10n.surface("共 \(items.count) 帧")
+            scope = pickedCount > 0
+                ? L10n.surface("下一步处理所选 \(pickedCount) 帧。")
+                : L10n.surface("下一步处理全部 \(items.count) 帧。")
+        }
         statusLabel.stringValue = status.isEmpty ? scope : status
         statusLabel.toolTip = statusLabel.stringValue
-        next.isEnabled = !busy && !items.isEmpty
+        next.isEnabled = canAdvance && !busy && !items.isEmpty
     }
 
     func present(from source: NSWindow? = nil) {
         guard let window else { return }
+        #if PURENEG_TONE_CALIBRATION
+        restoreFilmLightAdjustment()
+        #endif
         if let source { StudioStyle.expandWorkspaceWindow(window, from: source) }
         window.makeKeyAndOrderFront(nil)
     }
@@ -1758,18 +2305,161 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
     @objc private func advance() { onNext?() }
     @objc private func returnToSource() { onReturn?() }
 
+    #if PURENEG_TONE_CALIBRATION
+    private var filmLightDraft: FilmLightAdjustment {
+        FilmLightAdjustment(brightness: filmBrightness.integerValue, shadows: filmShadows.integerValue,
+                            gamma: filmGamma.integerValue, exposure: filmExposure.integerValue)
+    }
+
+    private func restoreFilmLightAdjustment() {
+        let saved = UserDefaults.standard.dictionary(forKey: Self.filmLightPreference)
+        let fallback = FilmLightAdjustment.defaultValue
+        let adjustment = saved.map {
+            FilmLightAdjustment(brightness: $0["brightness"] as? Int ?? fallback.brightness,
+                                shadows: $0["shadows"] as? Int ?? fallback.shadows,
+                                gamma: $0["gamma"] as? Int ?? 0,
+                                exposure: $0["exposure"] as? Int ?? 0)
+        } ?? fallback
+        filmExposure.integerValue = adjustment.exposure
+        filmBrightness.integerValue = adjustment.brightness
+        filmShadows.integerValue = adjustment.shadows
+        filmGamma.integerValue = adjustment.gamma
+        showFilmLightValues()
+        confirmFilmLight.title = L10n.surface("确认")
+        board.setFilmLightAdjustment(adjustment)
+    }
+
+    private func setFilmLightControlsEnabled(_ enabled: Bool) {
+        filmExposure.isEnabled = enabled
+        filmBrightness.isEnabled = enabled && board.filmHeadroom > 1
+        filmShadows.isEnabled = enabled
+        filmGamma.isEnabled = enabled
+        confirmFilmLight.isEnabled = enabled
+        showFilmLightValues()
+    }
+
+    private func showFilmLightValues() {
+        let adjustment = filmLightDraft
+        let available = board.filmHeadroom
+        let selected = adjustment.highlightHeadroom(available: available)
+        filmExposureValue.stringValue = String(format: "%+.2f EV", adjustment.exposureEV)
+        filmBrightnessValue.stringValue = filmShadows.isEnabled
+            ? String(format: "%+.2f / %+.2f EV", log2(selected), log2(available)) : "—"
+        let shadows = filmShadows.integerValue
+        filmShadowsValue.stringValue = shadows > 0 ? "+\(shadows)" : String(shadows)
+        filmGammaValue.stringValue = String(format: "%.2f", adjustment.gammaValue)
+    }
+
+    @objc private func changeFilmLightAdjustment() {
+        showFilmLightValues()
+        confirmFilmLight.title = L10n.surface("确认")
+        guard !filmLightPreviewQueued else { return }
+        filmLightPreviewQueued = true
+        // Coalesce dense trackpad events while keeping the latest adjustment visible.
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(30)) { [weak self] in
+            guard let self else { return }
+            filmLightPreviewQueued = false
+            board.setFilmLightAdjustment(filmLightDraft)
+        }
+    }
+
+    @objc private func saveFilmLightAdjustment() {
+        let adjustment = filmLightDraft
+        board.setFilmLightAdjustment(adjustment)
+        var record: [String: Any] = ["brightness": adjustment.brightness, "shadows": adjustment.shadows,
+                                     "gamma": adjustment.gamma, "gammaValue": Double(adjustment.gammaValue),
+                                     "exposure": adjustment.exposure, "exposureEV": Double(adjustment.exposure) / 100,
+                                     "selectedHeadroom": Double(adjustment.highlightHeadroom(available: board.filmHeadroom)),
+                                     "availableHeadroom": Double(board.filmHeadroom),
+                                     "confirmedAt": Date()]
+        if let screen = window?.screen {
+            record["display"] = screen.localizedName
+            record["currentHeadroom"] = Double(screen.maximumExtendedDynamicRangeColorComponentValue)
+            record["potentialHeadroom"] = Double(screen.maximumPotentialExtendedDynamicRangeColorComponentValue)
+        }
+        UserDefaults.standard.set(record, forKey: Self.filmLightPreference)
+        confirmFilmLight.title = L10n.surface("已记录")
+    }
+
+    private func filmLightControl(_ slider: NSSlider, value: NSTextField, title: String, hint: String) -> NSView {
+        let label = NSTextField(labelWithString: title)
+        label.textColor = StudioStyle.secondaryText
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        slider.target = self
+        slider.action = #selector(changeFilmLightAdjustment)
+        slider.controlSize = .small
+        slider.isContinuous = true
+        slider.toolTip = hint
+        slider.setAccessibilityLabel(title)
+        value.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        value.textColor = StudioStyle.amber
+        value.alignment = .right
+        value.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        let row = horizontal([label, value])
+        row.spacing = 6
+        let group = NSStackView(views: [row, slider])
+        group.orientation = .vertical
+        group.alignment = .leading
+        group.spacing = 3
+        row.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
+        slider.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
+        return group
+    }
+    #endif
+
+    @objc private func changeOrientation(_ button: NSButton) {
+        if let action = FilmOrientationAction(rawValue: button.tag) { board.changeRepairOrientation(action) }
+    }
+
+    private func orientationControl(_ action: FilmOrientationAction, symbol: String, label: String) -> NSView {
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage()
+        let button = NSButton(image: image, target: self, action: #selector(changeOrientation(_:)))
+        button.tag = action.rawValue
+        button.toolTip = label
+        button.setAccessibilityLabel(label)
+        return StudioStyle.actionControl(button, horizontal: 10)
+    }
+
+    private var headingTitle: String {
+        if viewingRepair { return L10n.surface("修复后观片") }
+        return singleFrame ? L10n.surface("单张观片") : L10n.surface("全卷处理")
+    }
+
     private func build(_ window: NSWindow) {
         let root = NSView()
         window.contentView = root
         StudioStyle.installBackdrop(in: window, root: root)
 
-        let name = NSTextField(labelWithString: L10n.surface("全卷处理"))
+        let name = NSTextField(labelWithString: headingTitle)
         name.textColor = StudioStyle.secondaryText
         name.font = .systemFont(ofSize: 13, weight: .medium)
-        let back = NSButton(title: L10n.surface("返回来源"), target: self, action: #selector(returnToSource))
-        let toolbar = bar([StudioStyle.wordmark(width: 114, maxHeight: 29, fallbackSize: 19),
-                           name, NSView(), StudioStyle.actionControl(back), SupportWindows.supportControl()], height: 45)
-        let detail = NSTextField(labelWithString: L10n.surface("点击底片移入候选区。未单独选片时，默认处理全部。"))
+        let back = NSButton(title: viewingRepair ? L10n.surface("返回审核") : L10n.surface("返回来源"),
+                            target: self, action: #selector(returnToSource))
+        back.keyEquivalent = "\u{1b}"
+        var toolbarViews = [StudioStyle.backControl(back),
+                            StudioStyle.wordmark(width: 114, maxHeight: 29, fallbackSize: 19),
+                            name, NSView()]
+        if viewingRepair {
+            let orientationTools = horizontal([
+                orientationControl(.rotateLeft, symbol: "rotate.left", label: L10n.surface("向左旋转 90°")),
+                orientationControl(.rotateRight, symbol: "rotate.right", label: L10n.surface("向右旋转 90°")),
+                orientationControl(.flipHorizontal, symbol: "arrow.left.and.right", label: L10n.surface("水平翻转")),
+                orientationControl(.flipVertical, symbol: "arrow.up.and.down", label: L10n.surface("垂直翻转"))
+            ])
+            orientationTools.spacing = 5
+            toolbarViews.append(orientationTools)
+        }
+        toolbarViews.append(SupportWindows.supportControl())
+        let toolbar = bar(toolbarViews, height: 45)
+        let instructions: String
+        if viewingRepair {
+            instructions = L10n.surface("用右下角电源点亮观片器，拖动放大镜检查胶片细节。")
+        } else if singleFrame {
+            instructions = L10n.surface("按右下角电源按钮点亮观片器。")
+        } else {
+            instructions = L10n.surface("点击底片移入候选区。未单独选片时，默认处理全部。")
+        }
+        let detail = NSTextField(labelWithString: instructions)
         detail.textColor = StudioStyle.secondaryText
         detail.font = .systemFont(ofSize: 13)
         count.textColor = StudioStyle.amber
@@ -1781,7 +2471,38 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
         statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let footer = bar([statusLabel, NSView(), StudioStyle.actionControl(next)], height: 51)
+        var footerViews = [statusLabel as NSView, NSView()]
+        #if PURENEG_TONE_CALIBRATION
+        let exposureControl = filmLightControl(filmExposure, value: filmExposureValue, title: L10n.surface("曝光"),
+                                               hint: L10n.surface("整体提亮或压暗照片。范围 −8 至 +8 EV，按住 Option 再按方向键可微调 0.01 EV。"))
+        let brightnessControl = filmLightControl(filmBrightness, value: filmBrightnessValue,
+                                                 title: L10n.surface("亮部"),
+                                                 hint: L10n.surface("从 0 EV 调到屏幕当前可用的 HDR 上限。数字为当前值和上限。"))
+        let shadowsControl = filmLightControl(filmShadows, value: filmShadowsValue,
+                                              title: L10n.surface("暗部"), hint: L10n.surface("向左加深暗部，向右提亮暗部。"))
+        let gammaControl = filmLightControl(filmGamma, value: filmGammaValue,
+                                            title: L10n.surface("伽马"), hint: L10n.surface("向左压暗中间调，向右提亮中间调。1.00 为原始中间调。"))
+        confirmFilmLight.toolTip = L10n.surface("记录曝光、亮部、暗部、伽马和屏幕 HDR 余量。")
+        confirmFilmLight.widthAnchor.constraint(greaterThanOrEqualToConstant: 60).isActive = true
+        footerViews.append(StudioStyle.actionControl(confirmFilmLight, horizontal: 8))
+        #endif
+        if !viewingRepair { footerViews.append(StudioStyle.actionControl(next)) }
+        #if PURENEG_TONE_CALIBRATION
+        setFilmLightControlsEnabled(false)
+        let toneControls = horizontal([exposureControl, brightnessControl, shadowsControl, gammaControl])
+        toneControls.distribution = .fillEqually
+        toneControls.spacing = 18
+        let footerActions = horizontal(footerViews)
+        let footerContent = NSStackView(views: [toneControls, footerActions])
+        footerContent.orientation = .vertical
+        footerContent.alignment = .leading
+        footerContent.spacing = 6
+        toneControls.widthAnchor.constraint(equalTo: footerContent.widthAnchor).isActive = true
+        footerActions.widthAnchor.constraint(equalTo: footerContent.widthAnchor).isActive = true
+        let footer = bar(footerContent, height: 87)
+        #else
+        let footer = bar(footerViews, height: 51)
+        #endif
         let layout = NSStackView(views: [toolbar, heading, board, footer])
         layout.orientation = .vertical
         layout.distribution = .fill
@@ -1810,6 +2531,10 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
     }
 
     private func bar(_ views: [NSView], height: CGFloat) -> NSView {
+        bar(horizontal(views), height: height)
+    }
+
+    private func bar(_ content: NSView, height: CGFloat) -> NSView {
         let panel = NSVisualEffectView()
         panel.material = .hudWindow
         panel.blendingMode = .withinWindow
@@ -1819,7 +2544,7 @@ final class BatchLightTableController: NSWindowController, NSWindowDelegate {
         panel.layer?.masksToBounds = true
         panel.layer?.borderWidth = 1
         panel.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
-        StudioStyle.embed(horizontal(views), in: panel, horizontal: 14, vertical: 6)
+        StudioStyle.embed(content, in: panel, horizontal: 14, vertical: 6)
         panel.heightAnchor.constraint(equalToConstant: height).isActive = true
         return panel
     }

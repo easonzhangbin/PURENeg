@@ -8,10 +8,14 @@ const NEAR_BLACK = 0.025;
 // A clipped dark film rebate is different from a dark part of the picture.
 // Check the outer strip before fitting a frame, then confirm clipped black
 // across the band on the outside of each fitted edge.
-function buildFrameProtection(data, width, height, channels) {
+// [Claude 2026-11-09] relaxed (the "保留片边和齿孔" option): a rebate counts as dark when it is
+// far darker than the picture (under REBATE_SHARE of the picture's median), not only when it
+// is clipped black. Off by default; a frame it cannot fit is left unprotected as before.
+const REBATE_SHARE = 0.3;
+function buildFrameProtection(data, width, height, channels, { relaxed = false } = {}) {
   const luma = (x, y) => {
     const i = (y * width + x) * channels;
-    if (channels === 1) return data[i] / 65535;
+    if (channels <= 2) return data[i] / 65535;
     return (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]) / 65535;
   };
   const sides = {
@@ -20,15 +24,23 @@ function buildFrameProtection(data, width, height, channels) {
     left: [height, width, (t, d) => luma(d, t)],
     right: [height, width, (t, d) => luma(width - 1 - d, t)],
   };
+  let limit = NEAR_BLACK;
+  if (relaxed) {
+    const values = [];
+    for (let y = Math.floor(height * 0.3); y < height * 0.7; y += Math.max(1, Math.floor(height / 60)))
+      for (let x = Math.floor(width * 0.3); x < width * 0.7; x += Math.max(1, Math.floor(width / 60))) values.push(luma(x, y));
+    values.sort((a, b) => a - b);
+    limit = Math.max(NEAR_BLACK, REBATE_SHARE * (values[values.length >> 1] || 0));
+  }
   const samples = 48;
   const reachesEdge = Object.entries(sides).filter(([, [along, depth, at]]) => {
     if (along < 128 || depth < 128) return false;
-    let dark = 0;
+    let count = 0;
     for (let i = 0; i < samples; i++) {
       const t = Math.floor((0.08 + 0.84 * (i + 0.5) / samples) * along);
-      if (at(t, 0) < NEAR_BLACK && at(t, 4) < NEAR_BLACK) dark++;
+      if (at(t, 0) < limit && at(t, 4) < limit) count++;
     }
-    return dark >= samples * 0.65;
+    return count >= samples * (relaxed ? 0.5 : 0.65);
   });
   if (!reachesEdge.length) return null;
 
@@ -52,23 +64,29 @@ function buildFrameProtection(data, width, height, channels) {
     const depthScale = horizontal ? sy : sx;
     const alongScale = horizontal ? sx : sy;
     const edge = { a: fit[side].a * depthScale, b: fit[side].b * depthScale / alongScale };
-    let dark = 0;
+    let count = 0;
     for (let i = 0; i < samples; i++) {
       const t = Math.floor((0.08 + 0.84 * (i + 0.5) / samples) * along);
       const d = edge.a + edge.b * t;
-      if (d >= 8 && d <= 0.15 * depth && at(t, Math.floor(d * 0.65)) < NEAR_BLACK &&
-          at(t, Math.floor(d * 0.82)) < NEAR_BLACK) dark++;
+      if (d >= 8 && d <= 0.15 * depth && at(t, Math.floor(d * 0.65)) < limit &&
+          at(t, Math.floor(d * 0.82)) < limit) count++;
     }
-    if (dark >= samples * 0.7) edges[side] = edge;
+    if (count >= samples * (relaxed ? 0.55 : 0.7)) edges[side] = edge;
   }
   if (!Object.values(edges).some(Boolean)) return null;
+  return protectionFromGeometry({ edges, margin: step }, width, height);
+}
+
+function protectionFromGeometry(geometry, width, height) {
+  if (!geometry) return null;
+  const { edges, margin } = geometry;
   return {
-    edges,
+    ...geometry,
     protects(index) {
       const y = Math.floor(index / width), x = index - y * width;
-      return beyondFrame(edges, width, height, x, y, step);
+      return beyondFrame(edges, width, height, x, y, margin);
     },
   };
 }
 
-module.exports = { buildFrameProtection };
+module.exports = { buildFrameProtection, protectionFromGeometry };

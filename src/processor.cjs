@@ -13,7 +13,10 @@ const { buildFrameProtection } = require('./frame-guard.cjs');
 const { protectSceneStructures } = require('./structure-guard.cjs');
 const UPSTREAM = require('../vendor/film-dust/UPSTREAM.json');
 const DEFECT_TYPES = ['dust', 'scratches', 'fibers'];
-const SENSITIVITY_OPTIONS = ['dustSensitivity', 'fiberSensitivity', 'scratchSensitivity'];
+const AVAILABLE_DEFECT_TYPES = [...DEFECT_TYPES, 'patches'];
+// [Claude 2026-11-09] fiberCurl / fiberSoftness: how curled and how soft or wide a line may be
+// and still be taken for a fibre (1 = the tested defaults; 0.5 to 2 like the sensitivities).
+const SENSITIVITY_OPTIONS = ['dustSensitivity', 'fiberSensitivity', 'scratchSensitivity', 'patchSensitivity', 'fiberCurl', 'fiberSoftness'];
 
 function cancelled(signal) {
   if (signal?.aborted) {
@@ -36,10 +39,12 @@ function optionsChecked(options) {
   if ([sensitivity, ...Object.values(overrides)].some(value => !Number.isFinite(value) || value < 0.5 || value > 2)) {
     throw new Error('灵敏度必须在 0.5 到 2 之间。');
   }
-  if (!Array.isArray(detect) || !detect.length || new Set(detect).size !== detect.length || detect.some(kind => !DEFECT_TYPES.includes(kind))) {
-    throw new Error('至少选择一项识别类型：dust、scratches、fibers。');
+  if (!Array.isArray(detect) || !detect.length || new Set(detect).size !== detect.length || detect.some(kind => !AVAILABLE_DEFECT_TYPES.includes(kind))) {
+    throw new Error('至少选择一项识别类型：dust、scratches、fibers、patches。');
   }
-  return { polarity, sensitivity, ...overrides, detect: DEFECT_TYPES.filter(kind => detect.includes(kind)) };
+  if (options.keepRebate !== undefined && typeof options.keepRebate !== 'boolean') throw new Error('保留片边选项无效。');
+  return { polarity, sensitivity, ...overrides, ...(options.keepRebate ? { keepRebate: true } : {}),
+    detect: AVAILABLE_DEFECT_TYPES.filter(kind => detect.includes(kind)) };
 }
 
 function checkImage(image) {
@@ -117,23 +122,46 @@ function composeMasked(original, repaired, mask, C, { out = Uint16Array.from(ori
 // 0.78-0.99). Repairs inside an eye found by eyesIn are taken back; dust that really lies
 // in an eye is rare and left to the brush. Returns the pixels taken back from the mask.
 function protectEyes(mask, width, height, marks, eyes) {
+  // [Claude 2026-11-09] Only compact repairs are taken back: a catchlight is a small round
+  // speck inside the eye. A repair that is long and thin, or runs out of the eye, is a fibre
+  // crossing it and stays repaired.
   let pixels = 0;
   for (const { x, y, r } of eyes || []) {
     if (![x, y, r].every(Number.isFinite) || r <= 0) continue;
-    const x0 = Math.max(0, Math.floor(x - r)), x1 = Math.min(width - 1, Math.ceil(x + r));
-    const y0 = Math.max(0, Math.floor(y - r)), y1 = Math.min(height - 1, Math.ceil(y + r));
-    for (let qy = y0; qy <= y1; qy++) {
-      for (let qx = x0; qx <= x1; qx++) {
-        const index = qy * width + qx;
-        if (mask[index] && (qx - x) ** 2 + (qy - y) ** 2 <= r * r) {
-          mask[index] = 0;
-          pixels++;
+    const reach = Math.ceil(3 * r);
+    const wx0 = Math.max(0, Math.floor(x - reach)), wx1 = Math.min(width - 1, Math.ceil(x + reach));
+    const wy0 = Math.max(0, Math.floor(y - reach)), wy1 = Math.min(height - 1, Math.ceil(y + reach));
+    const ww = wx1 - wx0 + 1, wh = wy1 - wy0 + 1;
+    const seen = new Uint8Array(ww * wh);
+    const inEye = (qx, qy) => (qx - x) ** 2 + (qy - y) ** 2 <= r * r;
+    for (let sy = wy0; sy <= wy1; sy++) for (let sx = wx0; sx <= wx1; sx++) {
+      const start = (sy - wy0) * ww + (sx - wx0);
+      if (seen[start] || !mask[sy * width + sx] || !inEye(sx, sy)) continue;
+      // The repair this pixel belongs to, within the window around the eye.
+      const stack = [start], piece = [];
+      seen[start] = 1;
+      let bx0 = sx, bx1 = sx, by0 = sy, by1 = sy, leaves = false;
+      while (stack.length) {
+        const i = stack.pop(), qx = wx0 + (i % ww), qy = wy0 + ((i / ww) | 0);
+        piece.push(qy * width + qx);
+        if (!inEye(qx, qy)) leaves = true;
+        if (qx < bx0) bx0 = qx; if (qx > bx1) bx1 = qx; if (qy < by0) by0 = qy; if (qy > by1) by1 = qy;
+        if (qx === wx0 || qx === wx1 || qy === wy0 || qy === wy1) leaves = true;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const nx = qx + dx, ny = qy + dy;
+          if (nx < wx0 || nx > wx1 || ny < wy0 || ny > wy1) continue;
+          const j = (ny - wy0) * ww + (nx - wx0);
+          if (!seen[j] && mask[ny * width + nx]) { seen[j] = 1; stack.push(j); }
         }
       }
+      const long = Math.max(bx1 - bx0, by1 - by0) + 1, short = Math.min(bx1 - bx0, by1 - by0) + 1;
+      if (leaves || long > 3 * short + 2) continue;   // a fibre crossing the eye
+      for (const index of piece) { mask[index] = 0; pixels++; }
     }
     for (const mark of marks) {
       if (mark.verdict !== 'defect' || (mark.cx - x) ** 2 + (mark.cy - y) ** 2 > r * r) continue;
       if (mark.area > Math.PI * r * r) continue;   // A fibre crossing the eye keeps the rest of its repair.
+      if (mark.kind === 'hair/fibre' && mark.length && mark.length > 2 * r) continue;
       mark.verdict = 'keep-photo';
       mark.why = 'a catchlight in an eye';
     }
@@ -190,11 +218,13 @@ function keepFrameMarks(marks, frame, width, height) {
   }
 }
 
-async function processScan(image, options = {}, { reuseInput = false } = {}) {
+async function processScan(image, options = {}, { reuseInput = false, captureReview = false, modelInputs } = {}) {
   const settings = optionsChecked(options);
   const detectDust = settings.detect.includes('dust'), detectFibers = settings.detect.includes('fibers');
   const detectUpstream = detectDust || detectFibers;
   const C = checkImage(image), W = image.width, H = image.height;
+  const wantsPatches = settings.detect.includes('patches') && settings.polarity !== 'dark';
+  const detectPatches = wantsPatches && options.fibreMap?.length === W * H;
   let lastProgress = 0;
   const onProgress = (event) => {
     lastProgress = Math.max(lastProgress, Math.min(1, Math.max(0, event.fraction)));
@@ -204,12 +234,13 @@ async function processScan(image, options = {}, { reuseInput = false } = {}) {
   cancelled(options.signal);
   const t0 = performance.now();
   const colors = colorCopy(image, C);
-  const frame = buildFrameProtection(colors, W, H, C);
+  const frame = buildFrameProtection(colors, W, H, C, { relaxed: settings.keepRebate === true });
+  const rebate = captureReview && (settings.keepRebate ? frame : buildFrameProtection(colors, W, H, C, { relaxed: true }));
   // The low-memory mode also uses the existing tiled full-resolution repair
   // path on large scans that ordinarily run the detector at full resolution.
   const factor = options.conserveMemory && W * H > 64_000_000 ? 2 : 1;
   const detectorFactor = Math.max(factor, scale.workingFactor(W, H));
-  const k = detectUpstream && Math.min(W, H) >= detectorFactor ? detectorFactor : 1;
+  const k = (detectUpstream || detectPatches) && Math.min(W, H) >= detectorFactor ? detectorFactor : 1;
   const Wd = Math.floor(W / k), Hd = Math.floor(H / k);
   let work;
   if (k === 1) work = Uint16Array.from(colors);
@@ -218,20 +249,20 @@ async function processScan(image, options = {}, { reuseInput = false } = {}) {
     scale.averageStrip(colors, W, H, C, k, work, Wd, 0, false);
   }
   onProgress({ fraction: 0.05, message: '读取完成，开始分析扫描件' });
-  const result = detectUpstream ? await cleanScan(work, Wd, Hd, C, {
+  const analysis = (detectUpstream || detectPatches) ? await cleanScan(work, Wd, Hd, C, {
     polarity: settings.polarity, sensitivity: settings.sensitivity,
     dustSensitivity: detectDust ? settings.dustSensitivity : undefined,
     fiberSensitivity: detectFibers ? settings.fiberSensitivity : undefined,
-    detectDust, detectFibers, heal: true, softPath: true, scanMp: W * H / 1e6,
+    detectDust: detectDust || !detectUpstream, detectFibers, heal: detectUpstream, softPath: detectUpstream, scanMp: W * H / 1e6,
   }, {
     tick,
     progress: (fraction, message) => onProgress({ fraction: 0.05 + fraction * (k > 1 ? 0.7 : 0.85), message: stageText(message) }),
-  }) : { mask: new Uint8Array(W * H), marks: [], stats: { healed: 0, healed_pixels: 0, hairs: 0, soft: 0, by_kind: {} } };
+  }) : null;
+  const result = detectUpstream ? analysis : { mask: new Uint8Array(W * H), marks: [], stats: { healed: 0, healed_pixels: 0, hairs: 0, soft: 0, by_kind: {} } };
   await tick();
-  let repaired = work;
+  let repaired = k > 1 ? Uint16Array.from(colors) : work;
   let mask = result.mask;
-  if (k > 1) {
-    repaired = Uint16Array.from(colors);
+  if (k > 1 && detectUpstream) {
     const bumps = result.discBumps || [];
     const io = {
       read: async (x0, y0, x1, y1) => {
@@ -253,6 +284,10 @@ async function processScan(image, options = {}, { reuseInput = false } = {}) {
     mask = scale.enlargeMask(result.mask, Wd, Hd, k, W, H);
   }
   cancelled(options.signal);
+  // The upstream pass only needs the original pixels. Its output order and
+  // all model-dependent refinement are the same when inference runs beside it.
+  if (modelInputs) options = { ...options, ...await modelInputs };
+  cancelled(options.signal);
   const marks = scale.enlargeMarks(result.marks, k);
   const extraStats = { by_kind: { ...result.stats.by_kind }, healed: result.stats.healed, healed_pixels: result.stats.healed_pixels, detection_types: settings.detect };
   if (detectFibers) {
@@ -260,6 +295,7 @@ async function processScan(image, options = {}, { reuseInput = false } = {}) {
     onProgress({ fraction: 0.9, message: '追踪断续的毛发与纤维' });
     const extra = await enhanceFibers({ original: colors, repaired, mask, W, H, C, marks,
       polarity: settings.polarity, sensitivity: settings.fiberSensitivity, frame, tick,
+      curl: settings.fiberCurl ?? 1, softness: settings.fiberSoftness ?? 1,
       probability: options.fibreMap?.length === W * H ? options.fibreMap : null });
     extraStats.learned_fibre_map = options.fibreMap?.length === W * H;
     extraStats.enhanced_fibers = extra.marks.length;
@@ -285,6 +321,17 @@ async function processScan(image, options = {}, { reuseInput = false } = {}) {
     extraStats.healed += extra.marks.length;
     extraStats.healed_pixels += extra.pixels;
     if (extra.marks.length) extraStats.by_kind.scratch = extra.marks.length;
+  }
+  if (wantsPatches && options.fibreMap?.length === W * H) {
+    const { repairPatches } = require('./patches.cjs');
+    onProgress({ fraction: 0.91, message: '检查亮色斑块' });
+    const extra = await repairPatches({ original: colors, repaired, mask, W, H, C,
+      candidates: detectUpstream ? marks : scale.enlargeMarks(analysis.marks, k),
+      probability: options.fibreMap, eyes: options.eyes, frame, sensitivity: settings.patchSensitivity ?? 1, tick });
+    marks.push(...extra.marks);
+    extraStats.healed += extra.marks.length;
+    extraStats.healed_pixels += extra.pixels;
+    if (extra.marks.length) extraStats.by_kind.patch = extra.marks.length;
   }
   cancelled(options.signal);
   const structurePixels = protectSceneStructures(mask, W, H, marks);
@@ -321,6 +368,7 @@ async function processScan(image, options = {}, { reuseInput = false } = {}) {
     stats, changed: composed.changedPixels > 0,
     marks,
     doubtful: reviewDoubtful,
+    ...(captureReview && { rebateGeometry: rebate ? { edges: rebate.edges, margin: rebate.margin } : null }),
   };
 }
 
@@ -329,28 +377,58 @@ function fingerprint(bytes) {
 }
 
 async function processFile(inputPath, outputRoot, options = {}, { captureReview = false } = {}) {
-  const { decodeTiff, encodeTiff } = require('./tiff.cjs');
-  optionsChecked(options);
+  const { decodeTiff, decodeTiffForWork, encodeTiff } = require('./tiff.cjs');
+  const settings = optionsChecked(options);
   cancelled(options.signal);
   const input = path.resolve(inputPath), output = path.resolve(outputRoot);
   const stat = await fs.stat(input);
   if (!stat.isFile() || stat.size < 8 || stat.size > 2_000_000_000) throw new Error('请选择小于 2GB 的有效 TIFF 扫描文件。');
   options.onProgress?.({ fraction: 0.01, message: '读取 TIFF 扫描件' });
   // Found while the TIFF decodes; handled here so a cancel during decoding is not unhandled.
-  const eyes = options.eyes === undefined ? eyesIn(input, options.signal) : Promise.resolve(options.eyes);
+  // [Claude 2026-11-08] Seconds spent in each step, kept in the report (stats.timings) so a
+  // slow start - detection sitting at 0% - can be traced to the step that held it.
+  const timings = {}, began = performance.now();
+  const since = start => Math.round((performance.now() - start) / 100) / 10;
+  const timed = (promise, key) => promise.then(value => { timings[key] = since(began); return value; });
+  const eyes = timed(options.eyes === undefined ? eyesIn(input, options.signal) : Promise.resolve(options.eyes), 'eyes_seconds');
   eyes.catch(() => {});
-  const fibreMap = options.fibreMap === undefined ? fibreMapIn(input, options.signal) : Promise.resolve(options.fibreMap);
-  fibreMap.catch(() => {});
+  const fibreMap = timed(options.fibreMap === undefined ? fibreMapIn(input, options.signal) : Promise.resolve(options.fibreMap), 'fibre_map_seconds');
+  const models = Promise.all([eyes, fibreMap]).then(([eyes, fibreMap]) => {
+    timings.models_ready_seconds = since(began);
+    return { eyes, fibreMap };
+  });
+  models.catch(() => {});
   const digests = captureReview ? {} : null;
   let image;
   {
     const bytes = await fs.readFile(input);
     if (digests) digests.source = fingerprint(bytes);
-    image = decodeTiff(bytes);
+    image = options.tiffWorkers > 1 ? await decodeTiffForWork(bytes, options) : decodeTiff(bytes);
   }
+  timings.decode_seconds = since(began);
   await fs.mkdir(output, { recursive: true });
   await requireWorkSpace(output, image);
-  const result = await processScan(image, { ...options, eyes: await eyes, fibreMap: await fibreMap }, { reuseInput: true });
+  const overlap = options.overlapModels && !options.conserveMemory &&
+    settings.detect.some(kind => kind === 'dust' || kind === 'fibers');
+  if (!overlap) {
+    const waitingForEyes = () => timings.eyes_seconds === undefined;
+    const waitingForFibres = () => timings.fibre_map_seconds === undefined;
+    if (waitingForEyes() && waitingForFibres()) {
+      options.onProgress?.({ fraction: 0.02, message: '正在准备眼部保护和纤维检测模型' });
+      await Promise.race([eyes, fibreMap]);
+    }
+    if (waitingForEyes()) {
+      options.onProgress?.({ fraction: 0.03, message: '正在定位眼部高光' });
+    } else if (waitingForFibres()) {
+      options.onProgress?.({ fraction: 0.03, message: '正在生成纤维检测图' });
+    }
+  }
+  const scanOptions = overlap ? options : { ...options, ...await models };
+  const detectStart = performance.now();
+  const result = await processScan(image, scanOptions, { reuseInput: true, captureReview, modelInputs: overlap ? models : null });
+  timings.detect_seconds = since(detectStart);
+  const { fibreMap: map } = await models;
+  result.stats = { ...result.stats, timings };
   cancelled(options.signal);
   const stem = path.basename(input).replace(/\.(tiff?|TIF{1,2})$/i, '').replace(/[^\p{L}\p{N}._ -]/gu, '_').slice(0, 100) || 'scan';
   const dir = await fs.mkdtemp(path.join(output, stem + '-dust-'));
@@ -363,6 +441,11 @@ async function processFile(inputPath, outputRoot, options = {}, { captureReview 
     await writeAsset('cleaned', encodeTiff(result.cleaned));
     cancelled(options.signal);
     await writeAsset('mask', encodeTiff(result.mask));
+    // Kept for a review so its training pack can give each repair the model's own score.
+    if (digests && map?.length === image.width * image.height) {
+      paths.fibreMap = path.join(dir, 'fibre-map.u8');
+      await writeAsset('fibreMap', Buffer.from(map.buffer, map.byteOffset, map.byteLength));
+    }
     const report = { version: require('./version.cjs'), upstream: UPSTREAM, source: input,
       image: { width: image.width, height: image.height, depth: image.depth, channels: image.channels, embedded_icc: Boolean(image.icc) },
       settings: optionsChecked(options), stats: result.stats, changed: result.changed,
@@ -371,7 +454,7 @@ async function processFile(inputPath, outputRoot, options = {}, { captureReview 
     await writeAsset('report', Buffer.from(JSON.stringify(report, null, 2) + '\n'));
     cancelled(options.signal);
     const output = { outputDir: dir, paths, stats: result.stats, changed: result.changed };
-    if (digests) output.reviewData = { mask: result.mask, image: report.image, marks: result.marks, digests };
+    if (digests) output.reviewData = { mask: result.mask, image: report.image, marks: result.marks, digests, rebateGeometry: result.rebateGeometry };
     return output;
   } catch (error) {
     await fs.rm(dir, { recursive: true, force: true });

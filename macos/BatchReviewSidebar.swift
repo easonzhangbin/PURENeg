@@ -15,12 +15,15 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
 
     var onOpen: ((UUID) -> Void)?
     var onToggle: ((UUID) -> Void)?
+    // [Claude 2026-11-09] Select all / none for export: true ticks every exportable photo.
+    var onToggleAll: ((Bool) -> Void)?
     var onDetect: (() -> Void)?
     var onStop: (() -> Void)?
     var onThumbnailReady: ((URL, CGImage) -> Void)?
 
     private let table = NSTableView()
     private let frameCount = NSTextField(labelWithString: "")
+    private let selectAllButton = NSButton(title: L10n.surface("全选"), target: nil, action: nil)
     private let activity = NSTextField(wrappingLabelWithString: "")
     private let detectButton = NSButton(title: L10n.surface("检测本批"), target: nil, action: nil)
     private let stopButton = NSButton(title: L10n.surface("停止检测"), target: nil, action: nil)
@@ -31,9 +34,9 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
     private var checked = Set<UUID>()
     private var busy = false
     private var updatingTable = false
-    private var detectionID: UUID?
-    private var detectionRow: Int?
-    private var detectionFraction: Double = 0
+    private var progressID: UUID?
+    private var progressRowIndex: Int?
+    private var progressFraction: Double = 0
 
     init() {
         super.init(frame: .zero)
@@ -63,9 +66,13 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
         self.busy = busy
 
         frameCount.stringValue = L10n.surface("\(items.count) 张")
+        let exportable = items.filter(\.canExport)
+        let allChecked = !exportable.isEmpty && exportable.allSatisfy { checked.contains($0.id) }
+        selectAllButton.title = allChecked ? L10n.surface("全不选") : L10n.surface("全选")
+        selectAllButton.isEnabled = !exportable.isEmpty && !busy
 
         guard needsReload else { return }
-        detectionRow = detectionID.flatMap { id in items.firstIndex { $0.id == id } }
+        progressRowIndex = progressID.flatMap { id in items.firstIndex { $0.id == id } }
         updatingTable = true
         defer { updatingTable = false }
         table.reloadData()
@@ -75,13 +82,18 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
                 let currentID = items[row].id
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.items.indices.contains(row), self.items[row].id == currentID,
-                          self.items[row].isCurrent, self.detectionRow == nil else { return }
+                          self.items[row].isCurrent, self.progressRowIndex == nil else { return }
                     self.table.scrollRowToVisible(row)
                 }
             }
         } else {
             table.deselectAll(nil)
         }
+    }
+
+    @objc private func toggleAll() {
+        let exportable = items.filter(\.canExport)
+        onToggleAll?(!(exportable.allSatisfy { checked.contains($0.id) }))
     }
 
     func setActivity(_ status: String, canDetect: Bool, canStop: Bool) {
@@ -93,44 +105,44 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
         stopControl.isHidden = !canStop
     }
 
-    func setDetectionProgress(id: UUID?, fraction: Double?, follow: Bool) {
+    func setProgress(id: UUID?, fraction: Double?, follow: Bool) {
         let reportedFraction = fraction ?? 0
         let value = id != nil && reportedFraction.isFinite ? min(max(reportedFraction, 0), 1) : 0
-        if detectionID == id {
-            guard detectionFraction != value else { return }
-            detectionFraction = value
-            if let detectionRow { updateVisibleProgress(in: detectionRow) }
+        if progressID == id {
+            guard progressFraction != value else { return }
+            progressFraction = value
+            if let progressRowIndex { updateVisibleProgress(in: progressRowIndex) }
             return
         }
 
-        let previousRow = detectionRow
-        detectionID = id
-        detectionFraction = value
-        detectionRow = id.flatMap { id in items.firstIndex { $0.id == id } }
-        let changedRows = IndexSet([previousRow, detectionRow].compactMap { $0 })
+        let previousRow = progressRowIndex
+        progressID = id
+        progressFraction = value
+        progressRowIndex = id.flatMap { id in items.firstIndex { $0.id == id } }
+        let changedRows = IndexSet([previousRow, progressRowIndex].compactMap { $0 })
         guard !changedRows.isEmpty else { return }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0
             table.noteHeightOfRows(withIndexesChanged: changedRows)
         }
         for row in changedRows { updateVisibleProgress(in: row) }
-        if follow, let detectionRow {
+        if follow, let progressRowIndex {
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.detectionID == id, self.detectionRow == detectionRow else { return }
-                self.table.scrollRowToVisible(detectionRow)
+                guard let self, self.progressID == id, self.progressRowIndex == progressRowIndex else { return }
+                self.table.scrollRowToVisible(progressRowIndex)
             }
         }
     }
 
     private func updateVisibleProgress(in row: Int) {
         let cell = table.view(atColumn: 0, row: row, makeIfNecessary: false) as? BatchSidebarRow
-        cell?.setDetectionProgress(row == detectionRow ? detectionFraction : nil)
+        cell?.setProgress(row == progressRowIndex ? progressFraction : nil)
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { items.count }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        row == detectionRow ? BatchSidebarRow.detectionHeight : BatchSidebarRow.normalHeight
+        row == progressRowIndex ? BatchSidebarRow.progressHeight : BatchSidebarRow.normalHeight
     }
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
@@ -149,7 +161,7 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
             ?? BatchSidebarRow()
         cell.onThumbnailReady = { [weak self] url, image in self?.onThumbnailReady?(url, image) }
         cell.update(item, checked: checked.contains(item.id), busy: busy)
-        cell.setDetectionProgress(row == detectionRow ? detectionFraction : nil)
+        cell.setProgress(row == progressRowIndex ? progressFraction : nil)
         cell.onToggle = { [weak self] id in self?.onToggle?(id) }
         return cell
     }
@@ -161,7 +173,13 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
         let heading = StudioStyle.section("04", L10n.surface("照片列表"), size: 14)
         frameCount.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         frameCount.textColor = StudioStyle.amber
-        let header = NSStackView(views: [heading, NSView(), frameCount])
+        selectAllButton.bezelStyle = .inline
+        selectAllButton.controlSize = .small
+        selectAllButton.font = .systemFont(ofSize: 11, weight: .medium)
+        selectAllButton.target = self
+        selectAllButton.action = #selector(toggleAll)
+        selectAllButton.setAccessibilityLabel(L10n.surface("全选或全不选可导出的照片"))
+        let header = NSStackView(views: [heading, NSView(), selectAllButton, frameCount])
         header.alignment = .firstBaseline
         header.spacing = 8
 
@@ -218,7 +236,7 @@ final class BatchReviewSidebar: NSVisualEffectView, NSTableViewDataSource, NSTab
 private final class BatchSidebarRow: NSTableCellView {
     static let reuseIdentifier = NSUserInterfaceItemIdentifier("BatchSidebarRow")
     static let normalHeight: CGFloat = 45
-    static let detectionHeight: CGFloat = 61
+    static let progressHeight: CGFloat = 61
     private static let placeholder = NSImage(systemSymbolName: "photo", accessibilityDescription: nil)
     private static let thumbnailCache: NSCache<NSUUID, Thumbnail> = {
         let cache = NSCache<NSUUID, Thumbnail>()
@@ -269,10 +287,11 @@ private final class BatchSidebarRow: NSTableCellView {
         #if compiler(>=6.2)
         if #available(macOS 26.0, *) { checkbox.tintProminence = .none }
         #endif
-        let labels = NSStackView(views: [filename, status])
+        let labels = NSStackView(views: [filename, progressRow, status])
         labels.orientation = .vertical
         labels.alignment = .leading
-        labels.spacing = 2
+        labels.spacing = 3
+        labels.detachesHiddenViews = true
         preview.imageScaling = .scaleProportionallyUpOrDown
         preview.contentTintColor = StudioStyle.secondaryText
         preview.wantsLayer = true
@@ -294,13 +313,12 @@ private final class BatchSidebarRow: NSTableCellView {
         addSubview(checkbox)
         addSubview(preview)
         addSubview(labels)
-        addSubview(progressRow)
         NSLayoutConstraint.activate([
             checkbox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             checkbox.centerYAnchor.constraint(equalTo: preview.centerYAnchor),
             checkbox.widthAnchor.constraint(equalToConstant: 17),
             preview.leadingAnchor.constraint(equalTo: checkbox.trailingAnchor, constant: 7),
-            preview.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            preview.centerYAnchor.constraint(equalTo: centerYAnchor),
             preview.widthAnchor.constraint(equalToConstant: 44),
             preview.heightAnchor.constraint(equalToConstant: 33),
             labels.leadingAnchor.constraint(equalTo: preview.trailingAnchor, constant: 7),
@@ -308,9 +326,7 @@ private final class BatchSidebarRow: NSTableCellView {
             labels.centerYAnchor.constraint(equalTo: preview.centerYAnchor),
             filename.widthAnchor.constraint(equalTo: labels.widthAnchor),
             status.widthAnchor.constraint(equalTo: labels.widthAnchor),
-            progressRow.leadingAnchor.constraint(equalTo: preview.leadingAnchor),
-            progressRow.trailingAnchor.constraint(equalTo: labels.trailingAnchor),
-            progressRow.topAnchor.constraint(equalTo: preview.bottomAnchor, constant: 3),
+            progressRow.widthAnchor.constraint(equalTo: labels.widthAnchor),
             percentage.widthAnchor.constraint(equalToConstant: 33)
         ])
     }
@@ -342,11 +358,11 @@ private final class BatchSidebarRow: NSTableCellView {
         layer?.backgroundColor = item.isCurrent ? StudioStyle.amber.withAlphaComponent(0.13).cgColor : nil
     }
 
-    func setDetectionProgress(_ fraction: Double?) {
+    func setProgress(_ fraction: Double?) {
         progressRow.isHidden = fraction == nil
         guard let fraction else { return }
         progress.doubleValue = fraction
-        percentage.stringValue = "\(Int(fraction * 100))%"
+        percentage.stringValue = "\(Int((fraction * 100).rounded()))%"
     }
 
     private func requestThumbnail(id: UUID, url: URL) {

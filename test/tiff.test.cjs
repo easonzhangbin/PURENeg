@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const zlib = require('node:zlib');
-const { decodeTiff, encodeTiff } = require('../src/tiff.cjs');
+const { decodeTiff, decodeTiffForWork, encodeTiff } = require('../src/tiff.cjs');
 
 function samples(n, depth) {
   let seed = 77;
@@ -77,6 +77,29 @@ for (const depth of [8, 16]) for (const channels of [1, 2, 3, 4]) for (const com
     assert.deepEqual(decoded.icc, source.icc); assert.deepEqual(decoded.resolution, source.resolution);
   });
 }
+
+test('parallel Deflate preserves strip order, predictors, pixels and metadata', async () => {
+  for (const depth of [8, 16]) {
+    const source = image(4, depth, 47, 31);
+    source.icc = Buffer.from([0, 0, 0, 7, 255, 88, 0]);
+    source.resolution = { x: 2400, y: 2399.5, unit: 2 };
+    const bytes = encodeTiff(source, { compression: 'deflate', rowsPerStrip: 3 });
+    assert.deepEqual(await decodeTiffForWork(bytes, { tiffWorkers: 4 }), decodeTiff(bytes));
+  }
+});
+
+test('parallel Deflate rejects a corrupt strip and honors cancellation', async () => {
+  const bytes = encodeTiff(image(3, 16, 113, 81), { compression: 'deflate', rowsPerStrip: 5 });
+  const controller = new AbortController();
+  const decoding = decodeTiffForWork(bytes, { tiffWorkers: 4, signal: controller.signal });
+  controller.abort();
+  await assert.rejects(decoding, { name: 'AbortError' });
+
+  const corrupt = Buffer.from(bytes);
+  const offsets = corrupt.readUInt32LE(entry(corrupt, 273) + 8);
+  corrupt.writeUInt16LE(0, corrupt.readUInt32LE(offsets + 4));
+  await assert.rejects(decodeTiffForWork(corrupt, { tiffWorkers: 4 }), /invalid Deflate strip/);
+});
 
 for (const depth of [8, 16]) for (const codec of ['lzw', 'packbits', 'deflate']) {
   test(`independent Pillow fixture: ${depth}-bit ${codec}`, () => {

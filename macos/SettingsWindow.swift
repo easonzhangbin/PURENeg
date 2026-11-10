@@ -14,6 +14,7 @@ enum AppPreferences {
         static let conserveMemory = "settings.conserveMemory"
         static let autoDetectWhenIdle = "settings.autoDetectWhenIdle"
         static let language = "settings.language"
+        static let exportTrainingPack = "settings.exportTrainingPack"
     }
 
     private static var defaults: UserDefaults { .standard }
@@ -27,6 +28,11 @@ enum AppPreferences {
 
     static var includeMask: Bool { defaults.bool(forKey: Key.includeMask) }
 
+    // [Claude 2026-11-08] A training build (PURENegTrainingBuild in Info.plist) exports a
+    // training pack beside each photo unless switched off; a release build only when switched on.
+    static let isTrainingBuild = Bundle.main.object(forInfoDictionaryKey: "PURENegTrainingBuild") as? Bool == true
+    static var exportTrainingPack: Bool { defaults.object(forKey: Key.exportTrainingPack) as? Bool ?? isTrainingBuild }
+
     static var exportFolder: URL? {
         guard let path = defaults.string(forKey: Key.exportFolder), path.hasPrefix("/") else { return nil }
         return URL(fileURLWithPath: path, isDirectory: true)
@@ -34,7 +40,21 @@ enum AppPreferences {
 
     static var cpuMode: String {
         let value = defaults.string(forKey: Key.cpuMode) ?? "balanced"
-        return ["balanced", "responsive", "efficient"].contains(value) ? value : "balanced"
+        return ["balanced", "responsive", "performance", "efficient"].contains(value) ? value : "balanced"
+    }
+
+    static var tiffDecodeWorkers: Int {
+        guard cpuMode == "performance" else { return 1 }
+        let hardware = ProcessInfo.processInfo
+        let limit: Int
+        if conserveMemory || defaultConserveMemory { limit = 2 }
+        else if hardware.physicalMemory <= 32 * 1_024 * 1_024 * 1_024 { limit = 4 }
+        else { limit = 8 }
+        return min(limit, max(1, hardware.activeProcessorCount - 1))
+    }
+
+    static var overlapsModelInference: Bool {
+        cpuMode == "performance" && !conserveMemory && ProcessInfo.processInfo.physicalMemory > 32 * 1_024 * 1_024 * 1_024
     }
 
     static var gpuPreview: Bool { defaults.bool(forKey: Key.gpuPreview) }
@@ -85,6 +105,7 @@ enum AppDiagnostics {
             "",
             "Settings",
             "CPU mode: \(AppPreferences.cpuMode)",
+            "TIFF decode workers: \(AppPreferences.tiffDecodeWorkers)",
             "GPU preview: \(AppPreferences.gpuPreview)",
             "Conserve memory: \(AppPreferences.conserveMemory)",
             "Detect automatically when idle: \(AppPreferences.autoDetectWhenIdle)",
@@ -310,6 +331,7 @@ private struct PureNegSettingsView: View {
     @ObservedObject var actions: SettingsActions
     @AppStorage(AppPreferences.Key.exportFormat) private var exportFormat = "tiff"
     @AppStorage(AppPreferences.Key.includeMask) private var includeMask = false
+    @AppStorage(AppPreferences.Key.exportTrainingPack) private var exportTrainingPack = AppPreferences.isTrainingBuild
     @AppStorage(AppPreferences.Key.exportFolder) private var exportFolder = ""
     @AppStorage(AppPreferences.Key.cpuMode) private var cpuMode = "balanced"
     @AppStorage(AppPreferences.Key.gpuPreview) private var gpuPreview = false
@@ -343,6 +365,13 @@ private struct PureNegSettingsView: View {
                     Text("PNG").tag("png")
                 }
                 Toggle(label("默认附带修复蒙版", "Include the repair mask by default"), isOn: $includeMask)
+                Toggle(label("导出训练数据包", "Export Training Packs"), isOn: $exportTrainingPack)
+                Text(label("开启后，可在导出时附带以「-training」结尾的文件夹，里面有未修复的扫描图、各层蒙版和修复记录。",
+                           "Enable this to include a folder ending in “-training” with your export. It contains the unrepaired scan, mask layers, and repair records."))
+                    .font(.caption).foregroundStyle(.secondary)
+                Text(label("遇到漏检或误修，可将原片、训练数据包和「维护 → 保存诊断报告…」生成的日志压缩成 ZIP，发送至 easonzhang@studiopure.cn，帮助改进识别模型。",
+                           "To report missed defects or unwanted repairs, ZIP the original scan, training pack, and log from Maintenance → Save Diagnostic Report, then email it to easonzhang@studiopure.cn to help improve detection."))
+                    .font(.caption).foregroundStyle(.secondary)
                 Section(label("默认导出位置", "Default export location")) {
                     Text(exportFolder.isEmpty ? label("自动", "Automatic") : exportFolder)
                         .lineLimit(2)
@@ -361,14 +390,18 @@ private struct PureNegSettingsView: View {
             .tabItem { Label(label("导出", "Export"), systemImage: "square.and.arrow.up") }
 
             Form {
-                Picker(label("CPU 调度", "CPU scheduling"), selection: $cpuMode) {
+                Picker(label("处理模式", "Processing mode"), selection: $cpuMode) {
                     Text(label("平衡", "Balanced")).tag("balanced")
                     Text(label("优先响应", "Prefer Responsiveness")).tag("responsive")
+                    Text(label("高性能", "High Performance")).tag("performance")
                     Text(label("节能", "Energy Efficient")).tag("efficient")
                 }
+                Text(label("高性能模式提高前台处理优先级，并行解压支持的 TIFF。内存充足时，模型推理与基础检测同时进行。",
+                           "High Performance prioritizes foreground jobs and decodes supported TIFFs in parallel. With enough memory, inference overlaps with the initial detection pass."))
+                    .foregroundStyle(.secondary)
                 Toggle(label("GPU 预览", "GPU preview"), isOn: $gpuPreview)
-                Text(label("为支持的图像启用 Metal 预览。自动检测由 CPU 完成。",
-                           "Use Metal for supported previews. Automatic detection runs on the CPU."))
+                Text(label("为支持的图像启用 Metal 预览。检测由 CPU 和系统分配给 Core ML 的计算单元协同完成。",
+                           "Use Metal for supported previews. Detection uses the CPU and the compute units macOS assigns to Core ML."))
                     .foregroundStyle(.secondary)
                 Toggle(label("节省内存", "Conserve memory"), isOn: $conserveMemory)
                 Text(label("内存为 16 GB 或更少的 Mac 默认开启。缩小预览缓存。超过 6400 万像素时，自动灰尘和纤维检测使用缩小的工作图，细小痕迹的检测结果可能变化。修复和导出使用原始分辨率。",

@@ -276,6 +276,7 @@ final class PreviewCanvasView: NSView {
     var excludedRegions = Set<Int>() {
         didSet {
             guard excludedRegions != oldValue else { return }
+            inactiveMaskRegions = excludedRegions.union(protectedRegions)
             clearHover()
             needsDisplay = true
             if let id = selectedRegionID, inspectionAnchor != nil, excludedRegions.contains(id) != oldValue.contains(id) {
@@ -284,6 +285,16 @@ final class PreviewCanvasView: NSView {
             }
         }
     }
+    var protectedRegions = Set<Int>() {
+        didSet {
+            guard protectedRegions != oldValue else { return }
+            inactiveMaskRegions = excludedRegions.union(protectedRegions)
+            if let id = selectedRegionID, protectedRegions.contains(id) { selectedRegionID = nil }
+            clearHover()
+            needsDisplay = true
+        }
+    }
+    private var inactiveMaskRegions = Set<Int>()
     var selectedRegionID: Int? {
         didSet {
             if selectedRegionID != oldValue { inspectionAnchor = nil }
@@ -331,7 +342,20 @@ final class PreviewCanvasView: NSView {
             updateInspectionOverlay()
         }
     }
-    private lazy var inspectionActionButton = NSButton(title: "", target: self, action: #selector(toggleInspectedRegion))
+    private lazy var inspectionActionButton = PrimaryActionButton(title: "", target: self, action: #selector(toggleInspectedRegion))
+    private lazy var inspectionActionControl: NSView = {
+        let button = inspectionActionButton
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            button.bezelStyle = .glass
+            button.borderShape = .capsule
+            button.bezelColor = StudioStyle.amber.withAlphaComponent(0.48)
+            button.tintProminence = .secondary
+            return button
+        }
+        #endif
+        return StudioStyle.actionControl(button)
+    }()
     private var inspectionBubble: SpotCaption?
     private var hoverBubble: SpotCaption?
     private let renderQueue = DispatchQueue(label: "PURENeg.previewRaster", qos: .userInitiated)
@@ -369,10 +393,11 @@ final class PreviewCanvasView: NSView {
         setAccessibilityLabel(L10n.surface("胶片除尘审核预览"))
         setAccessibilityHelp(L10n.surface("修复蒙版显示实际修复像素。滚动缩放，按住空格拖动平移。使用画笔补修漏点，使用橡皮擦恢复原始像素。"))
         postsFrameChangedNotifications = true
-        inspectionActionButton.bezelStyle = .rounded
-        inspectionActionButton.controlSize = .small
-        inspectionActionButton.isHidden = true
-        addSubview(inspectionActionButton)
+        inspectionActionButton.font = .systemFont(ofSize: 12, weight: .semibold)
+        inspectionActionButton.imagePosition = .imageLeading
+        inspectionActionButton.setAccessibilityIdentifier("inspection-recognition-action")
+        inspectionActionControl.isHidden = true
+        addSubview(inspectionActionControl)
     }
 
     required init?(coder: NSCoder) { nil }
@@ -398,6 +423,7 @@ final class PreviewCanvasView: NSView {
             viewportObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
                 self?.clearHover()
                 self?.updateInspectionOverlay()
+                self?.invalidateModeCaptions()
             }
         }
     }
@@ -435,6 +461,7 @@ final class PreviewCanvasView: NSView {
         regionsByID = Dictionary(uniqueKeysWithValues: regions.map { ($0.id, $0) })
         spotIndex = runsURL.flatMap { ReviewSpotIndex(url: $0, width: width, height: height, regionCount: regions.count) }
         self.excludedRegions = []
+        self.protectedRegions = []
         self.selectedRegionID = nil
         resetImageInteraction()
         isDisplayReady = !usesDisplayCache
@@ -464,7 +491,7 @@ final class PreviewCanvasView: NSView {
         if conserveMemory { metalRenderer = nil }
         imageSize = .zero; regions = []
         regionsByID = [:]
-        selectedRegionID = nil; excludedRegions = []
+        selectedRegionID = nil; excludedRegions = []; protectedRegions = []
         resetImageInteraction()
         fitted = true
         zoomScale = 1
@@ -789,7 +816,7 @@ final class PreviewCanvasView: NSView {
 
     private func drawRegions(in dirtyRect: NSRect) {
         let markerColor = maskColor.color.withAlphaComponent(0.95)
-        for region in regions {
+        for region in regions where !protectedRegions.contains(region.id) {
             let box = ringRect(region)
             guard box.insetBy(dx: -4, dy: -4).intersects(dirtyRect) else { continue }
             let excluded = excludedRegions.contains(region.id)
@@ -812,27 +839,42 @@ final class PreviewCanvasView: NSView {
         return NSRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height)
     }
 
+    // [Claude 2026-11-09] The mode captions are pinned to the visible corner of a scrolling
+    // canvas. Scrolling moves the drawn pixels with the photo, so a caption drawn last time
+    // stayed behind as a trail. Where they were drawn is kept, and every scroll asks for
+    // those places and the new corner to be drawn again.
+    private var captionRects: [NSRect] = []
+
+    func invalidateModeCaptions() {
+        for rect in captionRects { setNeedsDisplay(rect.insetBy(dx: -2, dy: -2)) }
+        let visible = enclosingScrollView?.documentVisibleRect ?? bounds
+        setNeedsDisplay(NSRect(x: visible.minX, y: visible.minY, width: visible.width, height: 48))
+    }
+
     private func drawModeCaptions() {
+        captionRects.removeAll()
         let visible = enclosingScrollView?.documentVisibleRect ?? bounds
         let image = imageRect
         let left = max(image.minX + 10, visible.minX + 10), top = max(image.minY + 10, visible.minY + 10)
         switch mode {
-        case .original: drawCaption(L10n.text("原图"), at: NSPoint(x: left, y: top))
-        case .repaired: drawCaption(L10n.text("修复后"), at: NSPoint(x: left, y: top))
+        case .original: captionRects.append(drawCaption(L10n.text("原图"), at: NSPoint(x: left, y: top)))
+        case .repaired: captionRects.append(drawCaption(L10n.text("修复后"), at: NSPoint(x: left, y: top)))
         case .split:
             let divider = image.minX + image.width * CGFloat(splitFraction)
-            if divider > visible.minX + 70 { drawCaption(L10n.text("原图"), at: NSPoint(x: left, y: top)) }
-            if divider < visible.maxX - 70 { drawCaption(L10n.text("修复后"), at: NSPoint(x: max(divider + 14, visible.minX + 10), y: top)) }
+            if divider > visible.minX + 70 { captionRects.append(drawCaption(L10n.text("原图"), at: NSPoint(x: left, y: top))) }
+            if divider < visible.maxX - 70 { captionRects.append(drawCaption(L10n.text("修复后"), at: NSPoint(x: max(divider + 14, visible.minX + 10), y: top))) }
         }
     }
 
-    private func drawCaption(_ text: String, at point: NSPoint, fontSize: CGFloat = 12) {
+    @discardableResult
+    private func drawCaption(_ text: String, at point: NSPoint, fontSize: CGFloat = 12) -> NSRect {
         let label = NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: fontSize, weight: .medium), .foregroundColor: NSColor.white])
         let size = label.size()
         let box = NSRect(origin: NSPoint(x: point.x - 5, y: point.y - 3), size: NSSize(width: size.width + 10, height: size.height + 6))
         NSColor(calibratedWhite: 0.06, alpha: 0.78).setFill()
         NSBezierPath(roundedRect: box, xRadius: 4, yRadius: 4).fill()
         label.draw(at: point)
+        return box
     }
 
     private var inspectionCaption: String? {
@@ -934,18 +976,22 @@ final class PreviewCanvasView: NSView {
         guard tool == .inspect, !spaceDown, let anchor = inspectionAnchor.map({ viewRect(for: NSRect(origin: $0, size: .zero)).origin }),
               let caption = inspectionCaption, let id = selectedRegionID, visible.contains(anchor),
               viewport.width > 20, viewport.height > 20 else {
-            inspectionActionButton.isHidden = true
+            inspectionActionControl.isHidden = true
             return
         }
-        let title = excludedRegions.contains(id) ? L10n.text("恢复识别") : L10n.text("撤销识别")
+        let excluded = excludedRegions.contains(id)
+        let title = excluded ? L10n.text("恢复识别") : L10n.text("撤销识别")
         if inspectionActionButton.title != title {
             inspectionActionButton.title = title
+            let symbol = excluded ? "arrow.uturn.forward" : "arrow.uturn.backward"
+            inspectionActionButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 11, weight: .semibold))
             inspectionActionButton.setAccessibilityLabel(title)
         }
         let label = spotLabel(caption), textSize = label.size()
         let captionSize = NSSize(width: min(viewport.width, ceil(textSize.width) + 10), height: ceil(textSize.height) + 6)
         let buttonFit = inspectionActionButton.intrinsicContentSize
-        let buttonSize = NSSize(width: max(76, ceil(buttonFit.width)), height: max(25, ceil(buttonFit.height)))
+        let buttonSize = NSSize(width: max(96, ceil(buttonFit.width) + 24), height: max(30, ceil(buttonFit.height) + 8))
         let showAction = onToggleInspectedRegion != nil && buttonSize.width <= viewport.width && captionSize.height + 4 + buttonSize.height <= viewport.height
         let groupSize = showAction ? NSSize(width: max(captionSize.width, buttonSize.width), height: captionSize.height + 4 + buttonSize.height) : captionSize
         let origin = overlayOrigin(near: anchor, size: groupSize, inside: viewport)
@@ -953,15 +999,14 @@ final class PreviewCanvasView: NSView {
         inspectionBubble = bubble
         setNeedsDisplay(bubble.frame.insetBy(dx: -1, dy: -1))
         if showAction {
-            inspectionActionButton.frame = NSRect(origin: NSPoint(x: origin.x, y: origin.y + captionSize.height + 4), size: buttonSize)
-            inspectionActionButton.toolTip = caption
+            inspectionActionControl.frame = NSRect(origin: NSPoint(x: origin.x, y: origin.y + captionSize.height + 4), size: buttonSize)
             inspectionActionButton.isEnabled = isUserInteractionEnabled
         }
-        inspectionActionButton.isHidden = !showAction
+        inspectionActionControl.isHidden = !showAction
     }
 
     @objc private func toggleInspectedRegion() {
-        guard isUserInteractionEnabled, tool == .inspect, !inspectionActionButton.isHidden,
+        guard isUserInteractionEnabled, tool == .inspect, !inspectionActionControl.isHidden,
               inspectionAnchor != nil, let id = selectedRegionID else { return }
         window?.makeFirstResponder(self)
         onToggleInspectedRegion?(id)
@@ -977,7 +1022,7 @@ final class PreviewCanvasView: NSView {
         clearHover()
         guard isUserInteractionEnabled, isDisplayReady, !spaceDown, !draggingPan, !draggingDivider,
               inspectionViewport.contains(point),
-              inspectionActionButton.isHidden || !inspectionActionButton.frame.contains(point),
+              inspectionActionControl.isHidden || !inspectionActionControl.frame.contains(point),
               let region = region(at: point, allowingMarkers: false),
               region.id != selectedRegionID || inspectionAnchor == nil else { return }
         let viewport = inspectionViewport.insetBy(dx: 8, dy: 8)
@@ -993,7 +1038,7 @@ final class PreviewCanvasView: NSView {
                          NSPoint(x: point.x - 12 - size.width, y: preferred.y), NSPoint(x: point.x + 12, y: preferred.y)]
         guard let frame = positions.lazy.map({ NSRect(origin: $0, size: size) }).first(where: {
             viewport.contains($0) && inspectionBubble?.frame.intersects($0) != true &&
-                (inspectionActionButton.isHidden || !inspectionActionButton.frame.intersects($0))
+                (inspectionActionControl.isHidden || !inspectionActionControl.frame.intersects($0))
         }) else { return }
         hoverBubble = SpotCaption(label: label, frame: frame)
         setNeedsDisplay(frame.insetBy(dx: -1, dy: -1))
@@ -1005,10 +1050,10 @@ final class PreviewCanvasView: NSView {
         let maskVisible = showMask && maskOpacity > 0 && mode != .original && (mode != .split || point.x >= divider)
         if image.contains(point), maskVisible || showRegions,
            let id = spotIndex?.nearest(to: imagePoint(from: point), radius: min(128, 5 / zoomScale),
-                                       excluding: showRegions ? [] : excludedRegions),
+                                       excluding: showRegions ? protectedRegions : inactiveMaskRegions),
            let region = regionsByID[id] { return region }
         guard showRegions, allowingMarkers else { return nil }
-        return regions.filter { ringRect($0).insetBy(dx: -4, dy: -4).contains(point) }.min { a, b in
+        return regions.filter { !protectedRegions.contains($0.id) && ringRect($0).insetBy(dx: -4, dy: -4).contains(point) }.min { a, b in
             let ar = viewRect(for: a.rect), br = viewRect(for: b.rect)
             let da = pow(ar.midX - point.x, 2) + pow(ar.midY - point.y, 2)
             let db = pow(br.midX - point.x, 2) + pow(br.midY - point.y, 2)

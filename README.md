@@ -16,61 +16,61 @@ Apple 芯片 Mac，macOS 14 或更新版本。 · Requires an Apple silicon Mac 
 
 [源码与构建 / Source and build](#源码与构建--source-and-build) · [技术内核与开源项目 / Engine and open-source credits](#技术内核与开源项目--engine-and-open-source-credits) · [支持 / Support PURE Neg](SUPPORT.md)
 
-## 最新版本 0.4.8 · What's new in 0.4.8
+## 最新版本 0.4.9 · What's new in 0.4.9
 
-![0.4.7 与 0.4.8 的修复结果对比：0.4.8 修掉了 0.4.7 漏掉的纤维](docs/images/v0.4.8-compare.png)
+- **除尘引擎**升级到 FibreNet v3，可补修通过形状和场景检查的高置信纤维。可分别调节纤维弯曲度和软度，按需保护片边、齿孔与片号，或试用浅色斑块检测。
+- **修复后观片器**加入 HDR 透光显示和可拖动放大镜。检查细节时可旋转、翻转，并调节镜面大小和放大倍率。
+- **批量与导出**支持累加文件和文件夹、全选或全不选，以及导出色彩空间、位深、TIFF 压缩和 JPEG 质量设置。
+- **模型反馈**可在设置中开启训练数据包导出，提交漏检和误修案例。
 
-- **认得更准**：新增本机运行的纤维识别模型，淡纤维、彩色背景和粗颗粒上的纤维漏得更少；纤维团分几轮处理；人像眼神光不再被误修。
-- **修整更顺手**：鼠标指向修复点会出现光圈，并提示「点击后可撤销此处修复」；重新计算时画面显示「正在更新…」；分割对比自动隐藏蒙版；手动笔画上限提高到 1024 笔。
-- **导出更清爽**：照片直接存进所选目录，文件名为「原文件名-PN」；修复蒙版 TIFF 默认不导出。
-- **观片台更真实**：HDR 灯光更亮，片袋和托盘呈磨砂塑料质感，开关灯有咔嗒声和日光灯启辉效果。
-
-- **Better detection**: an on-device fiber model finds faint fibers and fibers on colored or grainy ground that earlier versions missed. Tangles are cleaned in several passes, and catchlights in eyes are left alone.
-- **Smoother review**: the spot under the pointer glows with a hint that clicking undoes it, an indicator shows while the preview updates, Split View hides the mask, and up to 1,024 manual strokes are allowed.
-- **Cleaner export**: photos go straight into the chosen folder as `name-PN`, and the repair mask TIFF is off unless you tick it.
-- **Light table**: a brighter HDR lamp, frosted sleeves, a switch click, and a fluorescent-style start-up flicker.
+- **Repair engine** now uses FibreNet v3 with guarded repairs for high-confidence fibers, independent curl and softness controls, optional film rebate protection, and experimental light-patch detection.
+- **Repaired-image viewer** adds HDR backlighting, rotation and flipping, and a draggable loupe with adjustable size and magnification.
+- **Batch and export** accept additional files and folders, offer select-all controls, and let you choose export color space, bit depth, TIFF compression, and JPEG quality.
+- **Model feedback** can include an opt-in training pack alongside each export.
 
 [完整更新记录 / Full changelog](CHANGELOG.md)
+
+![石板样片中同一位置的原片、默认检测后的结果和修复蒙版](docs/images/v0.4.9-fiber-comparison.jpg)
+
+样片对比以 SDR 显示。默认检测修复了其中一根弯曲纤维，剩余交叠细丝可在审核页用画笔补修。白色表示修复蒙版的覆盖范围。
 
 ## 界面与操作 · Workflow
 
 ### 观片台 · Light Table
 
-![PURE Neg 0.4.8 观片台。灯板已点亮，候选区位于上方，带原始帧号的底片袋位于下方](docs/images/light-table-blur.png)
-
 导入多张 TIFF 或 JPEG 后，在灯板上点选底片。底片会从袋中移到上方候选区，再点一次可放回。候选区为空时，「下一步」会纳入整卷。右下角的电源按钮可点亮灯板，开关时有咔嗒声，开灯时像日光灯一样闪几下再稳定点亮。关闭时指示灯为红色，开启时为绿色。在支持 HDR 的屏幕上，空白灯面用屏幕可长时间保持的最高亮度发光，底片袋、托盘和底片按透光比例暗一些，袋面透出柔和的磨砂塑料质感，接缝和印字保留细节。
 
 Import a batch of TIFF or JPEG scans and click frames to move them from the film sleeve to your picks. Click a frame again to return it. If you leave the picks empty, **Next** includes the whole roll. The power button lights the table with a switch click and a fluorescent-style flicker. On HDR displays the bare lamp runs at the brightest level the screen can sustain, while sleeves, tray, and film transmit proportionally less light through a frosted look.
 
-### 除尘审核 · Repair review
+### 修复后观片器 · Repaired-image viewer
 
-![PURE Neg 0.4.8 的除尘审核页。检查模式下，绿色蒙版标出 313 处自动修复，鼠标悬停在啤酒杯口一处误识别上，外圈出现光圈和撤销提示](docs/images/review-cup-blur.png)
+在审核页点击「在观片器中查看」，把修好的单帧放到透光灯板上。右下角电源点亮灯面，影像会随屏幕可用的 HDR 亮度调整。点取或拖出右下角的琥珀色放大镜，移动到要看的位置。镜内沿用底片的观片色调。蓝点调镜面大小，绿点调倍率，双击镜面或拖回右下角归位。工具栏的旋转和翻转用于检查影像方向，导出沿用审核中的原始方向和色彩设置。
+
+From review, choose **View on Light Table** to place the repaired frame on the light table. Use the power button to light the table. The frame and loupe share the same tone adjustment for the display’s available HDR headroom. Click or drag the amber loupe onto the frame, then use the blue handle for size and the green handle for magnification. Double-click it or drag it back to dock it. Rotation and flips apply to the viewer. Exports use the orientation and color settings from review.
+
+### 除尘审核 · Repair review
 
 中央画布可切换「原图」「修复后」和「分割对比」，也能缩放检查。左栏用可调颜色和不透明度的蒙版标出修复位置。在检查模式把鼠标移到修复点上，修复点外圈会出现呼吸光圈，提示会写明类别和「点击后可撤销此处修复」。用画笔补修漏点，用橡皮擦恢复误修，也可从点位列表排除整处；每张最多 1024 笔。撤销、重做或修整后重新计算时，画面右上角显示「正在更新…」。进入「分割对比」时自动隐藏蒙版，离开后恢复原设置。右栏保留原始帧号，显示检测进度和处理状态。检测中可直接点击另一张照片切换。批量处理时，默认闲置 4 秒后检测其余照片，操作时暂停。
 
 Switch between **Original**, **Repaired**, and **Split View**, and zoom in to inspect the repair mask. Hover a repair to see a glowing ring and a hint that a click undoes it. Use the brush on missed spots, the eraser to restore details, or the spot list to exclude a whole detection. An indicator shows while the preview updates, and Split View hides the mask until you leave it. The sidebar keeps the original frame numbers and shows processing progress. Batch detection starts after four seconds of inactivity by default and pauses while you work.
 
-![检查模式细节：杯口高光被误认成纤维，悬停后外圈出现暖色光圈，提示「毛发 / 纤维 · 点击后可撤销此处修复」，点一下即可恢复原样](docs/images/review-hover-cup-blur.png)
-
-检查修复结果后，点左下角「导出当前」。也可在右侧勾选多张照片，再点「导出所选」。支持按原始分辨率导出 TIFF、JPEG 或 PNG。照片直接保存到所选目录，文件名为「原文件名-PN」，例如 `20250918-ECN213064-PN.jpg`；重名时自动加序号，不会覆盖。修复蒙版 TIFF 默认不导出，需要时在保存窗口勾选。导出后仍可继续修整，再导出一个新版本。
+检查修复结果后，点左下角「导出当前」。也可在右侧勾选多张照片，再点「导出所选」。支持按原始分辨率导出 TIFF、JPEG 或 PNG。照片直接保存到所选目录，文件名为「原文件名-PN」，例如 `scan-01-PN.jpg`。重名时自动加序号。需要修复蒙版 TIFF 时可在保存窗口勾选。导出后仍可继续修整，再导出一个新版本。
 
 Use **Export Current** for one frame or **Export Selected** for a batch. Export TIFF, JPEG, or PNG at the original resolution, straight into the chosen folder as `name-PN` (numbered if the name is taken). The repair mask TIFF is exported only when you tick it. You can keep editing after export and save another version.
 
 ## 除尘引擎 · Repair engine
 
-![PURE Neg 0.4.8 除尘引擎：修复覆盖率与引擎优化](docs/images/v0.4.8-engine.png)
+FibreNet v3 用真实修片训练，以 Core ML 在本机运行。新版继续追踪断续和卷曲的纤维，也允许高置信候选在通过宽度、亮暗方向和场景检查后直接进入修补。眼部保护着重保留眼神光，同时允许符合条件的长纤维跨过眼区。可按照片开启片边保护或实验性斑块检测。研究方法和采用范围见更新记录。[引擎与研究说明](CHANGELOG.md#049)
 
-- **纤维识别模型（0.4.8 新增）**：一个用作者真实修片训练的小型神经网络，通过 Apple Core ML 在本机运行，一张 5000 万像素的扫描约 3 秒，不联网。它只告诉追踪器「这里像纤维」，修不修仍由原有规则判断，不会因此乱修画面。
-- **纤维追踪**：沿断续、弯曲的纤维追到尾端；纤维团分多轮处理，先修清楚的一根，再修被它压住的交叉纤维。物体轮廓高光、台阶边缘、宽而柔和的线条不当作纤维。
-- **画面保护**：用 macOS Vision 找到人像眼睛，眼神光不再被当成灰尘。
-- **速度**：检测内核中最耗时的中值滤波改用常数时间算法，这一步快约 3 倍，结果逐像素一致。新增的模型和多轮处理会多花一点时间，整张处理时间与上一版相近。
-- **持续训练**：模型每增加一批修好的片子就可以重新训练。后续版本会用更多胶卷和场景继续提升除尘效果，「斑块」（半透明亮片）识别在下一版。
+FibreNet v3 is trained on corrected scans and runs on device through Core ML. Alongside tracing, high-confidence candidates can enter repair after width, polarity, and scene checks. Eye protection focuses on catchlights and can retain eligible long fibers crossing an eye region. Film rebate protection and experimental patch detection are optional. [Engine and research notes](CHANGELOG.md#049)
 
-- **Fiber model (new in 0.4.8)**: a small neural network trained on the author’s corrected scans runs on device through Apple Core ML, about 3 seconds for a 50 MP scan. It only points the tracer to likely fibers; the existing rules still decide every repair.
-- **Fiber tracing** follows broken, curved fibers to their ends and takes tangles apart over several passes, while rim highlights, step edges, and soft wide lines are left alone.
-- **Scene protection** uses macOS Vision to keep catchlights in eyes.
-- **Speed**: the heaviest filter now runs in constant time, about 3× faster with identical output; the new model and passes add a little, so overall time is close to the previous release.
-- **Ongoing training**: the model is retrained as more corrected frames come in, and soft translucent flakes are next.
+## 反馈识别问题 · Report detection errors
+
+1. 在「设置 → 导出」开启「导出训练数据包」。
+2. 在审核页用画笔补漏，用橡皮擦或「撤销识别」恢复误修。导出时勾选「导出训练数据包」，并按实际情况标记是否修整完毕。照片旁会生成一个 `-training` 文件夹，记录原始画面、蒙版和修复点。
+3. 在复现问题的同一次运行中，从「设置 → 维护」点「保存诊断报告…」。将原始扫描件、完整的 `-training` 文件夹和诊断报告压成一个 ZIP，注明哪些位置漏检或误修。请只附上你有权分享的影像，然后手动发送给作者。[easonzhang@studiopure.cn](mailto:easonzhang@studiopure.cn)
+
+Turn on **Settings → Export → Export Training Packs**. Correct missed spots or false detections in review, then choose **Include a training pack** when exporting. In the same session, choose **Settings → Maintenance → Save Diagnostic Report…**, then ZIP the original scan, the complete `-training` folder, and the report. Describe the affected areas and email the ZIP to help improve the model. [easonzhang@studiopure.cn](mailto:easonzhang@studiopure.cn)
 
 ## 视觉设计 · Visual design
 
@@ -100,7 +100,7 @@ The macOS interface uses AppKit and SwiftUI. Detection, review, and export run l
 
 The source code is MIT licensed. The artwork, payment QR code, and sample photos retain their own rights and attribution. [项目许可 / License](LICENSE) · [第三方许可 / Third-party notices](THIRD_PARTY_NOTICES.md) · [上游声明 / Upstream notices](vendor/film-dust/NOTICES.txt)
 
-[macos-installer]: https://github.com/easonzhangbin/PURENeg/releases/download/v0.4.8/PURE-Neg-0.4.8-macos-arm64.zip
+[macos-installer]: https://github.com/easonzhangbin/PURENeg/releases/download/v0.4.9/PURE-Neg-0.4.9-macos-arm64.zip
 
 ## 安装与使用指南 · Installation and help
 
@@ -116,9 +116,9 @@ The app checks GitHub for releases and verifies signatures on in-app updates. Us
 
 ## 截图来源 · Photo credits
 
-软件界面截图（观片台、除尘审核页与检查模式细节）中展示的照片由摄影师 **nothing老庄** 拍摄。0.4.8 对比图中的照片由 PURE Neg 作者提供。
+旧版观片台、除尘审核页与检查模式细节截图中的照片由摄影师 **nothing老庄** 拍摄。版本对比图中的样片由 PURE Neg 作者提供。
 
-The photos shown in the app screenshots (light table, repair review, and the inspection close-up) are by photographer **nothing老庄**. The 0.4.8 comparison uses photos provided by the PURE Neg author.
+The photos in the earlier light table, repair review, and inspection screenshots are by photographer **nothing老庄**. The release comparisons use samples provided by the PURE Neg author.
 
 ## 支持 PURE Neg · Support PURE Neg
 

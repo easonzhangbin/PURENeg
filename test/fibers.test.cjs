@@ -160,19 +160,22 @@ test('reconnects a faint tail after a sharp bend without rerendering the stripe 
 // The width limit follows the scan's long side (6 px at 8660 px), so these fixtures use a
 // full-width strip of a 50MP-class scan.
 // along: the line's brightness along its length, as a multiple of amplitude.
-function darkStrip({ width = 2.6, edgeAt = null, amplitude = 9000, stepAt = null, stepLevel = 0, along = () => 1 } = {}) {
+function darkStrip({ width = 2.6, edgeAt = null, amplitude = 9000, stepAt = null, stepLevel = 0, along = () => 1,
+  background = 5200, green = 0, blue = 0 } = {}) {
   const W = 8660, H = 520, C = 3;
   const fibreY = x => 260 + 70 * Math.sin((x - 3000) / 55);
   const original = new Uint16Array(W * H * C);
   let seed = 7;
   const noise = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32 - 0.5) * 300;
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-    let v = 5200;
+    let v = background;
     if (edgeAt !== null && y > fibreY(x) + edgeAt) v = 32000;   // a bright object beside the line
     if (stepAt !== null && y > fibreY(x) + stepAt) v = stepLevel; // another level right beside it
     if (x >= 3000 && x <= 3260) v += amplitude * along(x) * Math.exp(-0.5 * ((y - fibreY(x)) / (width / 2.355)) ** 2);
     const i = (y * W + x) * C, n = noise();
-    original[i] = Math.round(v + n); original[i + 1] = Math.round(v + n); original[i + 2] = Math.round(v + n);
+    original[i] = Math.round(v + n);
+    original[i + 1] = Math.round(v + n + green);
+    original[i + 2] = Math.round(v + n + blue);
   }
   return { original, repaired: original.slice(), mask: new Uint8Array(W * H), W, H, C, fibreY, marks: [], polarity: 'bright' };
 }
@@ -186,6 +189,13 @@ test('traces a fibre the engine left in pieces, starting from the image', async 
   let hit = 0, total = 0;
   for (let x = 3020; x <= 3240; x += 10) { total++; if (mask[Math.round(fibreY(x)) * W + x]) hit++; }
   assert.ok(hit >= 0.8 * total, `only ${hit}/${total} points of the fibre repaired`);
+});
+
+test('auto does not search for dark frame-like curves when the accepted dust is bright', async () => {
+  const image = darkStrip({ width: 7, background: 18000, green: 10000, blue: 23000, amplitude: -8000 });
+  image.marks = [{ polarity: 'bright', verdict: 'defect' }];
+  assert.deepEqual(await enhanceFibers({ ...image, polarity: 'auto' }), { marks: [], pixels: 0 });
+  assert.deepEqual(image.repaired, image.original);
 });
 
 test('leaves a soft, wide line of the same shape (a paving joint, a seam)', async () => {
@@ -271,4 +281,22 @@ test('the learned map does not override the scene tests (a soft, wide line stays
   const image = darkStrip({ width: 9 });
   const result = await enhanceFibers({ ...image, probability: mapOver(image, 5) });
   assert.equal(result.marks.length, 0);
+});
+
+test('a thin piece the learned map is sure of is repaired even where the tracer cannot follow it', async () => {
+  const image = darkStrip({ amplitude: 700 });
+  const sure = mapOver(image).map(v => (v ? 240 : 0));
+  const result = await enhanceFibers({ ...image, probability: sure });
+  assert.ok(result.marks.some(mark => mark.origin === 'learned'), 'no direct repair from the learned map');
+  const doubtful = await enhanceFibers({ ...darkStrip({ amplitude: 700 }), probability: mapOver(image).map(v => (v ? 150 : 0)) });
+  assert.ok(!doubtful.marks.some(mark => mark.origin === 'learned'), 'a doubtful map must not be repaired directly');
+});
+
+test('fibre softness lets a wider line be taken for a fibre; the default keeps it', async () => {
+  const image = darkStrip({ width: 9 });
+  const strict = await enhanceFibers({ ...image, probability: mapOver(image, 5) });
+  assert.equal(strict.marks.length, 0);
+  const loose = darkStrip({ width: 9 });
+  const soft = await enhanceFibers({ ...loose, probability: mapOver(loose, 5), softness: 2 });
+  assert.ok(soft.marks.length >= 1, 'softness 200% should accept the wide line');
 });

@@ -10,6 +10,8 @@ const { workRootOverride, defaultWorkRoot, legacyWorkRoot } = require('./workspa
 const version = require('./version.cjs');
 const runFile = promisify(execFile);
 const thresholdFlags = ['dust-sensitivity', 'fiber-sensitivity', 'scratch-sensitivity'];
+const shapeFlags = ['fiber-curl', 'fiber-softness'];
+const patchFlag = 'patch-sensitivity';
 
 const englishMessages = process.env.PURENEG_LANGUAGE === 'en' ? require('./engine-messages-en.json') : null;
 const emit = (event) => {
@@ -31,7 +33,7 @@ function parseArgs(args) {
   const command = args.shift() || 'help';
   const flags = {};
   const switches = new Set(['launch', 'revise-export']);
-  const allowed = new Set(['input', 'source-name', 'output', 'polarity', 'sensitivity', 'detect', 'work-dir', 'app', 'launch', 'review', 'edits', 'format', 'mask', 'revise-export', ...thresholdFlags]);
+  const allowed = new Set(['input', 'source-name', 'output', 'polarity', 'sensitivity', 'detect', 'work-dir', 'app', 'launch', 'review', 'edits', 'format', 'mask', 'training-pack', 'training-labels', 'export-settings', 'revise-export', 'keep-rebate', ...thresholdFlags, ...shapeFlags, patchFlag]);
   while (args.length) {
     const key = args.shift();
     if (!key.startsWith('--') || !allowed.has(key.slice(2))) throw new Error('未知参数：' + key);
@@ -86,7 +88,7 @@ async function main(argv) {
   // v0.2 makes the previous commands safe aliases: analysis never commits to a
   // PhotoCraft document or publishes final files without a separate confirm.
   const command = ({ process: 'prepare', photocraft: 'prepare-photocraft' })[parsed.command] || parsed.command;
-  if (command !== 'redetect' && thresholdFlags.some(key => Object.hasOwn(flags, key))) {
+  if (command !== 'redetect' && [...thresholdFlags, ...shapeFlags, patchFlag].some(key => Object.hasOwn(flags, key))) {
     throw new Error('分类灵敏度仅用于重新检测。');
   }
   if (flags.format !== undefined && command !== 'confirm') throw new Error('请在确认审核时选择导出格式。');
@@ -96,21 +98,26 @@ async function main(argv) {
   if (flags.mask !== undefined && (command !== 'confirm' || !['yes', 'no'].includes(flags.mask))) {
     throw new Error('请在确认审核时用 --mask yes 或 --mask no 选择是否保存蒙版。');
   }
+  if (flags['keep-rebate'] !== undefined && (!['preview', 'confirm', 'redetect'].includes(command) || !['yes', 'no'].includes(flags['keep-rebate']))) {
+    throw new Error('请在预览或导出时用 --keep-rebate yes 或 --keep-rebate no 选择是否保留片边。');
+  }
   if (command === 'help' || command === '--help') {
     emit({ type: 'result', message: 'PURE Neg ' + version, usage: [
-      'prepare --input scan.tiff|scan.jpg --output folder [--polarity auto|bright|dark] [--sensitivity 1] [--detect dust,scratches,fibers]',
+      'prepare --input scan.tiff|scan.jpg --output folder [--polarity auto|bright|dark] [--sensitivity 1] [--detect dust,scratches,fibers,patches]',
       'doctor [--launch] [--app /Applications/PhotoCraft.app]',
-      'prepare-photocraft --output folder [--polarity auto|bright|dark] [--sensitivity 1] [--detect dust,scratches,fibers]',
-      'redetect --review review.json [--edits edits.json] --dust-sensitivity 1 --fiber-sensitivity 1 --scratch-sensitivity 1',
-      'preview --review review.json --edits edits.json [--revise-export]',
+      'prepare-photocraft --output folder [--polarity auto|bright|dark] [--sensitivity 1] [--detect dust,scratches,fibers,patches]',
+      'redetect --review review.json [--edits edits.json] --dust-sensitivity 1 --fiber-sensitivity 1 --scratch-sensitivity 1 [--patch-sensitivity 1]',
+      'preview --review review.json --edits edits.json [--keep-rebate yes|no] [--revise-export]',
       'inspect-review --review review.json',
-      'confirm --review review.json --edits edits.json [--format tiff|jpeg|png] [--output folder] [--mask yes|no] [--revise-export]',
+      'confirm --review review.json --edits edits.json [--format tiff|jpeg|png] [--output folder] [--mask yes|no] [--keep-rebate yes|no] [--revise-export]',
     ] });
     return;
   }
   if (!['prepare', 'doctor', 'prepare-photocraft', 'preview', 'confirm', 'inspect-review', 'redetect'].includes(command)) throw new Error('未知命令：' + command);
   const settings = optionsChecked({ polarity: flags.polarity ?? 'auto', sensitivity: flags.sensitivity === undefined ? 1 : Number(flags.sensitivity), detect: flags.detect });
   const options = { ...settings, conserveMemory: process.env.PURENEG_CONSERVE_MEMORY === '1',
+    tiffWorkers: Number(process.env.PURENEG_TIFF_WORKERS ?? 1),
+    overlapModels: process.env.PURENEG_OVERLAP_MODELS === '1',
     signal: controller.signal, onProgress: (event) => emit({ type: 'progress', ...event }) };
   const root = workRoot(flags), cacheRoot = path.join(root, 'reviews');
   const hasExplicitRoot = Boolean(flags['work-dir'] || workRootOverride());
@@ -119,6 +126,7 @@ async function main(argv) {
     if (!flags.review) throw new Error('缺少审核记录；请先分析并预览扫描件。');
     const { renderReviewPreview, confirmReview, inspectReview, redetectReview } = require('./review.cjs');
     const reviewOptions = { ...options, reviseExport };
+    if (flags['keep-rebate'] !== undefined) reviewOptions.keepRebate = flags['keep-rebate'] === 'yes';
     if (hasExplicitRoot) reviewOptions.cacheRoot = cacheRoot;
     if (command === 'inspect-review') {
       emit({ type: 'review', ...await inspectReview(flags.review, reviewOptions) });
@@ -133,7 +141,10 @@ async function main(argv) {
     }
     if (command === 'redetect') {
       const [dustSensitivity, fiberSensitivity, scratchSensitivity] = thresholdFlags.map(key => Number(flags[key]));
-      const result = await redetectReview(flags.review, edits, { ...reviewOptions, dustSensitivity, fiberSensitivity, scratchSensitivity });
+      const [fiberCurl, fiberSoftness] = shapeFlags.map(key => (flags[key] === undefined ? 1 : Number(flags[key])));
+      const patchSensitivity = flags[patchFlag] === undefined ? 1 : Number(flags[patchFlag]);
+      const result = await redetectReview(flags.review, edits, { ...reviewOptions, dustSensitivity, fiberSensitivity, scratchSensitivity,
+        patchSensitivity, fiberCurl, fiberSoftness });
       emit({ type: 'redetected', ...result });
       return;
     }
@@ -144,7 +155,16 @@ async function main(argv) {
     }
     emit({ type: 'progress', fraction: 0.05, message: '按你确认的点位生成最终结果' });
     const includeMask = flags.mask === undefined ? undefined : flags.mask === 'yes';
-    const result = await confirmReview(flags.review, edits, { ...reviewOptions, format: flags.format, outputRoot: flags.output, includeMask });
+    const trainingPack = flags['training-pack'] === undefined ? undefined : flags['training-pack'] === 'yes';
+    let trainingLabels;
+    if (flags['training-labels'] !== undefined) {
+      try { trainingLabels = JSON.parse(flags['training-labels']); } catch { throw new Error('训练标签格式无效。'); }
+    }
+    let exportSettings;
+    if (flags['export-settings'] !== undefined) {
+      try { exportSettings = JSON.parse(flags['export-settings']); } catch { throw new Error('导出设置格式无效。'); }
+    }
+    const result = await confirmReview(flags.review, edits, { ...reviewOptions, format: flags.format, outputRoot: flags.output, includeMask, trainingPack, trainingLabels, exportSettings });
     const { context, host, stagedPaths, ...publicResult } = result;
     if (context !== 'photocraft' || !result.changed) {
       const saved = publicResult.paths.mask ? '图像和蒙版' : '图像';
@@ -152,7 +172,7 @@ async function main(argv) {
         context === 'photocraft' ? '没有保留需要修复的区域，原图保持不变。' : `已保存${saved}，图像与原图一致。`;
       const resultEvent = { type: 'result', ...publicResult, imported: false, message };
       if (reviseExport) {
-        resultEvent.reviewPreview = { cleanedPath: stagedPaths.cleaned, maskPath: stagedPaths.mask };
+        resultEvent.reviewPreview = { cleanedPath: stagedPaths.cleaned, maskPath: stagedPaths.mask, protectedRegions: result.protectedRegions };
       }
       emit(resultEvent);
       return;

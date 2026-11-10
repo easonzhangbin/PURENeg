@@ -4,6 +4,8 @@
 // always returned as full-range Uint16 (8-bit samples are multiplied by 257).
 // No colour transform, tone mapping, or implicit HDR conversion happens here.
 const zlib = require('node:zlib');
+const { promisify } = require('node:util');
+const inflate = promisify(zlib.inflate), inflateRaw = promisify(zlib.inflateRaw);
 
 const LIMITS = Object.freeze({ maxPixels: 300_000_000, maxSamples: 500_000_000, maxMetadataBytes: 16 * 1024 * 1024 });
 const TYPE_SIZE = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4 };
@@ -105,7 +107,7 @@ function decompress(input, compression, expected) {
   fail(`unsupported compression ${compression}; export an uncompressed or Deflate TIFF`);
 }
 
-function decodeTiff(input, options = {}) {
+function readTiff(input, options = {}) {
   const buf = bytes(input), limits = { ...LIMITS, ...options };
   if (buf.length < 8) fail('header is truncated');
   const sig = buf.toString('ascii', 0, 2), le = sig === 'II';
@@ -211,39 +213,97 @@ function decodeTiff(input, options = {}) {
   };
   const x = rational(282), y = rational(283), unit = one(296, 2);
   const resolution = x > 0 && y > 0 && [1, 2, 3].includes(unit) ? { x, y, unit } : null;
-  const data = new Uint16Array(samples), rowSamples = width * channels, bytesPerSample = depth / 8;
-  let output = 0;
-  for (let s = 0; s < nstrips; s++) {
-    const rows = Math.min(rowsPerStrip, height - s * rowsPerStrip), ns = rows * rowSamples, expected = ns * bytesPerSample;
-    const raw = decompress(buf.subarray(offsets[s], offsets[s] + counts[s]), compression, expected);
-    const target = data.subarray(output, output + ns);
-    if (depth === 16 && le === LITTLE_HOST && raw.byteOffset % 2 === 0) {
-      target.set(new Uint16Array(raw.buffer, raw.byteOffset, ns));
-      if (predictor === 2) {
-        // Each row restarts the horizontal predictor. Uint16 assignment
-        // performs the TIFF-specified modulo 65536 addition.
-        for (let row = 0; row < ns; row += rowSamples) {
-          for (let k = row + channels; k < row + rowSamples; k++) target[k] += target[k - channels];
-        }
-      }
-    } else if (depth === 8 && predictor === 1) {
-      for (let k = 0; k < ns; k++) target[k] = raw[k] * 257;
-    } else {
-      for (let k = 0; k < ns; k++) {
-        let v = depth === 8 ? raw[k] : le ? raw.readUInt16LE(2 * k) : raw.readUInt16BE(2 * k);
-        if (predictor === 2 && k % rowSamples >= channels) {
-          const previous = target[k - channels];
-          v = (v + (depth === 8 ? previous / 257 : previous)) & (depth === 8 ? 255 : 65535);
-        }
-        target[k] = depth === 8 ? v * 257 : v;
+  const image = { width, height, channels, colorChannels, alpha, depth, icc, resolution, orientation: 1, compression };
+  return { image, buf, le, photo, predictor, samples, rowsPerStrip, offsets, counts };
+}
+
+function copyStrip(layout, data, firstSample, raw) {
+  const { image: { width, channels, depth }, le, predictor } = layout;
+  const rowSamples = width * channels, ns = raw.length / (depth / 8);
+  const target = data.subarray(firstSample, firstSample + ns);
+  if (depth === 16 && le === LITTLE_HOST && raw.byteOffset % 2 === 0) {
+    target.set(new Uint16Array(raw.buffer, raw.byteOffset, ns));
+    if (predictor === 2) {
+      // Each row restarts the horizontal predictor. Uint16 assignment
+      // performs the TIFF-specified modulo 65536 addition.
+      for (let row = 0; row < ns; row += rowSamples) {
+        for (let k = row + channels; k < row + rowSamples; k++) target[k] += target[k - channels];
       }
     }
-    output += ns;
+  } else if (depth === 8 && predictor === 1) {
+    for (let k = 0; k < ns; k++) target[k] = raw[k] * 257;
+  } else {
+    for (let k = 0; k < ns; k++) {
+      let v = depth === 8 ? raw[k] : le ? raw.readUInt16LE(2 * k) : raw.readUInt16BE(2 * k);
+      if (predictor === 2 && k % rowSamples >= channels) {
+        const previous = target[k - channels];
+        v = (v + (depth === 8 ? previous / 257 : previous)) & (depth === 8 ? 255 : 65535);
+      }
+      target[k] = depth === 8 ? v * 257 : v;
+    }
   }
+}
+
+function decodedTiff({ image, photo }, data) {
   // Convert WhiteIsZero to the same black=0 convention used by the engine. Alpha
   // is independent and must never be inverted with the gray channel.
-  if (photo === 0) for (let i = 0; i < data.length; i += channels) data[i] = 65535 - data[i];
-  return { width, height, channels, colorChannels, alpha, depth, data, icc, resolution, orientation: 1, compression };
+  if (photo === 0) for (let i = 0; i < data.length; i += image.channels) data[i] = 65535 - data[i];
+  return { ...image, data };
+}
+
+function decodeStrips(layout) {
+  const { buf, offsets, counts, rowsPerStrip, samples, image: { width, height, channels, depth, compression } } = layout;
+  const data = new Uint16Array(samples), stripSamples = rowsPerStrip * width * channels;
+  for (let s = 0; s < offsets.length; s++) {
+    const expected = Math.min(rowsPerStrip, height - s * rowsPerStrip) * width * channels * (depth / 8);
+    const raw = decompress(buf.subarray(offsets[s], offsets[s] + counts[s]), compression, expected);
+    copyStrip(layout, data, s * stripSamples, raw);
+  }
+  return decodedTiff(layout, data);
+}
+
+function decodeTiff(input, options) {
+  return decodeStrips(readTiff(input, options));
+}
+
+async function inflateStrip(input, expected, compression) {
+  const settings = { maxOutputLength: expected, chunkSize: Math.max(16_384, Math.min(expected, 1_048_576)) };
+  let raw;
+  try { raw = await inflate(input, settings); }
+  catch (error) {
+    if (compression !== 32946) fail(`invalid Deflate strip (${error.code || 'decompression failed'})`);
+    try { raw = await inflateRaw(input, settings); }
+    catch { fail('invalid legacy Deflate strip'); }
+  }
+  if (raw.length !== expected) fail('Deflate strip length does not match its dimensions');
+  return raw;
+}
+
+async function decodeTiffForWork(input, { tiffWorkers = 1, signal } = {}) {
+  signal?.throwIfAborted();
+  const layout = readTiff(input);
+  const { image: { width, height, channels, depth, compression }, buf, offsets, counts, rowsPerStrip, samples } = layout;
+  const stripSamples = rowsPerStrip * width * channels;
+  const workers = Math.min(Math.floor(tiffWorkers), 8, offsets.length, Math.floor(32 * 1024 * 1024 / (stripSamples * (depth / 8))));
+  if (!(workers >= 2) || (compression !== 8 && compression !== 32946)) return decodeStrips(layout);
+  // Only one small batch of independent strips is inflated at a time. Writes
+  // stay in file order and use the same sample and predictor path as sync.
+  const data = new Uint16Array(samples);
+  for (let from = 0; from < offsets.length; from += workers) {
+    signal?.throwIfAborted();
+    const tasks = offsets.slice(from, from + workers).map((offset, index) => {
+      const s = from + index;
+      const expected = Math.min(rowsPerStrip, height - s * rowsPerStrip) * width * channels * (depth / 8);
+      return inflateStrip(buf.subarray(offset, offset + counts[s]), expected, compression);
+    });
+    const results = await Promise.allSettled(tasks);
+    signal?.throwIfAborted();
+    for (const [i, result] of results.entries()) {
+      if (result.status === 'rejected') throw result.reason;
+      copyStrip(layout, data, (from + i) * stripSamples, result.value);
+    }
+  }
+  return decodedTiff(layout, data);
 }
 
 function encodeTiff(image, options = {}) {
@@ -335,4 +395,4 @@ function encodeTiff(image, options = {}) {
   return result;
 }
 
-module.exports = { decodeTiff, encodeTiff, LIMITS };
+module.exports = { decodeTiff, decodeTiffForWork, encodeTiff, LIMITS };
