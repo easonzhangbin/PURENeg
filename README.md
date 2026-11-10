@@ -74,9 +74,9 @@ Turn on **Settings → Export → Export Training Packs**. Correct missed spots 
 
 ## 视觉设计 · Visual design
 
-![PURE Neg 来源页的磨砂玻璃透出红色与冷色壁纸，照片选择和检测控件保持清晰](docs/images/v0.4.9-frosted-glass-sdr.png)
+![PURE Neg 开始界面叠在红色与冷色壁纸前，完整显示处理来源、检测设置和处理状态](docs/images/v0.4.9-frosted-glass-sdr.png)
 
-这是应用界面的真实截图局部，采用 8 位 sRGB 呈现。红色条纹和冷色背景透过磨砂玻璃。壁纸由 Milad Fakurian 创作。 [Unsplash 原图](https://unsplash.com/photos/red-and-black-horizontal-striped-abstract-background-WlFOb5WgWvY)
+开始界面以 8 位 sRGB 呈现。红色条纹和冷色背景透过磨砂玻璃。壁纸由 Milad Fakurian 创作。 [Unsplash 原图](https://unsplash.com/photos/red-and-black-horizontal-striped-abstract-background-WlFOb5WgWvY)
 
 下图用同一张壁纸给 0.4.9 的四个原生窗口取景。观片台以 SDR 点亮，所有截图以 8 位 sRGB 呈现。点击图片可查看全尺寸。
 

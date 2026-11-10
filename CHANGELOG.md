@@ -25,9 +25,9 @@
 
 ### 磨砂玻璃界面
 
-![PURE Neg 来源页叠在红色与冷色壁纸上，磨砂窗口透出背景色](docs/images/v0.4.9-frosted-glass-sdr.png)
+![PURE Neg 开始界面叠在红色与冷色壁纸前，完整显示处理来源、检测设置和处理状态](docs/images/v0.4.9-frosted-glass-sdr.png)
 
-来源页真实截图的 SDR 局部。壁纸的暖红与冷色透过窗口，文字和控件仍保留清晰轮廓。壁纸由 Milad Fakurian 创作。 [Unsplash 原图](https://unsplash.com/photos/red-and-black-horizontal-striped-abstract-background-WlFOb5WgWvY)
+开始界面的 SDR 截图。壁纸的暖红与冷色透过窗口，文字和控件仍保留清晰轮廓。壁纸由 Milad Fakurian 创作。 [Unsplash 原图](https://unsplash.com/photos/red-and-black-horizontal-striped-abstract-background-WlFOb5WgWvY)
 
 下图用同一张壁纸给 0.4.9 的四个原生窗口取景。观片台以 SDR 点亮，所有截图以 8 位 sRGB 呈现。点击图片可查看全尺寸。
 
