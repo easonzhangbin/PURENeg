@@ -23,6 +23,12 @@
 - **蓝点调镜面大小，绿点调倍率。** 放大镜默认 3×，可在 1.5× 至 8× 之间调节。双击镜面或拖回右下角可归位。
 - 顶栏可以向左或向右旋转 90°，也可以水平或垂直翻转。画面和放大镜一起跟随方向。色调和方向调整只作用于观片显示。
 
+### 磨砂玻璃界面
+
+![PURE Neg 来源页叠在红色与冷色壁纸上，磨砂窗口透出背景色](docs/images/v0.4.9-frosted-glass-sdr.png)
+
+来源页真实截图的 SDR 局部。壁纸的暖红与冷色透过窗口，文字和控件仍保留清晰轮廓。壁纸由 Milad Fakurian 创作。 [Unsplash 原图](https://unsplash.com/photos/red-and-black-horizontal-striped-abstract-background-WlFOb5WgWvY)
+
 ### 导入与审核
 
 - **单张也能先观片。** 载入一张照片后可先打开观片台，再开始检测。多次添加会累积并去重，也可选择文件夹，或从待导入列表移除照片。

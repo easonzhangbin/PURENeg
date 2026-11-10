@@ -74,6 +74,10 @@ Turn on **Settings → Export → Export Training Packs**. Correct missed spots 
 
 ## 视觉设计 · Visual design
 
+![PURE Neg 来源页的磨砂玻璃透出红色与冷色壁纸，照片选择和检测控件保持清晰](docs/images/v0.4.9-frosted-glass-sdr.png)
+
+这是应用界面的真实截图局部，采用 8 位 sRGB 呈现。红色条纹和冷色背景透过磨砂玻璃。壁纸由 Milad Fakurian 创作。 [Unsplash 原图](https://unsplash.com/photos/red-and-black-horizontal-striped-abstract-background-WlFOb5WgWvY)
+
 观片台取自实体灯板和半透明底片袋。袋口、帧号与抽出底片的动作让整卷照片的位置一眼可辨。审核页把照片留在中央，工具和批次信息分列两侧。
 
 控制区域使用 macOS 原生玻璃材质，照片保持在独立画布。品牌以石墨灰和暗房黑为底，片基琥珀用于主要操作和选中状态，激光红提示检测进度。修复蒙版默认使用荧光红，可按照片内容调整。
