@@ -11,12 +11,15 @@ const { subtractFull } = require('../vendor/film-dust/engine/discs');
 const native = require('../vendor/film-dust/engine/native');
 const { buildFrameProtection } = require('./frame-guard.cjs');
 const { protectSceneStructures } = require('./structure-guard.cjs');
+const { restoreMaskedTwinRails } = require('./seam-tracks.cjs');
+const { capturePhotoLinePaths, photoLineProtections } = require('./scene-lines.cjs');
 const UPSTREAM = require('../vendor/film-dust/UPSTREAM.json');
 const DEFECT_TYPES = ['dust', 'scratches', 'fibers'];
 const AVAILABLE_DEFECT_TYPES = [...DEFECT_TYPES, 'patches'];
 // [Claude 2026-11-09] fiberCurl / fiberSoftness: how curled and how soft or wide a line may be
 // and still be taken for a fibre (1 = the tested defaults; 0.5 to 2 like the sensitivities).
 const SENSITIVITY_OPTIONS = ['dustSensitivity', 'fiberSensitivity', 'scratchSensitivity', 'patchSensitivity', 'fiberCurl', 'fiberSoftness'];
+capturePhotoLinePaths();
 
 function cancelled(signal) {
   if (signal?.aborted) {
@@ -289,15 +292,18 @@ async function processScan(image, options = {}, { reuseInput = false, captureRev
   if (modelInputs) options = { ...options, ...await modelInputs };
   cancelled(options.signal);
   const marks = scale.enlargeMarks(result.marks, k);
+  const protectedLines = photoLineProtections(marks, k);
+  let twinRailPaths;
   const extraStats = { by_kind: { ...result.stats.by_kind }, healed: result.stats.healed, healed_pixels: result.stats.healed_pixels, detection_types: settings.detect };
   if (detectFibers) {
     const { enhanceFibers } = require('./fibers.cjs');
     onProgress({ fraction: 0.9, message: '追踪断续的毛发与纤维' });
     const extra = await enhanceFibers({ original: colors, repaired, mask, W, H, C, marks,
       polarity: settings.polarity, sensitivity: settings.fiberSensitivity, frame, tick,
-      curl: settings.fiberCurl ?? 1, softness: settings.fiberSoftness ?? 1,
+      curl: settings.fiberCurl ?? 1, softness: settings.fiberSoftness ?? 1, protectedLines, eyes: options.eyes,
       probability: options.fibreMap?.length === W * H ? options.fibreMap : null });
     extraStats.learned_fibre_map = options.fibreMap?.length === W * H;
+    twinRailPaths = extra.twinRailPaths;
     extraStats.enhanced_fibers = extra.marks.length;
     extraStats.enhanced_fiber_pixels = extra.pixels;
     extraStats.healed += extra.marks.length;
@@ -313,7 +319,7 @@ async function processScan(image, options = {}, { reuseInput = false, captureRev
     onProgress({ fraction: 0.90, message: '沿原图搜索连续细划痕' });
     const polarity = settings.polarity === 'auto' && result.stats.polarity?.length === 1 ?
       result.stats.polarity[0] : settings.polarity;
-    const lines = await detectScratches(colors, W, H, C, polarity, tick, frame, settings.scratchSensitivity);
+    const lines = await detectScratches(colors, W, H, C, polarity, tick, frame, settings.scratchSensitivity, protectedLines);
     const extra = await healScratches(lines, repaired, mask, W, H, C, tick);
     extraStats.enhanced_scratches = extra.marks.length;
     extraStats.enhanced_scratch_pixels = extra.pixels;
@@ -334,7 +340,14 @@ async function processScan(image, options = {}, { reuseInput = false, captureRev
     if (extra.marks.length) extraStats.by_kind.patch = extra.marks.length;
   }
   cancelled(options.signal);
-  const structurePixels = protectSceneStructures(mask, W, H, marks);
+  let railPixels = 0;
+  for (const { points, offset } of twinRailPaths || []) {
+    await tick();
+    railPixels += restoreMaskedTwinRails({ original: colors, repaired, mask, width: W, height: H,
+      channels: C, points, probability: options.fibreMap?.length === W * H ? options.fibreMap : null, offset });
+  }
+  if (railPixels) extraStats.protected_twin_rail_pixels = railPixels;
+  const structurePixels = protectSceneStructures(mask, W, H, marks) + railPixels;
   const eyePixels = protectEyes(mask, W, H, marks, options.eyes);
   const maskData = new Uint16Array(mask.length);
   // Only processFile owns its decoded input. Finish all detection on the

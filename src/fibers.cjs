@@ -2,6 +2,11 @@
 
 const { gaussianBlur } = require('../vendor/film-dust/engine/filters');
 const { heal } = require('../vendor/film-dust/engine/heal');
+const { proposeTangleScores } = require('./fiber-tangles.cjs');
+const { followsPhotoLine } = require('./scene-lines.cjs');
+const { tracesPhotoMaterial, recordMaterialPath } = require('./seam-tracks.cjs');
+const { repairCrossings } = require('./fiber-crossings.cjs');
+const { repairNearEye } = require('./eye-fibers.cjs');
 const { lumaFromU16 } = require('../vendor/film-dust/engine/maps');
 
 const PAD = 160;
@@ -157,7 +162,7 @@ function surround(original, W, H, C, track) {
   return { busy: median(busy), balance: median(balance), spread: (at90 - at10) / median(rises) };
 }
 
-const { label: labelRegions, findObjects } = require('../vendor/film-dust/engine/regions');
+const { label: labelRegions, findObjects, skeletonize: skeletonizeLearnedCore } = require('../vendor/film-dust/engine/regions');
 
 function ridgeSeeds({ original, W, H, C, signs, frame }) {
   const w = W >> 1, h = H >> 1;
@@ -564,7 +569,7 @@ function footprint(points, w, h, x0, y0, W, mask) {
 }
 
 async function enhanceFibers({ original, repaired, mask, W, H, C, marks, polarity = 'auto', sensitivity = 1,
-  frame = null, imageSeeds = true, probability = null, curl = 1, softness = 1, tick = async () => {} }) {
+  frame = null, imageSeeds = true, probability = null, curl = 1, softness = 1, protectedLines = [], eyes = [], tick = async () => {} }) {
   // [Claude 2026-11-09] User controls, 0.5-2 (1 = the tested defaults). curl: how curled and how
   // short a track may be; softness: how wide (soft) a line may be, here and in the direct repair.
   curl = Number.isFinite(curl) ? Math.min(2, Math.max(0.5, curl)) : 1;
@@ -593,6 +598,7 @@ async function enhanceFibers({ original, repaired, mask, W, H, C, marks, polarit
   // again in what the earlier ones left. Where one fibre crossed another and broke it into
   // pieces, the other now runs whole and clean. Later passes trace on that repaired image.
   let source = original, passSeeds = seeds;
+  const twinRailPaths = [], materialExcluded = new Set();
   const traced = new Uint8Array(W * H);   // pixels this tracer repaired, for the touch test below
   for (let pass = 0; pass < FIBRE_PASSES; pass++) {
   if (pass > 0) {
@@ -644,6 +650,14 @@ async function enhanceFibers({ original, repaired, mask, W, H, C, marks, polarit
         || crossWidth(source, W, H, C, points) > softness * (seed.learned ? LEARNED_WIDTH : 1) * FWHM_AT_REFERENCE * Math.max(W, H) / REFERENCE_SIDE) continue;
     }
 
+    if (followsPhotoLine(protectedLines, points, seed.polarity)) continue;
+    const material = tracesPhotoMaterial({ source: original, width: W, height: H,
+      channels: C, points, probability, protectedLines, polarity: seed.polarity });
+    if (material) {
+      recordMaterialPath(materialExcluded, W, H, points);
+      if (Number.isFinite(material.strongOffset) && points.length >= 75) twinRailPaths.push({ points, offset: material.strongOffset });
+      continue;
+    }
     const tail = [...turnAcross(win, backward, sign, minimumRise), ...turnAcross(win, forward, sign, minimumRise)];
     let changed = 0, trackLength = length;
     let boxX0 = W, boxY0 = H, boxX1 = 0, boxY1 = 0;
@@ -696,11 +710,16 @@ async function enhanceFibers({ original, repaired, mask, W, H, C, marks, polarit
   if (found.length === before) break;
   }
   if (probability && probability.length === W * H) {
-    const direct = await repairLearned({ original, repaired, mask, W, H, C, probability, signs, frame, sensitivity, softness, tick });
+    const direct = await repairLearned({ original, repaired, mask, W, H, C, probability, signs, frame, sensitivity, softness, tick, materialExcluded,
+      eyes, photoMarks: marks,
+      directGuard: protectedLines.length ? (points, span) => followsPhotoLine(
+        protectedLines.filter(line => line.directTexture || line.directSoftLength >= 2 * span),
+        points, 'bright', true) : null,
+      rejectBranch: protectedLines.length ? points => followsPhotoLine(protectedLines, points, 'bright', true) : null });
     found.push(...direct.marks);
     pixels += direct.pixels;
   }
-  return { marks: found, pixels };
+  return { marks: found, pixels, ...(twinRailPaths.length > 0 && { twinRailPaths }) };
 }
 
 // [Claude 2026-11-09] Direct repair of what the learned map is sure of. The tracer needs a
@@ -720,7 +739,7 @@ const DIRECT_WIDTH = 10;         // px, mean width a piece may have (times the s
                                  // few px wide whatever the scan size; on four held-out frames the pieces users
                                  // kept had a median width of 7-9 px, the unwanted ones 4-6 px.
 
-async function repairLearned({ original, repaired, mask, W, H, C, probability, signs, frame, sensitivity = 1, softness = 1, tick }) {
+async function repairLearned({ original, repaired, mask, W, H, C, probability, signs, frame, sensitivity = 1, softness = 1, directGuard = null, tick, tanglePass = false, eyes = [], photoMarks = [], rejectBranch = null, materialExcluded = null }) {
   const threshold = Math.max(160, Math.min(245, Math.round(DIRECT_MIN - 40 * (sensitivity - 1))));
   // [Claude 2026-11-09] Grown from the sure core along what the map still takes for a defect
   // (DIRECT_GROW_PROB), the way an edge is followed from its strong part: a fibre the map is
@@ -744,12 +763,18 @@ async function repairLearned({ original, repaired, mask, W, H, C, probability, s
     if (y < by0[id]) by0[id] = y; if (y > by1[id]) by1[id] = y;
   }
   const bright = !signs.length || signs.includes(1), dark = signs.includes(-1);
+  const rejected = [];
+  const grow = tanglePass ? 0 : DIRECT_GROW;
+  const recordRejected = (id, widthOnly) => {
+    if (!tanglePass && bright) rejected.push({ id, widthOnly, x0: bx0[id], y0: by0[id], x1: bx1[id], y1: by1[id] });
+  };
   const marks = [];
   let pixels = 0;
   for (let id = 1; id <= n; id++) {
-    if (core[id] < DIRECT_CORE_PIXELS || size[id] < DIRECT_MIN_PIXELS || size[id] > DIRECT_MAX_PIXELS || done[id] * 2 >= size[id]) continue;
+    if (core[id] < DIRECT_CORE_PIXELS || size[id] < DIRECT_MIN_PIXELS || done[id] * 2 >= size[id]) continue;
+    if (size[id] > DIRECT_MAX_PIXELS) { recordRejected(id, false); continue; }
     await tick();
-    const margin = DIRECT_GROW + 6;
+    const margin = grow + 6;
     const x0 = Math.max(0, bx0[id] - margin), y0 = Math.max(0, by0[id] - margin);
     const w = Math.min(W, bx1[id] + margin + 1) - x0, h = Math.min(H, by1[id] + margin + 1) - y0;
     if (w * h > MAX_REPAIR_PIXELS) continue;
@@ -761,10 +786,12 @@ async function repairLearned({ original, repaired, mask, W, H, C, probability, s
       const g = (y0 + y) * W + x0 + x;
       if (lab[g] !== id) continue;
       inside += luma(g); insideN++;
-      if (frame && frame.protects(g)) protectedPx++;
-      for (let dy = -DIRECT_GROW; dy <= DIRECT_GROW; dy++) for (let dx = -DIRECT_GROW; dx <= DIRECT_GROW; dx++) {
+      const protectedPixel = frame?.protects(g);
+      if (protectedPixel) protectedPx++;
+      if (tanglePass && (mask[g] || protectedPixel)) continue;
+      for (let dy = -grow; dy <= grow; dy++) for (let dx = -grow; dx <= grow; dx++) {
         const yy = y + dy, xx = x + dx;
-        if (yy >= 0 && xx >= 0 && yy < h && xx < w) add[yy * w + xx] = 1;
+        if (yy >= 0 && xx >= 0 && yy < h && xx < w && !materialExcluded?.has((y0 + yy) * W + x0 + xx)) add[yy * w + xx] = 1;
       }
     }
     if (protectedPx * 2 > insideN) continue;
@@ -775,6 +802,8 @@ async function repairLearned({ original, repaired, mask, W, H, C, probability, s
       const g = (y0 + y) * W + x0 + x;
       if (lab[g] === id && probability[g] >= threshold) { layer[y * w + x] = 1; cells++; }   // the sure core
     }
+    const span = Math.hypot(bx1[id] - bx0[id], by1[id] - by0[id]);
+    const lineCore = !tanglePass && directGuard && span >= 45 ? layer : null;
     let layers = 0;
     const widest = Math.ceil((softness * DIRECT_WIDTH + 1) / 2);
     while (cells && layers <= widest) {
@@ -786,7 +815,7 @@ async function repairLearned({ original, repaired, mask, W, H, C, probability, s
       }
       layer = next; layers++;
     }
-    if (2 * layers - 1 > softness * DIRECT_WIDTH) continue;
+    if (2 * layers - 1 > softness * DIRECT_WIDTH) { recordRejected(id, true); continue; }
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
       if (add[y * w + x]) continue;
       const near = x >= 2 && y >= 2 && x < w - 2 && y < h - 2;
@@ -799,6 +828,16 @@ async function repairLearned({ original, repaired, mask, W, H, C, probability, s
     const brighter = inside / insideN > ring / ringN;
     // Only the polarity the engine found dust in (see enhanceFibers).
     if ((brighter && !bright) || (!brighter && !dark)) continue;
+    // When the model and a photo line coincide for most of their length,
+    // keep the scene evidence even though the model proposes direct repair.
+    if (brighter && lineCore) {
+      const skeleton = skeletonizeLearnedCore(lineCore, w, h);
+      const points = [];
+      for (let i = 0; i < skeleton.length; i++) {
+        if (skeleton[i]) points.push({ x: x0 + i % w, y: y0 + Math.floor(i / w) });
+      }
+      if (points.length >= 25 && directGuard(points, span)) continue;
+    }
     const previous = new Uint8Array(w * h);
     for (let y = 0; y < h; y++) previous.set(mask.subarray((y0 + y) * W + x0, (y0 + y) * W + x0 + w), y * w);
     const healed = patch(repaired, W, C, x0, y0, w, h);
@@ -816,10 +855,32 @@ async function repairLearned({ original, repaired, mask, W, H, C, probability, s
     }
     if (!changed) continue;
     pixels += changed;
-    marks.push({ id: -4, kind: 'hair/fibre', verdict: 'defect', origin: 'learned',
-      why: 'a piece the learned dust/fibre map is sure of, repaired as the map draws it',
+    marks.push({ id: -4, kind: 'hair/fibre', verdict: 'defect', origin: tanglePass ? 'learned-tangle' : 'learned',
+      why: tanglePass ? 'a thin bright branch in a larger fibre tangle' : 'a piece the learned dust/fibre map is sure of, repaired as the map draws it',
       polarity: brighter ? 'bright' : 'dark', x0: bx0[id], x1: bx1[id], y0: by0[id], y1: by1[id],
       cx: Math.round((bx0[id] + bx1[id]) / 2), cy: Math.round((by0[id] + by1[id]) / 2), area: changed });
+  }
+  if (rejected.length) {
+    const branchScores = await proposeTangleScores({ original, mask, W, H, C, probability,
+      labels: lab, rejected, threshold, maxWidth: softness * DIRECT_WIDTH,
+      minCore: DIRECT_CORE_PIXELS, minArea: DIRECT_MIN_PIXELS, maxArea: DIRECT_MAX_PIXELS,
+      maxPatchPixels: MAX_REPAIR_PIXELS, labelRegions, findObjects, rejectBranch, tick });
+    if (branchScores) {
+      const extra = await repairLearned({ original, repaired, mask, W, H, C, probability: branchScores,
+        signs: [1], frame, sensitivity, softness, tick, tanglePass: true, materialExcluded });
+      marks.push(...extra.marks);
+      pixels += extra.pixels;
+    }
+  }
+  if (rejected.length) {
+    const crossing = await repairCrossings({ original, repaired, mask, W, H, C, probability,
+      labels: lab, rejected, threshold, frame, rejectBranch, patch, heal, tick });
+    marks.push(...crossing.marks);
+    pixels += crossing.pixels;
+    const nearEye = await repairNearEye({ original, repaired, mask, W, H, C, probability,
+      labels: lab, rejected, threshold, eyes, photoMarks, frame, rejectBranch, patch, heal, tick });
+    marks.push(...nearEye.marks);
+    pixels += nearEye.pixels;
   }
   return { marks, pixels };
 }

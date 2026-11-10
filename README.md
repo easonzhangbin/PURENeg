@@ -18,21 +18,21 @@ Apple 芯片 Mac，macOS 14 或更新版本。 · Requires an Apple silicon Mac 
 
 ## 最新版本 0.4.9 · What's new in 0.4.9
 
-- **除尘引擎**升级到 FibreNet v3，可补修通过形状和场景检查的高置信纤维。可分别调节纤维弯曲度和软度，按需保护片边、齿孔与片号，或试用浅色斑块检测。
+- **除尘引擎**采用基于 FibreNet v3 续训的模型，结合形状和场景检查筛选纤维。可分别调节纤维弯曲度和软度，按需保护片边、齿孔与片号，或试用浅色斑块检测。
 - **修复后观片器**加入 HDR 透光显示和可拖动放大镜。检查细节时可旋转、翻转，并调节镜面大小和放大倍率。
 - **批量与导出**支持累加文件和文件夹、全选或全不选，以及导出色彩空间、位深、TIFF 压缩和 JPEG 质量设置。
 - **模型反馈**可在设置中开启训练数据包导出，提交漏检和误修案例。
 
-- **Repair engine** now uses FibreNet v3 with guarded repairs for high-confidence fibers, independent curl and softness controls, optional film rebate protection, and experimental light-patch detection.
+- **Repair engine** uses a model fine-tuned from FibreNet v3, with shape and scene checks, independent curl and softness controls, optional film rebate protection, and experimental light-patch detection.
 - **Repaired-image viewer** adds HDR backlighting, rotation and flipping, and a draggable loupe with adjustable size and magnification.
 - **Batch and export** accept additional files and folders, offer select-all controls, and let you choose export color space, bit depth, TIFF compression, and JPEG quality.
 - **Model feedback** can include an opt-in training pack alongside each export.
 
 [完整更新记录 / Full changelog](CHANGELOG.md)
 
-![石板样片中同一位置的原片、默认检测后的结果和修复蒙版](docs/images/v0.4.9-fiber-comparison.jpg)
+![岸边样片同一位置的原片、自动修复结果和最终修复蒙版](docs/images/v0.4.9-shore-fiber-sdr.jpg)
 
-样片对比以 SDR 显示。默认检测修复了其中一根弯曲纤维，剩余交叠细丝可在审核页用画笔补修。白色表示修复蒙版的覆盖范围。
+岸边样片的 SDR 局部对比。默认自动检测修复了岩石旁的一根弯曲纤维，白色标出这次实际写入的修复范围。
 
 ## 界面与操作 · Workflow
 
@@ -60,9 +60,9 @@ Use **Export Current** for one frame or **Export Selected** for a batch. Export 
 
 ## 除尘引擎 · Repair engine
 
-FibreNet v3 用真实修片训练，以 Core ML 在本机运行。新版继续追踪断续和卷曲的纤维，也允许高置信候选在通过宽度、亮暗方向和场景检查后直接进入修补。眼部保护着重保留眼神光，同时允许符合条件的长纤维跨过眼区。可按照片开启片边保护或实验性斑块检测。研究方法和采用范围见更新记录。[引擎与研究说明](CHANGELOG.md#049)
+纤维模型在真实修片基础上加入合成纤维和短划痕样本续训，以 Core ML 在本机运行。候选位置经宽度、亮暗方向和场景检查后进入修补。场景检查会尝试保留衣缝、重复纹理和物体边缘。密集交叠处可在审核中结合原图和修复蒙版复核。[引擎与研究说明](CHANGELOG.md#049)
 
-FibreNet v3 is trained on corrected scans and runs on device through Core ML. Alongside tracing, high-confidence candidates can enter repair after width, polarity, and scene checks. Eye protection focuses on catchlights and can retain eligible long fibers crossing an eye region. Film rebate protection and experimental patch detection are optional. [Engine and research notes](CHANGELOG.md#049)
+The fiber model was fine-tuned on corrected scans with additional synthetic fibers and short scratches. It runs on device through Core ML. Width, polarity, and scene checks filter repair candidates and help preserve seams, repeating textures, and object edges. Use the original and the repair mask to review dense overlaps. [Engine and research notes](CHANGELOG.md#049)
 
 ## 反馈识别问题 · Report detection errors
 

@@ -292,6 +292,42 @@ test('a thin piece the learned map is sure of is repaired even where the tracer 
   assert.ok(!doubtful.marks.some(mark => mark.origin === 'learned'), 'a doubtful map must not be repaired directly');
 });
 
+test('recovers narrow learned branches without repairing the broad region connecting them', async () => {
+  const W = 230, H = 220, C = 1, center = 110;
+  const original = new Uint16Array(W * H).fill(18000);
+  const probability = new Uint8Array(W * H);
+  for (let y = 20; y < 204; y++) {
+    for (let x = center - 5; x <= center + 5; x++) {
+      const distance = Math.abs(x - center), i = y * W + x;
+      original[i] += Math.round(4800 * Math.exp(-0.5 * (distance / 1.8) ** 2));
+      probability[i] = distance <= 2 ? 244 : distance <= 3 ? 170 : 0;
+    }
+  }
+  for (let y = 92; y <= 125; y++) {
+    for (let x = 86; x <= 135; x++) {
+      const i = y * W + x;
+      original[i] = 27000;
+      probability[i] = 244;
+    }
+  }
+  const repaired = original.slice(), mask = new Uint8Array(W * H);
+  const result = await enhanceFibers({ original, repaired, mask, W, H, C, marks: [],
+    probability, polarity: 'bright', imageSeeds: false });
+  assert.deepEqual(result.marks.map(mark => mark.origin), ['learned-tangle', 'learned-tangle']);
+  for (const y of [65, 158]) {
+    const i = y * W + center;
+    assert.equal(mask[i], 1);
+    assert.ok(repaired[i] < original[i] - 3000);
+  }
+  for (let y = 92; y <= 125; y++) {
+    for (let x = 86; x <= 135; x++) {
+      const i = y * W + x;
+      assert.equal(mask[i], 0);
+      assert.equal(repaired[i], original[i]);
+    }
+  }
+});
+
 test('fibre softness lets a wider line be taken for a fibre; the default keeps it', async () => {
   const image = darkStrip({ width: 9 });
   const strict = await enhanceFibers({ ...image, probability: mapOver(image, 5) });

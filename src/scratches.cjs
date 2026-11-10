@@ -1,6 +1,9 @@
 'use strict';
 
 const { heal } = require('../vendor/film-dust/engine/heal');
+const { followsPhotoLine } = require('./scene-lines.cjs');
+const { followsParallelEdge, scratchPath } = require('./scratch-context.cjs');
+const { materialRidge } = require('./scratch-material.cjs');
 
 const BLOCK = 40, BORDER = 16, CONTEXT = 112;
 
@@ -209,14 +212,21 @@ function isBroadRidgeNearFrame(luma, W, H, line, edges) {
   return broad * 3 >= samples.length * 2;
 }
 
-async function detectScratches(data, W, H, C, polarity = 'auto', tick = async () => {}, frame = null, sensitivity = 1) {
+async function detectScratches(data, W, H, C, polarity = 'auto', tick = async () => {}, frame = null, sensitivity = 1, protectedLines = null) {
   const luma = luma16(data, W, H, C);
   const thresholdScale = 1 / sensitivity;
   const horizontal = await alongAxis(luma, W, H, false, polarity, tick, thresholdScale);
   const vertical = await alongAxis(luma, W, H, true, polarity, tick, thresholdScale);
   const lines = [...horizontal, ...vertical];
   const accepted = frame ? lines.filter(line => !isBroadRidgeNearFrame(luma, W, H, line, frame.edges)) : lines;
-  return accepted.sort((a, b) => (b.score * Math.sqrt(b.length)) - (a.score * Math.sqrt(a.length)));
+  const repairs = protectedLines === null ? accepted : accepted.filter(line => {
+    if (line.sign <= 0) return true;
+    const protection = protectedLines.length ? followsPhotoLine(protectedLines, scratchPath(line), 'bright') : null;
+    const parallelEdge = !protection && followsParallelEdge(luma, W, H, line, frame);
+    const material = protection || parallelEdge ? null : materialRidge(luma, W, H, line, frame, protectedLines);
+    return !protection && !parallelEdge && !material;
+  });
+  return repairs.sort((a, b) => (b.score * Math.sqrt(b.length)) - (a.score * Math.sqrt(a.length)));
 }
 
 async function healScratches(lines, pixels, mask, W, H, C, tick) {

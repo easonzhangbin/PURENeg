@@ -289,7 +289,7 @@ private enum GuideTopic: String, CaseIterable, Identifiable {
         case .technology:
             content = [
                 "自动检测和修补基于 Magnus Holmes 的 film-dust（MIT，基准提交 fcf68d6）。引擎使用 JavaScript，在可用时通过 Node-API 调用 C++ 内核加速滤波、检测和推理。PURE Neg 在原始像素上补充划痕检测与纤维追踪。",
-                "FibreNet v3 用人工审核过的样本训练，通过 Core ML 在本机生成纤维概率图。引擎结合概率、线宽、形状和周边画面判断是否修复，并尝试沿纤维接回较淡的尾端。",
+                "纤维模型在 FibreNet v3 基础上，用人工审核的样本和合成瑕疵续训，通过 Core ML 在本机生成纤维概率图。引擎结合概率、线宽、形状和周边画面判断是否修复，并尝试沿纤维接回较淡的尾端。",
                 "上游骨架细化使用 scikit-image 的查表方法。按上游许可说明，场景判断模型源自 torchvision 的 MobileNetV3-small ImageNet 权重。两项引用均采用 BSD 3-Clause 许可。",
                 "应用内附 Node.js，图像处理在本机运行。界面使用 AppKit 与 SwiftUI，ImageIO 用于 JPEG 导入、JPEG 和 PNG 导出及预览，支持的预览可用 Core Image 与 Metal 加速。观片台的 HDR 光源使用 Core Animation 的扩展动态范围。",
                 "闲置时启动后台任务的交互参考 Final Cut Pro 的后台渲染。PURE Neg 自行调度除尘任务，并通过 macOS 进程组一起暂停或恢复检测与解码进程。"
