@@ -78,6 +78,15 @@ Turn on **Settings → Export → Export Training Packs**. Correct missed spots 
 
 这是应用界面的真实截图局部，采用 8 位 sRGB 呈现。红色条纹和冷色背景透过磨砂玻璃。壁纸由 Milad Fakurian 创作。 [Unsplash 原图](https://unsplash.com/photos/red-and-black-horizontal-striped-abstract-background-WlFOb5WgWvY)
 
+下图用同一张壁纸给 0.4.9 的四个原生窗口取景。观片台以 SDR 点亮，所有截图以 8 位 sRGB 呈现。点击图片可查看全尺寸。
+
+| 批量观片台 | 除尘审核 |
+| --- | --- |
+| [![点亮的灯板上摆有三张底片，其中一张在候选区](docs/images/v0.4.9-wallpaper-light-table.jpg)](docs/images/v0.4.9-wallpaper-light-table.jpg) | [![审核画布显示海岸样片和修复蒙版，工具和照片列表分列两侧](docs/images/v0.4.9-wallpaper-review.jpg)](docs/images/v0.4.9-wallpaper-review.jpg) |
+| **修复后观片** | **导出设置** |
+| [![修复后的户外人像在灯板上，三倍放大镜显示衣服细节](docs/images/v0.4.9-wallpaper-repaired-viewer.jpg)](docs/images/v0.4.9-wallpaper-repaired-viewer.jpg) | [![壁纸前的导出设置窗口显示默认格式、修复蒙版和训练数据包选项](docs/images/v0.4.9-wallpaper-export-settings.jpg)](docs/images/v0.4.9-wallpaper-export-settings.jpg) |
+
+
 观片台取自实体灯板和半透明底片袋。袋口、帧号与抽出底片的动作让整卷照片的位置一眼可辨。审核页把照片留在中央，工具和批次信息分列两侧。
 
 控制区域使用 macOS 原生玻璃材质，照片保持在独立画布。品牌以石墨灰和暗房黑为底，片基琥珀用于主要操作和选中状态，激光红提示检测进度。修复蒙版默认使用荧光红，可按照片内容调整。

@@ -29,6 +29,15 @@
 
 来源页真实截图的 SDR 局部。壁纸的暖红与冷色透过窗口，文字和控件仍保留清晰轮廓。壁纸由 Milad Fakurian 创作。 [Unsplash 原图](https://unsplash.com/photos/red-and-black-horizontal-striped-abstract-background-WlFOb5WgWvY)
 
+下图用同一张壁纸给 0.4.9 的四个原生窗口取景。观片台以 SDR 点亮，所有截图以 8 位 sRGB 呈现。点击图片可查看全尺寸。
+
+| 批量观片台 | 除尘审核 |
+| --- | --- |
+| [![点亮的灯板上摆有三张底片，其中一张在候选区](docs/images/v0.4.9-wallpaper-light-table.jpg)](docs/images/v0.4.9-wallpaper-light-table.jpg) | [![审核画布显示海岸样片和修复蒙版，工具和照片列表分列两侧](docs/images/v0.4.9-wallpaper-review.jpg)](docs/images/v0.4.9-wallpaper-review.jpg) |
+| **修复后观片** | **导出设置** |
+| [![修复后的户外人像在灯板上，三倍放大镜显示衣服细节](docs/images/v0.4.9-wallpaper-repaired-viewer.jpg)](docs/images/v0.4.9-wallpaper-repaired-viewer.jpg) | [![壁纸前的导出设置窗口显示默认格式、修复蒙版和训练数据包选项](docs/images/v0.4.9-wallpaper-export-settings.jpg)](docs/images/v0.4.9-wallpaper-export-settings.jpg) |
+
+
 ### 导入与审核
 
 - **单张也能先观片。** 载入一张照片后可先打开观片台，再开始检测。多次添加会累积并去重，也可选择文件夹，或从待导入列表移除照片。
