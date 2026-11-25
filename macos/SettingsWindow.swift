@@ -15,11 +15,22 @@ enum AppPreferences {
         static let autoDetectWhenIdle = "settings.autoDetectWhenIdle"
         static let language = "settings.language"
         static let exportTrainingPack = "settings.exportTrainingPack"
+        static let reviewBrushRadius = "settings.reviewBrushRadius"
     }
 
     private static var defaults: UserDefaults { .standard }
     fileprivate static let defaultConserveMemory = ProcessInfo.processInfo.physicalMemory <= 16 * 1_024 * 1_024 * 1_024
     static let idleDetectionDelay: TimeInterval = 4
+    static let reviewBrushRadiusRange = 1...96
+
+    static var reviewBrushRadius: Int {
+        get {
+            guard let value = defaults.object(forKey: Key.reviewBrushRadius) as? Int,
+                  reviewBrushRadiusRange.contains(value) else { return 8 }
+            return value
+        }
+        set { defaults.set(newValue, forKey: Key.reviewBrushRadius) }
+    }
 
     static var exportFormat: String {
         let value = defaults.string(forKey: Key.exportFormat) ?? "tiff"

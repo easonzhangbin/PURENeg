@@ -893,6 +893,18 @@ private struct ReviewRasters {
     let protectedRegions: Set<Int>
 }
 
+private struct BatchRepairPreview {
+    let directory: URL
+    let protectedRegions: Set<Int>
+    let manualResult: String?
+
+    var rasters: ReviewRasters {
+        ReviewRasters(cleaned: directory.appendingPathComponent("cleaned.tiff"),
+                      mask: directory.appendingPathComponent("dust-mask.tiff"),
+                      protectedRegions: protectedRegions)
+    }
+}
+
 private struct DetectionThresholds: Equatable {
     var dust: Double = 1
     var fibers: Double = 1
@@ -988,8 +1000,10 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
     private let markers = NSButton(checkboxWithTitle: L10n.text("显示自动检测圈"), target: nil, action: nil)
     private let maskOpacity = NSSlider(value: 70, minValue: 0, maxValue: 100, target: nil, action: nil)
     private let maskOpacityLabel = NSTextField(labelWithString: "70%")
-    private let radius = NSSlider(value: 8, minValue: 1, maxValue: 96, target: nil, action: nil)
-    private let radiusLabel = NSTextField(labelWithString: "8 px")
+    private let radius = NSSlider(value: Double(AppPreferences.reviewBrushRadius),
+                                  minValue: Double(AppPreferences.reviewBrushRadiusRange.lowerBound),
+                                  maxValue: Double(AppPreferences.reviewBrushRadiusRange.upperBound), target: nil, action: nil)
+    private let radiusLabel = NSTextField(labelWithString: "")
     private static var inspectionHint: String { L10n.text("悬停查看类别。点击点位后可选择「撤销识别」。") }
     private let toolHint = NSTextField(wrappingLabelWithString: ReviewWindowController.inspectionHint)
     private let zoomLabel = NSTextField(labelWithString: L10n.text("适应"))
@@ -1110,6 +1124,7 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         reviewWindow.delegate = self
         reviewWindow.center()
         buildInterface()
+        applyBrushRadius()
         reviewWindow.initialFirstResponder = canvas
         setKeepRebate(session?.rebateBakedIn ?? false)
         setDetectionThresholds(session?.detectionThresholds ?? .standard)
@@ -1503,6 +1518,7 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
 
         message.font = .systemFont(ofSize: 12)
         message.textColor = StudioStyle.secondaryText
+        message.alignment = .center
         message.maximumNumberOfLines = 3
         if isBatch {
             confirmButton.title = L10n.surface("导出当前")
@@ -1657,7 +1673,9 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         let label = NSTextField(labelWithString: L10n.text("正在更新…"))
         label.font = .systemFont(ofSize: 12, weight: .medium)
         label.textColor = .labelColor
+        label.alignment = .center
         let row = NSStackView(views: [spinner, label])
+        row.alignment = .centerY
         row.spacing = 6
         row.translatesAutoresizingMaskIntoConstraints = false
         badge.addSubview(row)
@@ -1682,11 +1700,17 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         updatingBadge.isHidden = !visible
     }
 
-    func setBatchPhoto(_ frame: BatchFrame, loadingThumbnail: CGImage? = nil) throws {
+    func setBatchPhoto(_ frame: BatchFrame, loadingThumbnail: CGImage? = nil) throws -> Bool {
         // PreviewCanvas validates the incoming files before replacing the current photo.
-        let rasters = frame.displaysExport ? frame.exportedRasters : nil
+        var rasters = frame.displaysExport ? frame.exportedRasters : nil
+        var reusedPreview = false
         if let session = frame.session {
-            try loadPreview(session, rasters: rasters)
+            if !frame.displaysExport, let cached = frame.repairPreview, (try? loadPreview(session, rasters: cached.rasters)) != nil {
+                rasters = cached.rasters
+                reusedPreview = true
+            } else {
+                try loadPreview(session, rasters: rasters)
+            }
         } else {
             canvas.clearImages()
             repairedURL = nil
@@ -1716,18 +1740,16 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         overlay.state = .on
         markers.state = .off
         maskOpacity.doubleValue = 70
-        radius.doubleValue = 8
         listToggle.state = .off
         changeOverlay()
         changeMarkers()
         changeOpacity()
-        changeRadius()
         changeList(listToggle)
         excludedRegions = frame.excludedRegions
         strokes = frame.strokes
         editHistory = frame.editHistory
         appliedStrokeCount = rasters == nil ? 0 : strokes.count
-        lastManualResult = nil
+        lastManualResult = reusedPreview ? frame.repairPreview?.manualResult : nil
         strokePointCount = strokes.reduce(0) { $0 + $1.points.count }
         if canvas.isDisplayReady { canvas.pendingStrokes = Array(strokes.dropFirst(appliedStrokeCount)) }
         setProtectedRegions(rasters?.protectedRegions ?? [])
@@ -1737,6 +1759,12 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
             showSavedResult(file: output, directory: output.deletingLastPathComponent(), includedMask: frame.exportedWithMask)
         }
         window?.makeFirstResponder(canvas)
+        return reusedPreview
+    }
+
+    func settledBatchPreview(in directory: URL) -> BatchRepairPreview? {
+        guard settledRepairedURL?.resolvingSymlinksInPath().deletingLastPathComponent().path == directory.path else { return nil }
+        return BatchRepairPreview(directory: directory, protectedRegions: protectedRegions, manualResult: lastManualResult)
     }
 
     func replaceDetection(_ session: ReviewSession, excludedRegions: Set<Int>, rasters: ReviewRasters?, stats: [String: Any]) throws {
@@ -1946,9 +1974,13 @@ private final class ReviewWindowController: NSWindowController, NSWindowDelegate
         maskOpacityLabel.stringValue = "\(percent)%"
     }
     @objc private func changeRadius() {
-        let pixels = Int(radius.doubleValue.rounded())
-        canvas.brushRadius = pixels
-        radiusLabel.stringValue = "\(pixels) px"
+        AppPreferences.reviewBrushRadius = brushRadius
+        applyBrushRadius()
+    }
+    private var brushRadius: Int { Int(radius.doubleValue.rounded()) }
+    private func applyBrushRadius() {
+        canvas.brushRadius = brushRadius
+        radiusLabel.stringValue = "\(brushRadius) px"
     }
     private func adjustBrushRadius(by delta: Int) {
         guard canEdit else { return }
@@ -2126,7 +2158,7 @@ private struct BatchFrame {
     var keepRebate: Bool?
     var output: URL?
     var exportedRasters: ReviewRasters?
-    var lightTablePreviewDirectory: URL?
+    var repairPreview: BatchRepairPreview?
     var exportedWithMask = false
     var revisingExport = false
     var detectionAdjusted = false
@@ -2138,7 +2170,7 @@ private struct BatchFrame {
     var canExport: Bool { !displaysExport && session != nil }
     var lightTableArtwork: URL? {
         if displaysExport { return exportedRasters?.cleaned ?? output }
-        if let lightTablePreviewDirectory { return lightTablePreviewDirectory.appendingPathComponent("cleaned.tiff") }
+        if let repairPreview { return repairPreview.rasters.cleaned }
         guard let session, !hasEdits else { return nil }
         return URL(fileURLWithPath: session.cleanedPath)
     }
@@ -3426,18 +3458,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
     private func openBatchReview(_ id: UUID) {
         guard let batch, let review = reviewController, let index = batch.index(for: id) else { return }
-        let frame = batch.frames[index]
         do {
             storeBatchEdits(batch)
             stashBatchPreview(batch)
-            try review.setBatchPhoto(frame, loadingThumbnail: batch.controller.cachedThumbnail(for: frame.url))
+            let frame = batch.frames[index]
+            let reusedPreview = try review.setBatchPhoto(frame, loadingThumbnail: batch.controller.cachedThumbnail(for: frame.url))
             resetReviewPreview()
+            if reusedPreview {
+                currentPreviewDirectory = frame.repairPreview?.directory
+                batch.frames[index].repairPreview = nil
+            } else if frame.repairPreview != nil {
+                removeBatchRepairPreview(batch, at: index)
+            }
             if frame.session != nil {
                 batch.current = id
                 batch.reviewAfterDetection = nil
                 batch.status = ""
                 if batch.job?.isBackground == false { yieldDetection(batch) }
-                if frame.hasEdits && (!frame.displaysExport || frame.exportedRasters == nil) { schedulePreview() }
+                if !reusedPreview && frame.hasEdits && (!frame.displaysExport || frame.exportedRasters == nil) { schedulePreview() }
             } else {
                 batch.current = nil
                 batch.reviewAfterDetection = id
@@ -3459,7 +3497,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             }
             refreshBatch()
         } catch {
-            batch.status = L10n.text("无法打开 \(frame.url.lastPathComponent) 的审核：\(error.localizedDescription)")
+            batch.status = L10n.text("无法打开 \(batch.frames[index].url.lastPathComponent) 的审核：\(error.localizedDescription)")
             refreshBatch()
         }
     }
@@ -3490,21 +3528,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func stashBatchPreview(_ batch: BatchSession) {
         guard let id = batch.current, let index = batch.index(for: id), let review = reviewController else { return }
         if batch.frames[index].displaysExport || review.settledRepairedURL == nil {
-            removeBatchLightTablePreview(batch, at: index)
-        } else if let directory = currentPreviewDirectory,
-                  review.settledRepairedURL?.resolvingSymlinksInPath().deletingLastPathComponent().path == directory.path {
+            removeBatchRepairPreview(batch, at: index)
+        } else if let directory = currentPreviewDirectory, let preview = review.settledBatchPreview(in: directory) {
             // This preview was validated when the worker returned it. Transfer it to the frame so
             // resetReviewPreview does not remove the image while the light table is using it.
-            removeBatchLightTablePreview(batch, at: index)
-            batch.frames[index].lightTablePreviewDirectory = directory
+            removeBatchRepairPreview(batch, at: index)
+            batch.frames[index].repairPreview = preview
             currentPreviewDirectory = nil
         }
     }
 
-    private func removeBatchLightTablePreview(_ batch: BatchSession, at index: Int) {
-        guard let directory = batch.frames[index].lightTablePreviewDirectory else { return }
-        batch.frames[index].lightTablePreviewDirectory = nil
-        removeTemporary(directory)
+    private func removeBatchRepairPreview(_ batch: BatchSession, at index: Int) {
+        guard let preview = batch.frames[index].repairPreview else { return }
+        batch.frames[index].repairPreview = nil
+        removeTemporary(preview.directory)
     }
 
     private func showRepairedLightTable(from review: ReviewWindowController) {
@@ -3858,10 +3895,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 }
             }
             guard reviewController?.session != nil else { return }
-            if previewNeedsRefresh || activePreviewGeneration != previewGeneration {
-                previewNeedsRefresh = true
+            if previewNeedsRefresh {
                 if previewDebounce == nil { startPreviewIfReady() }
-            } else if code != 0 || !previewWasApplied {
+                return
+            }
+            guard activePreviewGeneration == previewGeneration else { return }
+            if code != 0 || !previewWasApplied {
                 reviewController?.setPreviewPending(true, error: reportedError ?? L10n.text("引擎未返回更新后的图像"))
             } else {
                 reviewController?.setPreviewPending(false)
@@ -4068,7 +4107,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 removeCurrentPreview()
                 currentPreviewDirectory = directory
                 if let batch, let id = request.frameID, batch.current == id, let index = batch.index(for: id) {
-                    removeBatchLightTablePreview(batch, at: index)
+                    removeBatchRepairPreview(batch, at: index)
                     batch.frames[index].session = session
                     batch.frames[index].revisingExport = batch.frames[index].output != nil
                     batch.frames[index].detectionAdjusted = true

@@ -901,6 +901,7 @@ final class PreviewCanvasView: NSView {
 
     private func spotLabel(_ text: String) -> NSAttributedString {
         let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
         paragraph.lineBreakMode = .byTruncatingTail
         return NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium),
                                                            .foregroundColor: NSColor.white, .paragraphStyle: paragraph])

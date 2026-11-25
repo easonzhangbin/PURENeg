@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST_DIR="${DIST_DIR:-$PROJECT_DIR/dist/release-0.4.9}"
+DIST_DIR="${DIST_DIR:-$PROJECT_DIR/dist/release-0.4.10}"
 FINAL_APP_DIR="$DIST_DIR/PURE Neg.app"
 BUILD_DIR="$PROJECT_DIR/.build/macos"
 ICON_SOURCE="$PROJECT_DIR/assets/PURENeg.png"
@@ -173,8 +173,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>PURE Neg</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.4.9</string>
-  <key>CFBundleVersion</key><string>34</string>
+  <key>CFBundleShortVersionString</key><string>0.4.10</string>
+  <key>CFBundleVersion</key><string>35</string>
   <key>CFBundleIconFile</key><string>PURENeg</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSAppleEventsUsageDescription</key><string>PURE Neg 需要读取 Photoshop 当前文档的可见图像，用于在本机生成除尘预览。</string>

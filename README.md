@@ -16,17 +16,15 @@ Apple 芯片 Mac，macOS 14 或更新版本。 · Requires an Apple silicon Mac 
 
 [源码与构建 / Source and build](#源码与构建--source-and-build) · [技术内核与开源项目 / Engine and open-source credits](#技术内核与开源项目--engine-and-open-source-credits) · [支持 / Support PURE Neg](SUPPORT.md)
 
-## 最新版本 0.4.9 · What's new in 0.4.9
+## 最新版本 0.4.10 · What's new in 0.4.10
 
-- **除尘引擎**采用基于 FibreNet v3 续训的模型，结合形状和场景检查筛选纤维。可分别调节纤维弯曲度和软度，按需保护片边、齿孔与片号，或试用浅色斑块检测。
-- **修复后观片器**加入 HDR 透光显示和可拖动放大镜。检查细节时可旋转、翻转，并调节镜面大小和放大倍率。
-- **批量与导出**支持累加文件和文件夹、全选或全不选，以及导出色彩空间、位深、TIFF 压缩和 JPEG 质量设置。
-- **模型反馈**可在设置中开启训练数据包导出，提交漏检和误修案例。
+- **记住画笔半径。** 画笔和橡皮擦沿用上次使用的半径。滑块与 `[`、`]` 快捷键的调整均会保存，切换照片、重开审核或重启应用后仍可使用。
+- **加快返回审核。** 同一批次中，返回已有可用修复预览的照片时，复用修复图和蒙版，减少重复计算。
+- **提示居中。** 审核画布上的状态提示采用居中排版。
 
-- **Repair engine** uses a model fine-tuned from FibreNet v3, with shape and scene checks, independent curl and softness controls, optional film rebate protection, and experimental light-patch detection.
-- **Repaired-image viewer** adds HDR backlighting, rotation and flipping, and a draggable loupe with adjustable size and magnification.
-- **Batch and export** accept additional files and folders, offer select-all controls, and let you choose export color space, bit depth, TIFF compression, and JPEG quality.
-- **Model feedback** can include an opt-in training pack alongside each export.
+- **Remember the tool radius.** The brush and eraser share the last radius set with the slider or the `[` and `]` keys. It carries across frames, review windows, and app launches.
+- **Return to review faster.** Revisiting a frame in the same batch reuses its ready repaired preview and mask when they still match the edits.
+- **Centered notices.** Status text on the review canvas is centered.
 
 [完整更新记录 / Full changelog](CHANGELOG.md)
 
@@ -54,7 +52,7 @@ From review, choose **View on Light Table** to place the repaired frame on the l
 
 ### 除尘审核 · Repair review
 
-中央画布可切换「原图」「修复后」和「分割对比」，也能缩放检查。左栏用可调颜色和不透明度的蒙版标出修复位置。在检查模式把鼠标移到修复点上，修复点外圈会出现呼吸光圈，提示会写明类别和「点击后可撤销此处修复」。用画笔补修漏点，用橡皮擦恢复误修，也可从点位列表排除整处；每张最多 1024 笔。撤销、重做或修整后重新计算时，画面右上角显示「正在更新…」。进入「分割对比」时自动隐藏蒙版，离开后恢复原设置。右栏保留原始帧号，显示检测进度和处理状态。检测中可直接点击另一张照片切换。批量处理时，默认闲置 4 秒后检测其余照片，操作时暂停。
+中央画布可切换「原图」「修复后」和「分割对比」，也能缩放检查。左栏用可调颜色和不透明度的蒙版标出修复位置。在检查模式把鼠标移到修复点上，修复点外圈会出现呼吸光圈，提示会写明类别和「点击后可撤销此处修复」。用画笔补修漏点，用橡皮擦恢复误修，也可从点位列表排除整处。每张最多 1024 笔。半径调整会保存。撤销、重做或修整后重新计算时，画布中的提示显示「正在更新…」。进入「分割对比」时自动隐藏蒙版，离开后恢复原设置。右栏保留原始帧号，显示检测进度和处理状态。检测中可直接点击另一张照片切换。批量处理时，默认闲置 4 秒后检测其余照片，操作时暂停。
 
 Switch between **Original**, **Repaired**, and **Split View**, and zoom in to inspect the repair mask. Hover a repair to see a glowing ring and a hint that a click undoes it. Use the brush on missed spots, the eraser to restore details, or the spot list to exclude a whole detection. An indicator shows while the preview updates, and Split View hides the mask until you leave it. The sidebar keeps the original frame numbers and shows processing progress. Batch detection starts after four seconds of inactivity by default and pauses while you work.
 
@@ -117,7 +115,7 @@ The macOS interface uses AppKit and SwiftUI. Detection, review, and export run l
 
 The source code is MIT licensed. The artwork, payment QR code, and sample photos retain their own rights and attribution. [项目许可 / License](LICENSE) · [第三方许可 / Third-party notices](THIRD_PARTY_NOTICES.md) · [上游声明 / Upstream notices](vendor/film-dust/NOTICES.txt)
 
-[macos-installer]: https://github.com/easonzhangbin/PURENeg/releases/download/v0.4.9/PURE-Neg-0.4.9-macos-arm64.zip
+[macos-installer]: https://github.com/easonzhangbin/PURENeg/releases/download/v0.4.10/PURE-Neg-0.4.10-macos-arm64.zip
 
 ## 安装与使用指南 · Installation and help
 
